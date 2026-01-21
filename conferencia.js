@@ -1,3 +1,5 @@
+/* global $, XLSX, supabase */
+
 const { jsPDF } = window.jspdf || {};
 
 const STORAGE_KEY = 'conferencia.routes.v1';
@@ -9,76 +11,35 @@ const ConferenciaApp = {
 
   // Cloud
   cloudEnabled: false,
-  supabase: null,
-  deviceId: null,
-  pollHandle: null,
+  supa: null,
 
   // =======================
-  // Init
+  // Boot Supabase
   // =======================
-  async init() {
-    this.deviceId = this.getOrCreateDeviceId();
-
-    // local (fallback/offline)
-    this.loadFromStorage();
-
-    // cloud
-    await this.initSupabaseIfConfigured();
-
-    if (this.cloudEnabled) {
-      await this.loadRoutesFromCloud();
-    }
-
-    this.renderRoutesSelects();
-  },
-
-  getOrCreateDeviceId() {
-    const key = 'conferencia.device_id.v1';
-    let v = localStorage.getItem(key);
-    if (!v) {
-      v = (crypto?.randomUUID?.() || `${Date.now()}_${Math.random().toString(16).slice(2)}`);
-      localStorage.setItem(key, v);
-    }
-    return v;
-  },
-
-  async initSupabaseIfConfigured() {
+  initCloud() {
     try {
-      const cfg = window.APP_CONFIG || {};
-      const SUPABASE_URL = cfg.SUPABASE_URL || window.SUPABASE_URL || '';
-      const SUPABASE_KEY = cfg.SUPABASE_KEY || window.SUPABASE_KEY || '';
-
-      if (!SUPABASE_URL || !SUPABASE_KEY || !window.supabase?.createClient) {
+      const url = (window.SUPABASE_URL || '').trim();
+      const key = (window.SUPABASE_KEY || '').trim();
+      if (!url || !key) {
         this.cloudEnabled = false;
         return;
       }
-
-      this.supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+      // supabase-js v2 expõe global "supabase" com createClient
+      if (!window.supabase || !window.supabase.createClient) {
+        console.warn('Supabase JS não carregou.');
+        this.cloudEnabled = false;
+        return;
+      }
+      this.supa = window.supabase.createClient(url, key);
       this.cloudEnabled = true;
     } catch (e) {
-      console.warn('Supabase init falhou:', e);
+      console.warn('Falha ao iniciar Supabase:', e);
       this.cloudEnabled = false;
     }
   },
 
-  startPollingCurrentRoute(ms = 3000) {
-    this.stopPolling();
-    this.pollHandle = setInterval(async () => {
-      if (!this.cloudEnabled) return;
-      if (!this.currentRouteId) return;
-      await this.syncCurrentRouteFromCloud();
-    }, ms);
-  },
-
-  stopPolling() {
-    if (this.pollHandle) {
-      clearInterval(this.pollHandle);
-      this.pollHandle = null;
-    }
-  },
-
   // =======================
-  // Persistência LOCAL
+  // Persistência Local
   // =======================
   loadFromStorage() {
     try {
@@ -98,13 +59,13 @@ const ConferenciaApp = {
         route.destinationFacilityName = r.destinationFacilityName || '';
         route.totalInicial = Number(r.totalInicial || 0);
 
-        (r.ids || []).forEach(id => route.ids.add(id));
-        (r.conferidos || []).forEach(id => route.conferidos.add(id));
-        (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
-        route.faltantes = new Set(r.faltantes || []);
+        (r.ids || []).forEach(id => route.ids.add(String(id)));
+        (r.conferidos || []).forEach(id => route.conferidos.add(String(id)));
+        (r.foraDeRota || []).forEach(id => route.foraDeRota.add(String(id)));
+        route.faltantes = new Set((r.faltantes || []).map(String));
 
-        route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [k, v]));
-        route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, v]));
+        route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [String(k), v]));
+        route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [String(k), v]));
 
         if (!route.faltantes.size && route.ids.size) {
           route.faltantes = new Set(route.ids);
@@ -152,7 +113,8 @@ const ConferenciaApp = {
     this.saveToStorage();
     this.renderRoutesSelects();
 
-    if (this.cloudEnabled) this.deleteRouteFromCloud(id).catch(() => {});
+    // cloud best-effort (não trava)
+    this.deleteRouteFromCloud(id).catch(() => {});
   },
 
   clearAllRoutes() {
@@ -160,7 +122,6 @@ const ConferenciaApp = {
     this.currentRouteId = null;
     localStorage.removeItem(STORAGE_KEY);
     this.renderRoutesSelects();
-    alert('Rotas locais removidas. (Cloud não foi apagado automaticamente)');
   },
 
   // =======================
@@ -174,11 +135,11 @@ const ConferenciaApp = {
       destinationFacilityName: '',
 
       timestamps: new Map(), // id -> epoch (ms)
-      ids: new Set(),        // IDs esperados (route_items)
-      faltantes: new Set(),
-      conferidos: new Set(), // derivado
-      foraDeRota: new Set(), // derivado
-      duplicados: new Map(), // id -> count
+      ids: new Set(),        // IDs esperados (importados)
+      faltantes: new Set(),  // IDs ainda não conferidos (subset de ids)
+      conferidos: new Set(), // IDs conferidos (bipados corretos)
+      foraDeRota: new Set(), // IDs bipados fora
+      duplicados: new Map(), // id -> count (>=2 significa duplicado)
 
       totalInicial: 0
     };
@@ -196,15 +157,12 @@ const ConferenciaApp = {
       return;
     }
     this.currentRouteId = id;
+
+    // tenta puxar itens da nuvem (não bloqueia se falhar)
+    await this.loadRouteItemsFromCloud(id).catch(() => {});
+
     this.renderRoutesSelects();
-
-    if (this.cloudEnabled) {
-      await this.syncCurrentRouteFromCloud();
-      this.startPollingCurrentRoute(3000);
-    } else {
-      this.refreshUIFromCurrent();
-    }
-
+    this.refreshUIFromCurrent();
     this.saveToStorage();
   },
 
@@ -216,7 +174,7 @@ const ConferenciaApp = {
     const $sel2 = $('#saved-routes-inapp');
 
     const routesSorted = Array.from(this.routes.values())
-      .sort((a, b) => a.routeId.localeCompare(b.routeId));
+      .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
 
     const makeLabel = (r) => {
       const parts = [];
@@ -319,218 +277,134 @@ const ConferenciaApp = {
   },
 
   // =======================
-  // Cloud helpers
+  // Fora de rota inteligente (global)
   // =======================
-  async loadRoutesFromCloud() {
-    const { data, error } = await this.supabase
-      .from('routes')
-      .select('route_id, cluster, destination_facility_id, destination_facility_name, updated_at');
+  findCorrectRouteForId(id) {
+    const needle = String(id);
 
-    if (error) {
-      console.warn('Cloud routes load error:', error);
-      return;
+    for (const [rid, r] of this.routes.entries()) {
+      if (r.ids && r.ids.has(needle)) return String(rid);
     }
-
-    const { data: items, error: errItems } = await this.supabase
-      .from('route_items')
-      .select('route_id, shipment_id');
-
-    if (errItems) {
-      console.warn('Cloud route_items load error:', errItems);
-      return;
+    for (const [rid, r] of this.routes.entries()) {
+      if (r.faltantes && r.faltantes.has(needle)) return String(rid);
     }
-
-    this.routes.clear();
-
-    const itemsByRoute = new Map();
-    for (const it of (items || [])) {
-      const rid = String(it.route_id);
-      if (!itemsByRoute.has(rid)) itemsByRoute.set(rid, []);
-      itemsByRoute.get(rid).push(String(it.shipment_id));
+    for (const [rid, r] of this.routes.entries()) {
+      if (r.conferidos && r.conferidos.has(needle)) return String(rid);
     }
+    return null;
+  },
 
-    for (const r of (data || [])) {
-      const rid = String(r.route_id);
-      const route = this.makeEmptyRoute(rid);
-      route.cluster = r.cluster || '';
-      route.destinationFacilityId = r.destination_facility_id || '';
-      route.destinationFacilityName = r.destination_facility_name || '';
+  cleanupIdFromOtherRoutes(id, targetRouteId) {
+    const needle = String(id);
+    const target = String(targetRouteId);
 
-      const list = itemsByRoute.get(rid) || [];
-      for (const id of list) route.ids.add(id);
+    for (const [rid, r] of this.routes.entries()) {
+      if (String(rid) === target) continue;
 
-      route.totalInicial = route.ids.size;
-      route.faltantes = new Set(route.ids);
+      let changed = false;
 
-      this.routes.set(rid, route);
+      if (r.foraDeRota && r.foraDeRota.has(needle)) {
+        r.foraDeRota.delete(needle);
+        changed = true;
+      }
+
+      if (r.duplicados && r.duplicados.has(needle)) {
+        r.duplicados.delete(needle);
+        changed = true;
+      }
+
+      if (changed) {
+        const stillRelevant =
+          (r.conferidos && r.conferidos.has(needle)) ||
+          (r.faltantes && r.faltantes.has(needle)) ||
+          (r.ids && r.ids.has(needle)) ||
+          (r.foraDeRota && r.foraDeRota.has(needle)) ||
+          (r.duplicados && r.duplicados.has(needle));
+
+        if (!stillRelevant && r.timestamps) r.timestamps.delete(needle);
+      }
     }
-
-    this.saveToStorage();
-  },
-
-  async upsertRouteMetaToCloud(route) {
-    if (!this.cloudEnabled) return;
-
-    const payload = {
-      route_id: String(route.routeId),
-      cluster: route.cluster || null,
-      destination_facility_id: route.destinationFacilityId || null,
-      destination_facility_name: route.destinationFacilityName || null,
-      updated_at: new Date().toISOString()
-    };
-
-    const { error } = await this.supabase
-      .from('routes')
-      .upsert(payload, { onConflict: 'route_id' });
-
-    if (error) console.warn('upsert routes error:', error);
-  },
-
-  // ✅ CORRIGIDO: UP SERT em vez de insert (evita duplicados)
-  async upsertRouteItemsToCloud(routeId, idsArray) {
-    if (!this.cloudEnabled) return;
-    if (!idsArray?.length) return;
-
-    const rows = idsArray.map(id => ({
-      route_id: String(routeId),
-      shipment_id: String(id)
-    }));
-
-    // upsert com onConflict no PK composto
-    const { error } = await this.supabase
-      .from('route_items')
-      .upsert(rows, { onConflict: 'route_id,shipment_id', ignoreDuplicates: true });
-
-    if (error) console.warn('upsert route_items error:', error);
-  },
-
-  async deleteRouteFromCloud(routeId) {
-    if (!this.cloudEnabled) return;
-    await this.supabase.from('routes').delete().eq('route_id', String(routeId));
-  },
-
-  async findCorrectRouteForIdCloud(id) {
-    if (!this.cloudEnabled) return null;
-
-    const { data, error } = await this.supabase
-      .from('route_items')
-      .select('route_id')
-      .eq('shipment_id', String(id))
-      .limit(1);
-
-    if (error) return null;
-    if (!data || !data.length) return null;
-    return String(data[0].route_id);
-  },
-
-  async deleteScansFromOtherRoutesCloud(id, correctRouteId) {
-    if (!this.cloudEnabled) return;
-
-    await this.supabase
-      .from('scans')
-      .delete()
-      .eq('shipment_id', String(id))
-      .neq('route_id', String(correctRouteId));
-  },
-
-  async insertScanCloud(routeId, id) {
-    if (!this.cloudEnabled) return;
-
-    const payload = {
-      route_id: String(routeId),
-      shipment_id: String(id),
-      scanned_at: new Date().toISOString(),
-      device_id: this.deviceId
-    };
-
-    const { error } = await this.supabase.from('scans').insert(payload);
-    if (error) console.warn('insert scan error:', error);
-  },
-
-  async syncCurrentRouteFromCloud() {
-    const r = this.current;
-    if (!r) return;
-
-    const { data: items, error: errItems } = await this.supabase
-      .from('route_items')
-      .select('shipment_id')
-      .eq('route_id', String(r.routeId));
-
-    if (errItems) return;
-
-    r.ids = new Set((items || []).map(x => String(x.shipment_id)));
-    r.totalInicial = r.ids.size;
-
-    const { data: scans, error: errScans } = await this.supabase
-      .from('scans')
-      .select('shipment_id, scanned_at')
-      .eq('route_id', String(r.routeId))
-      .order('scanned_at', { ascending: true });
-
-    if (errScans) return;
-
-    const countMap = new Map();
-    const tsMap = new Map();
-
-    for (const s of (scans || [])) {
-      const id = String(s.shipment_id);
-      countMap.set(id, (countMap.get(id) || 0) + 1);
-
-      const t = Date.parse(s.scanned_at);
-      if (!tsMap.has(id) || t > tsMap.get(id)) tsMap.set(id, t);
-    }
-
-    r.timestamps = tsMap;
-    r.duplicados = new Map();
-    r.conferidos = new Set();
-    r.foraDeRota = new Set();
-
-    for (const [id, cnt] of countMap.entries()) {
-      if (cnt > 1) r.duplicados.set(id, cnt);
-
-      if (r.ids.has(id)) r.conferidos.add(id);
-      else r.foraDeRota.add(id);
-    }
-
-    r.faltantes = new Set(r.ids);
-    for (const id of r.conferidos) r.faltantes.delete(id);
-
-    this.refreshUIFromCurrent();
-    this.saveToStorage();
   },
 
   // =======================
-  // Conferência
+  // Conferência (LOCAL + Cloud best-effort)
   // =======================
-  async conferirId(codigo) {
+  conferirId(codigo) {
     const r = this.current;
     if (!r || !codigo) return;
 
-    let correctRouteId = null;
-    if (this.cloudEnabled) {
-      correctRouteId = await this.findCorrectRouteForIdCloud(codigo);
-    }
+    const id = String(codigo);
+    const now = Date.now();
 
+    const correctRouteId = this.findCorrectRouteForId(id);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
 
-    if (isCorrectHere && this.cloudEnabled) {
-      await this.deleteScansFromOtherRoutesCloud(codigo, this.currentRouteId);
+    if (isCorrectHere) {
+      // remove da rota errada localmente
+      this.cleanupIdFromOtherRoutes(id, this.currentRouteId);
     }
 
-    if (this.cloudEnabled) {
-      await this.insertScanCloud(this.currentRouteId, codigo);
-      await this.syncCurrentRouteFromCloud();
+    // DUPLICATA
+    if (r.conferidos.has(id) || r.foraDeRota.has(id)) {
+      const count = r.duplicados.get(id) || 1;
+      r.duplicados.set(id, count + 1);
+      r.timestamps.set(id, now);
+
+      if (!this.viaCsv) this.playAlertSound();
+
       $('#barcode-input').val('').focus();
+      this.saveToStorage();
+      this.atualizarListas();
+
+      // cloud best-effort
+      this.upsertScanToCloud(this.currentRouteId, id, {
+        scanned_at: new Date(now).toISOString(),
+        is_out_of_route: !isCorrectHere, // se não é da rota atual, marca como fora
+        duplicate_count: (count + 1) - 1
+      }).catch(() => {});
       return;
     }
 
-    // (se quiser manter modo offline, pode colar aqui a lógica local antiga)
+    // CONFERE NORMAL
+    if (r.faltantes.has(id)) {
+      r.faltantes.delete(id);
+      r.conferidos.add(id);
+      r.timestamps.set(id, now);
+
+      $('#barcode-input').val('').focus();
+      this.saveToStorage();
+      this.atualizarListas();
+
+      // cloud best-effort: se for correto, marca como dentro da rota
+      this.upsertScanToCloud(this.currentRouteId, id, {
+        scanned_at: new Date(now).toISOString(),
+        is_out_of_route: false,
+        duplicate_count: 0
+      }).catch(() => {});
+      return;
+    }
+
+    // FORA DE ROTA
+    r.foraDeRota.add(id);
+    r.timestamps.set(id, now);
+    if (!this.viaCsv) this.playAlertSound();
+
+    $('#barcode-input').val('').focus();
+    this.saveToStorage();
+    this.atualizarListas();
+
+    // cloud best-effort
+    this.upsertScanToCloud(this.currentRouteId, id, {
+      scanned_at: new Date(now).toISOString(),
+      is_out_of_route: true,
+      duplicate_count: 0
+    }).catch(() => {});
   },
 
   // =======================
   // Importação HTML: várias rotas
   // =======================
-  async importRoutesFromHtml(rawHtml) {
+  importRoutesFromHtml(rawHtml) {
     const html = String(rawHtml || '').replace(/<[^>]+>/g, ' ');
 
     const idxs = [];
@@ -571,8 +445,8 @@ const ConferenciaApp = {
       const idsExtraidos = new Set();
 
       while ((match = regexEnvio.exec(block)) !== null) {
-        const shipmentId = match[1];
-        const receiverId = match[2];
+        const shipmentId = String(match[1]);
+        const receiverId = String(match[2] || '');
         if (!receiverId.includes('_')) idsExtraidos.add(shipmentId);
       }
 
@@ -580,100 +454,100 @@ const ConferenciaApp = {
 
       for (const id of idsExtraidos) {
         route.ids.add(id);
-        route.faltantes.add(id);
+        if (!route.conferidos.has(id)) route.faltantes.add(id);
       }
 
       route.totalInicial = route.ids.size;
       this.routes.set(routeId, route);
       imported++;
 
-      if (this.cloudEnabled) {
-        await this.upsertRouteMetaToCloud(route);
-        await this.upsertRouteItemsToCloud(routeId, Array.from(idsExtraidos)); // ✅ upsert robusto
-      }
+      // cloud meta best-effort
+      this.upsertRouteMetaToCloud(route).catch(() => {});
     }
 
     this.saveToStorage();
     this.renderRoutesSelects();
-
-    if (this.cloudEnabled) {
-      await this.loadRoutesFromCloud();
-      this.renderRoutesSelects();
-      this.saveToStorage();
-    }
-
     return imported;
   },
 
   // =======================
-  // EXPORT: rota atual CSV (PADRÃO ANTIGO)
+  // CSV (EXATAMENTE COMO O ANTIGO)
   // =======================
   exportRotaAtualCsv() {
     const r = this.current;
-    if (!r) return alert('Nenhuma rota selecionada.');
+    if (!r) {
+      alert('Nenhuma rota selecionada.');
+      return;
+    }
 
     const all = [
-      ...Array.from(r.conferidos || []),
-      ...Array.from(r.foraDeRota || []),
-      ...Array.from((r.duplicados && r.duplicados.keys()) ? r.duplicados.keys() : [])
+      ...Array.from(r.conferidos),
+      ...Array.from(r.foraDeRota),
+      ...Array.from(r.duplicados.keys())
     ];
 
-    const uniq = Array.from(new Set(all));
-    if (uniq.length === 0) return alert('Nenhum ID para exportar.');
+    if (!all.length) {
+      alert('Nenhum ID para exportar.');
+      return;
+    }
 
     const parseDateSafe = (value) => {
       if (!value) return new Date();
       if (value instanceof Date) return value;
       if (typeof value === 'number') return new Date(value);
-      const d = new Date(value);
-      if (!isNaN(d.getTime())) return d;
+      if (typeof value === 'string') {
+        if (/^\d{4}-\d{2}-\d{2}T/.test(value)) {
+          const d = new Date(value);
+          if (!isNaN(d.getTime())) return d;
+        }
+        if (/^\d{13}$/.test(value)) return new Date(Number(value));
+        const d = new Date(value);
+        if (!isNaN(d.getTime())) return d;
+      }
       return new Date();
     };
 
-    const pad2 = (n) => String(n).padStart(2, '0');
     const zona = 'Horário Padrão de Brasília';
     const header = 'date,time,time_zone,format,text,notes,favorite,date_utc,time_utc,metadata,duplicates';
 
-    uniq.sort((a, b) => {
-      const ta = r.timestamps?.get(a) ? Number(r.timestamps.get(a)) : 0;
-      const tb = r.timestamps?.get(b) ? Number(r.timestamps.get(b)) : 0;
-      return (ta - tb) || String(a).localeCompare(String(b));
-    });
-
-    const linhas = uniq.map((id) => {
-      const lidaEm = parseDateSafe(r.timestamps?.get(id));
-      const date = `${lidaEm.getFullYear()}-${pad2(lidaEm.getMonth() + 1)}-${pad2(lidaEm.getDate())}`;
+    const linhas = all.map(id => {
+      const lidaEm = parseDateSafe(r.timestamps.get(id));
+      const pad2 = n => String(n).padStart(2,'0');
+      const date = `${lidaEm.getFullYear()}-${pad2(lidaEm.getMonth()+1)}-${pad2(lidaEm.getDate())}`;
       const time = `${pad2(lidaEm.getHours())}:${pad2(lidaEm.getMinutes())}:${pad2(lidaEm.getSeconds())}`;
 
-      const iso = lidaEm.toISOString();
-      const dateUtc = iso.slice(0, 10);
-      const timeUtc = iso.split('T')[1].split('.')[0];
-
-      const totalReads = r.duplicados?.get(id) || 0;
-      const dupCount = totalReads ? Math.max(0, totalReads - 1) : 0;
+      const dateUtc = lidaEm.toISOString().slice(0, 10);
+      const timeUtc = lidaEm.toISOString().split('T')[1].split('.')[0];
+      const dupCount = r.duplicados.get(id) ? (r.duplicados.get(id) - 1) : 0;
 
       return `${date},${time},${zona},Code 128,${id},,0,${dateUtc},${timeUtc},,${dupCount}`;
     });
 
     const conteudo = [header, ...linhas].join('\r\n');
     const blob = new Blob([conteudo], { type: 'text/csv;charset=utf-8;' });
-
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
 
-    const cluster = (r.cluster || 'semCluster').trim() || 'semCluster';
-    const rota = (r.routeId || 'semRota').trim() || 'semRota';
+    const cluster = (r.cluster || 'semCluster').replace(/\s+/g, '_');
+    const rota = (r.routeId || 'semRota').replace(/\s+/g, '_');
     link.download = `${cluster}_${rota}_padrao.csv`;
 
     link.click();
   },
 
   // =======================
-  // EXPORT: todas as rotas XLSX (1 coluna por rota)
+  // XLSX: todas as rotas
+  // 1 aba ("Bipagens"), 1 coluna por rota, só IDs conferidos
   // =======================
   exportTodasRotasXlsx() {
-    if (typeof XLSX === 'undefined') return alert('Biblioteca XLSX não carregou.');
-    if (!this.routes || this.routes.size === 0) return alert('Não há rotas salvas para exportar.');
+    if (typeof XLSX === 'undefined') {
+      alert('Biblioteca XLSX não carregou. Verifique o script do SheetJS no HTML.');
+      return;
+    }
+    if (!this.routes || this.routes.size === 0) {
+      alert('Não há rotas salvas para exportar.');
+      return;
+    }
 
     const routesSorted = Array.from(this.routes.values())
       .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
@@ -684,6 +558,8 @@ const ConferenciaApp = {
       const header = cluster ? `${routeId}-${cluster}` : routeId;
 
       const ids = Array.from(r.conferidos || []);
+
+      // ordena por timestamp (se existir) e depois por ID
       ids.sort((x, y) => {
         const tx = r.timestamps?.get(x) ? Number(r.timestamps.get(x)) : 0;
         const ty = r.timestamps?.get(y) ? Number(r.timestamps.get(y)) : 0;
@@ -712,31 +588,182 @@ const ConferenciaApp = {
 
     const pad2 = (n) => String(n).padStart(2, '0');
     const now = new Date();
-    const stamp = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}`;
+    const stamp = `${now.getFullYear()}-${pad2(now.getMonth()+1)}-${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}`;
 
     XLSX.writeFile(wb, `bipagens_todas_rotas_${stamp}.xlsx`);
-  }
+  },
+
+  // =======================
+  // CLOUD: carregar rotas meta
+  // =======================
+  async loadRoutesFromCloud() {
+    if (!this.cloudEnabled || !this.supa) return;
+    try {
+      const { data, error } = await this.supa
+        .from('routes')
+        .select('route_id,cluster,destination_facility_id,destination_facility_name,updated_at')
+        .order('route_id', { ascending: true });
+
+      if (error) throw error;
+      if (!data) return;
+
+      for (const row of data) {
+        const routeId = String(row.route_id);
+        const route = this.routes.get(routeId) || this.makeEmptyRoute(routeId);
+
+        route.cluster = row.cluster || route.cluster || '';
+        route.destinationFacilityId = row.destination_facility_id || route.destinationFacilityId || '';
+        route.destinationFacilityName = row.destination_facility_name || route.destinationFacilityName || '';
+
+        this.routes.set(routeId, route);
+      }
+
+      this.saveToStorage();
+      this.renderRoutesSelects();
+    } catch (e) {
+      console.warn('Cloud routes load error:', e);
+    }
+  },
+
+  // =======================
+  // CLOUD: carregar itens da rota (conferidos/fora/duplicados)
+  // =======================
+  async loadRouteItemsFromCloud(routeId) {
+    if (!this.cloudEnabled || !this.supa) return;
+    const rid = String(routeId);
+    const r = this.routes.get(rid);
+    if (!r) return;
+
+    try {
+      const { data, error } = await this.supa
+        .from('route_items')
+        .select('route_id,shipment_id,scanned_at,is_out_of_route,duplicate_count')
+        .eq('route_id', rid);
+
+      if (error) throw error;
+      if (!data) return;
+
+      // mescla no estado local sem quebrar ids importados
+      for (const row of data) {
+        const sid = String(row.shipment_id);
+        const scannedAt = row.scanned_at ? new Date(row.scanned_at).getTime() : Date.now();
+        r.timestamps.set(sid, scannedAt);
+
+        const dup = Number(row.duplicate_count || 0);
+        if (dup > 0) r.duplicados.set(sid, dup + 1); // interno = contagem total (>=2)
+
+        if (row.is_out_of_route) {
+          r.foraDeRota.add(sid);
+        } else {
+          // se for esperado, marca conferido
+          if (r.ids.has(sid) || r.faltantes.has(sid)) {
+            r.faltantes.delete(sid);
+            r.conferidos.add(sid);
+          } else {
+            // se não era esperado (sem import), ainda assim tratamos como conferido
+            r.conferidos.add(sid);
+          }
+        }
+      }
+
+      // evita ficar “sem faltantes” quando veio só da nuvem
+      if (!r.faltantes.size && r.ids.size) {
+        r.faltantes = new Set(r.ids);
+        for (const c of r.conferidos) r.faltantes.delete(c);
+      }
+
+      this.saveToStorage();
+    } catch (e) {
+      console.warn('Cloud route_items load error:', e);
+    }
+  },
+
+  // =======================
+  // CLOUD: upsert meta de rota
+  // =======================
+  async upsertRouteMetaToCloud(route) {
+    if (!this.cloudEnabled || !this.supa) return;
+
+    try {
+      const payload = {
+        route_id: String(route.routeId),
+        cluster: route.cluster || null,
+        destination_facility_id: route.destinationFacilityId || null,
+        destination_facility_name: route.destinationFacilityName || null
+      };
+
+      const { error } = await this.supa
+        .from('routes')
+        .upsert(payload, { onConflict: 'route_id' });
+
+      if (error) throw error;
+    } catch (e) {
+      console.warn('upsert routes error:', e);
+    }
+  },
+
+  // =======================
+  // CLOUD: upsert scan
+  // =======================
+  async upsertScanToCloud(routeId, shipmentId, fields) {
+    if (!this.cloudEnabled || !this.supa) return;
+
+    const payload = {
+      route_id: String(routeId),
+      shipment_id: String(shipmentId),
+      scanned_at: fields?.scanned_at || new Date().toISOString(),
+      is_out_of_route: !!fields?.is_out_of_route,
+      duplicate_count: Number(fields?.duplicate_count || 0),
+    };
+
+    try {
+      const { error } = await this.supa
+        .from('route_items')
+        .upsert(payload, { onConflict: 'route_id,shipment_id' });
+
+      if (error) throw error;
+    } catch (e) {
+      console.warn('upsert route_items error:', e);
+    }
+  },
+
+  // (opcional) delete rota no cloud (precisa policy de delete)
+  async deleteRouteFromCloud(routeId) {
+    if (!this.cloudEnabled || !this.supa) return;
+    try {
+      await this.supa.from('route_items').delete().eq('route_id', String(routeId));
+      await this.supa.from('routes').delete().eq('route_id', String(routeId));
+    } catch (e) {
+      // sem policy delete, vai falhar — mas não quebra o app
+    }
+  },
 };
 
 // =======================
-// Eventos
+// Eventos (IMPORTANTE: não travar por cloud)
 // =======================
 $(document).ready(async () => {
-  await ConferenciaApp.init();
+  ConferenciaApp.loadFromStorage();
+  ConferenciaApp.initCloud();
   ConferenciaApp.renderRoutesSelects();
+
+  // carrega do cloud em background (sem travar UI)
+  await ConferenciaApp.loadRoutesFromCloud().catch(() => {});
 });
 
-$('#extract-btn').click(async () => {
+// Importar HTML
+$(document).on('click', '#extract-btn', () => {
   const raw = $('#html-input').val();
   if (!raw.trim()) return alert('Cole o HTML antes de importar.');
 
-  const qtd = await ConferenciaApp.importRoutesFromHtml(raw);
+  const qtd = ConferenciaApp.importRoutesFromHtml(raw);
   if (!qtd) return alert('Nenhuma rota importada. Confira se o HTML está completo.');
 
   alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
-$('#load-route').click(async () => {
+// Carregar rota
+$(document).on('click', '#load-route', async () => {
   const id = $('#saved-routes').val();
   if (!id) return alert('Selecione uma rota salva.');
 
@@ -745,19 +772,82 @@ $('#load-route').click(async () => {
   $('#initial-interface').addClass('d-none');
   $('#manual-interface').addClass('d-none');
   $('#conference-interface').removeClass('d-none');
+
   $('#barcode-input').focus();
 });
 
-$('#switch-route').click(async () => {
+// Excluir rota
+$(document).on('click', '#delete-route', () => {
+  const id = $('#saved-routes').val();
+  if (!id) return alert('Selecione uma rota para excluir.');
+  ConferenciaApp.deleteRoute(id);
+});
+
+// Limpar todas
+$(document).on('click', '#clear-all-routes', () => {
+  ConferenciaApp.clearAllRoutes();
+  alert('Todas as rotas foram removidas.');
+});
+
+// Trocar rota dentro
+$(document).on('click', '#switch-route', async () => {
   const id = $('#saved-routes-inapp').val();
   if (!id) return;
   await ConferenciaApp.setCurrentRoute(id);
   $('#barcode-input').focus();
 });
 
-$('#barcode-input').keypress(async (e) => {
-  if (e.which === 13) {
+// Manual
+$(document).on('click', '#manual-btn', () => {
+  $('#initial-interface').addClass('d-none');
+  $('#manual-interface').removeClass('d-none');
+});
+
+$(document).on('click', '#submit-manual', () => {
+  try {
+    const routeId = ($('#manual-routeid').val() || '').trim();
+    if (!routeId) return alert('Informe o RouteId.');
+
+    const cluster = ($('#manual-cluster').val() || '').trim();
+    const manualIds = $('#manual-input').val().split(/[\s,;]+/).map(x => x.trim()).filter(Boolean);
+
+    if (!manualIds.length) return alert('Nenhum ID válido inserido.');
+
+    const route = ConferenciaApp.routes.get(String(routeId)) || ConferenciaApp.makeEmptyRoute(routeId);
+    route.cluster = cluster || route.cluster;
+
+    for (const id of manualIds) {
+      const sid = String(id);
+      route.ids.add(sid);
+      if (!route.conferidos.has(sid)) route.faltantes.add(sid);
+    }
+
+    route.totalInicial = route.ids.size;
+    ConferenciaApp.routes.set(String(routeId), route);
+
+    ConferenciaApp.saveToStorage();
+    ConferenciaApp.renderRoutesSelects();
+
+    // cloud meta best-effort
+    ConferenciaApp.upsertRouteMetaToCloud(route).catch(() => {});
+
+    alert(`Rota ${routeId} salva com ${route.totalInicial} ID(s).`);
+
+    $('#manual-interface').addClass('d-none');
+    $('#initial-interface').removeClass('d-none');
+  } catch (e) {
+    console.error(e);
+    alert('Erro ao processar IDs manuais.');
+  }
+});
+
+// ENTER no input (use keydown pra evitar falhas em alguns leitores)
+$(document).on('keydown', '#barcode-input', (e) => {
+  if (e.key === 'Enter' || e.which === 13) {
+    e.preventDefault();
+
     ConferenciaApp.viaCsv = false;
+
     const raw = $('#barcode-input').val();
     const id = ConferenciaApp.normalizarCodigo(raw);
 
@@ -766,22 +856,63 @@ $('#barcode-input').keypress(async (e) => {
       return;
     }
 
-    await ConferenciaApp.conferirId(id);
+    ConferenciaApp.conferirId(id);
   }
 });
 
-// Exportações
-$(document).on('click', '#export-csv-rota-atual', () => ConferenciaApp.exportRotaAtualCsv());
-$(document).on('click', '#export-xlsx-todas-rotas', () => ConferenciaApp.exportTodasRotasXlsx());
+// Checar CSV
+$(document).on('click', '#check-csv', () => {
+  const r = ConferenciaApp.current;
+  if (!r) return alert('Selecione uma rota antes.');
 
-// Finalizar sem ação
-$(document).off('click', '#finish-btn');
-$('#finish-btn').off('click');
-$(document).on('click', '#finish-btn', (e) => {
-  e.preventDefault();
-  e.stopImmediatePropagation();
-  return false;
+  const fileInput = document.getElementById('csv-input');
+  if (!fileInput || fileInput.files.length === 0) return alert('Selecione um arquivo CSV.');
+
+  ConferenciaApp.viaCsv = true;
+
+  const file = fileInput.files[0];
+  const reader = new FileReader();
+
+  reader.onload = e => {
+    const csvText = e.target.result;
+    const linhas = String(csvText || '').split(/\r?\n/);
+    if (!linhas.length) return alert('Arquivo CSV vazio.');
+
+    const header = linhas[0].split(',');
+    const textCol = header.findIndex(h => /(text|texto|id)/i.test(h));
+    if (textCol === -1) return alert('Coluna apropriada não encontrada (text/texto/id).');
+
+    for (let i = 1; i < linhas.length; i++) {
+      if (!linhas[i].trim()) continue;
+      const cols = linhas[i].split(',');
+      if (cols.length <= textCol) continue;
+
+      let campo = cols[textCol].trim().replace(/^"|"$/g, '').replace(/""/g, '"');
+      const id = ConferenciaApp.normalizarCodigo(campo);
+      if (id) ConferenciaApp.conferirId(id);
+    }
+
+    ConferenciaApp.viaCsv = false;
+    $('#barcode-input').focus();
+  };
+
+  reader.readAsText(file, 'UTF-8');
+});
+
+// Export CSV rota atual
+$(document).on('click', '#export-csv-rota-atual', () => {
+  ConferenciaApp.exportRotaAtualCsv();
+});
+
+// Export XLSX todas rotas
+$(document).on('click', '#export-xlsx-todas-rotas', () => {
+  ConferenciaApp.exportTodasRotasXlsx();
+});
+
+// Sem bind no finalizar (não faz download)
+$(document).on('click', '#finish-btn', () => {
+  alert('Finalizar não exporta automaticamente. Use os botões de exportação acima.');
 });
 
 // Voltar
-$('#back-btn').click(() => location.reload());
+$(document).on('click', '#back-btn', () => location.reload());
