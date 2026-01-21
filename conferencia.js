@@ -1,4 +1,4 @@
-/* global $, XLSX, supabase */
+/* global $, XLSX */
 
 const { jsPDF } = window.jspdf || {};
 
@@ -9,37 +9,8 @@ const ConferenciaApp = {
   currentRouteId: null,
   viaCsv: false,
 
-  // Cloud
-  cloudEnabled: false,
-  supa: null,
-
   // =======================
-  // Boot Supabase
-  // =======================
-  initCloud() {
-    try {
-      const url = (window.SUPABASE_URL || '').trim();
-      const key = (window.SUPABASE_KEY || '').trim();
-      if (!url || !key) {
-        this.cloudEnabled = false;
-        return;
-      }
-      // supabase-js v2 expõe global "supabase" com createClient
-      if (!window.supabase || !window.supabase.createClient) {
-        console.warn('Supabase JS não carregou.');
-        this.cloudEnabled = false;
-        return;
-      }
-      this.supa = window.supabase.createClient(url, key);
-      this.cloudEnabled = true;
-    } catch (e) {
-      console.warn('Falha ao iniciar Supabase:', e);
-      this.cloudEnabled = false;
-    }
-  },
-
-  // =======================
-  // Persistência Local
+  // Persistência (LOCAL)
   // =======================
   loadFromStorage() {
     try {
@@ -67,6 +38,7 @@ const ConferenciaApp = {
         route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [String(k), v]));
         route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [String(k), v]));
 
+        // reconstrói faltantes se vier vazio
         if (!route.faltantes.size && route.ids.size) {
           route.faltantes = new Set(route.ids);
           for (const c of route.conferidos) route.faltantes.delete(c);
@@ -112,9 +84,6 @@ const ConferenciaApp = {
     if (this.currentRouteId === id) this.currentRouteId = null;
     this.saveToStorage();
     this.renderRoutesSelects();
-
-    // cloud best-effort (não trava)
-    this.deleteRouteFromCloud(id).catch(() => {});
   },
 
   clearAllRoutes() {
@@ -135,10 +104,10 @@ const ConferenciaApp = {
       destinationFacilityName: '',
 
       timestamps: new Map(), // id -> epoch (ms)
-      ids: new Set(),        // IDs esperados (importados)
-      faltantes: new Set(),  // IDs ainda não conferidos (subset de ids)
-      conferidos: new Set(), // IDs conferidos (bipados corretos)
-      foraDeRota: new Set(), // IDs bipados fora
+      ids: new Set(),        // importados
+      faltantes: new Set(),  // ids ainda não conferidos
+      conferidos: new Set(), // bipados corretos
+      foraDeRota: new Set(), // bipados fora
       duplicados: new Map(), // id -> count (>=2 significa duplicado)
 
       totalInicial: 0
@@ -150,17 +119,13 @@ const ConferenciaApp = {
     return this.routes.get(String(this.currentRouteId)) || null;
   },
 
-  async setCurrentRoute(routeId) {
+  setCurrentRoute(routeId) {
     const id = String(routeId);
     if (!this.routes.has(id)) {
       alert('Rota não encontrada.');
       return;
     }
     this.currentRouteId = id;
-
-    // tenta puxar itens da nuvem (não bloqueia se falhar)
-    await this.loadRouteItemsFromCloud(id).catch(() => {});
-
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
     this.saveToStorage();
@@ -327,7 +292,7 @@ const ConferenciaApp = {
   },
 
   // =======================
-  // Conferência (LOCAL + Cloud best-effort)
+  // Conferência
   // =======================
   conferirId(codigo) {
     const r = this.current;
@@ -339,12 +304,12 @@ const ConferenciaApp = {
     const correctRouteId = this.findCorrectRouteForId(id);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
 
+    // se for o ID correto nesta rota, remove de outras rotas onde estava fora
     if (isCorrectHere) {
-      // remove da rota errada localmente
       this.cleanupIdFromOtherRoutes(id, this.currentRouteId);
     }
 
-    // DUPLICATA
+    // duplicata (já conferido ou já fora de rota)
     if (r.conferidos.has(id) || r.foraDeRota.has(id)) {
       const count = r.duplicados.get(id) || 1;
       r.duplicados.set(id, count + 1);
@@ -355,17 +320,10 @@ const ConferenciaApp = {
       $('#barcode-input').val('').focus();
       this.saveToStorage();
       this.atualizarListas();
-
-      // cloud best-effort
-      this.upsertScanToCloud(this.currentRouteId, id, {
-        scanned_at: new Date(now).toISOString(),
-        is_out_of_route: !isCorrectHere, // se não é da rota atual, marca como fora
-        duplicate_count: (count + 1) - 1
-      }).catch(() => {});
       return;
     }
 
-    // CONFERE NORMAL
+    // conferência normal
     if (r.faltantes.has(id)) {
       r.faltantes.delete(id);
       r.conferidos.add(id);
@@ -374,17 +332,10 @@ const ConferenciaApp = {
       $('#barcode-input').val('').focus();
       this.saveToStorage();
       this.atualizarListas();
-
-      // cloud best-effort: se for correto, marca como dentro da rota
-      this.upsertScanToCloud(this.currentRouteId, id, {
-        scanned_at: new Date(now).toISOString(),
-        is_out_of_route: false,
-        duplicate_count: 0
-      }).catch(() => {});
       return;
     }
 
-    // FORA DE ROTA
+    // fora de rota
     r.foraDeRota.add(id);
     r.timestamps.set(id, now);
     if (!this.viaCsv) this.playAlertSound();
@@ -392,13 +343,6 @@ const ConferenciaApp = {
     $('#barcode-input').val('').focus();
     this.saveToStorage();
     this.atualizarListas();
-
-    // cloud best-effort
-    this.upsertScanToCloud(this.currentRouteId, id, {
-      scanned_at: new Date(now).toISOString(),
-      is_out_of_route: true,
-      duplicate_count: 0
-    }).catch(() => {});
   },
 
   // =======================
@@ -460,9 +404,6 @@ const ConferenciaApp = {
       route.totalInicial = route.ids.size;
       this.routes.set(routeId, route);
       imported++;
-
-      // cloud meta best-effort
-      this.upsertRouteMetaToCloud(route).catch(() => {});
     }
 
     this.saveToStorage();
@@ -471,7 +412,7 @@ const ConferenciaApp = {
   },
 
   // =======================
-  // CSV (EXATAMENTE COMO O ANTIGO)
+  // EXPORT: rota atual CSV (modo local)
   // =======================
   exportRotaAtualCsv() {
     const r = this.current;
@@ -480,63 +421,45 @@ const ConferenciaApp = {
       return;
     }
 
-    const all = [
-      ...Array.from(r.conferidos),
-      ...Array.from(r.foraDeRota),
-      ...Array.from(r.duplicados.keys())
-    ];
+    const rows = [];
+    rows.push(['ID', 'STATUS', 'DUPLICADO_X']);
 
-    if (!all.length) {
-      alert('Nenhum ID para exportar.');
-      return;
+    const idsOrdenados = Array.from(r.ids).sort((a, b) => String(a).localeCompare(String(b)));
+    for (const id of idsOrdenados) {
+      const dup = r.duplicados.get(id) || 0;
+      const status = r.conferidos.has(id) ? 'CONFERIDO' : 'FALTANTE';
+      rows.push([id, status, dup ? `${dup}x` : '']);
     }
 
-    const parseDateSafe = (value) => {
-      if (!value) return new Date();
-      if (value instanceof Date) return value;
-      if (typeof value === 'number') return new Date(value);
-      if (typeof value === 'string') {
-        if (/^\d{4}-\d{2}-\d{2}T/.test(value)) {
-          const d = new Date(value);
-          if (!isNaN(d.getTime())) return d;
-        }
-        if (/^\d{13}$/.test(value)) return new Date(Number(value));
-        const d = new Date(value);
-        if (!isNaN(d.getTime())) return d;
-      }
-      return new Date();
+    const foraOrdenados = Array.from(r.foraDeRota).sort((a, b) => String(a).localeCompare(String(b)));
+    for (const id of foraOrdenados) {
+      const dup = r.duplicados.get(id) || 0;
+      const status = dup > 0 ? 'DUPLICADO' : 'FORA_DE_ROTA';
+      rows.push([id, status, dup ? `${dup}x` : '']);
+    }
+
+    const esc = (v) => {
+      const s = String(v ?? '');
+      if (/[",\n\r;]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
     };
 
-    const zona = 'Horário Padrão de Brasília';
-    const header = 'date,time,time_zone,format,text,notes,favorite,date_utc,time_utc,metadata,duplicates';
+    const csv = rows.map(line => line.map(esc).join(',')).join('\r\n');
 
-    const linhas = all.map(id => {
-      const lidaEm = parseDateSafe(r.timestamps.get(id));
-      const pad2 = n => String(n).padStart(2,'0');
-      const date = `${lidaEm.getFullYear()}-${pad2(lidaEm.getMonth()+1)}-${pad2(lidaEm.getDate())}`;
-      const time = `${pad2(lidaEm.getHours())}:${pad2(lidaEm.getMinutes())}:${pad2(lidaEm.getSeconds())}`;
-
-      const dateUtc = lidaEm.toISOString().slice(0, 10);
-      const timeUtc = lidaEm.toISOString().split('T')[1].split('.')[0];
-      const dupCount = r.duplicados.get(id) ? (r.duplicados.get(id) - 1) : 0;
-
-      return `${date},${time},${zona},Code 128,${id},,0,${dateUtc},${timeUtc},,${dupCount}`;
-    });
-
-    const conteudo = [header, ...linhas].join('\r\n');
-    const blob = new Blob([conteudo], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
 
-    const cluster = (r.cluster || 'semCluster').replace(/\s+/g, '_');
-    const rota = (r.routeId || 'semRota').replace(/\s+/g, '_');
-    link.download = `${cluster}_${rota}_padrao.csv`;
+    const pad2 = (n) => String(n).padStart(2, '0');
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${pad2(now.getMonth()+1)}-${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}`;
 
+    link.download = `rota_${r.routeId}_validacao_${stamp}.csv`;
     link.click();
   },
 
   // =======================
-  // XLSX: todas as rotas
+  // EXPORT: todas as rotas XLSX
   // 1 aba ("Bipagens"), 1 coluna por rota, só IDs conferidos
   // =======================
   exportTodasRotasXlsx() {
@@ -558,8 +481,7 @@ const ConferenciaApp = {
       const header = cluster ? `${routeId}-${cluster}` : routeId;
 
       const ids = Array.from(r.conferidos || []);
-
-      // ordena por timestamp (se existir) e depois por ID
+      // ordena por timestamp e depois ID
       ids.sort((x, y) => {
         const tx = r.timestamps?.get(x) ? Number(r.timestamps.get(x)) : 0;
         const ty = r.timestamps?.get(y) ? Number(r.timestamps.get(y)) : 0;
@@ -573,14 +495,12 @@ const ConferenciaApp = {
 
     const aoa = [];
     aoa.push(cols.map(c => c.header || 'ROTA'));
-
     for (let i = 0; i < maxLen; i++) {
       aoa.push(cols.map(c => c.ids[i] || ''));
     }
 
     const wb = XLSX.utils.book_new();
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-
     ws['!freeze'] = { xSplit: 0, ySplit: 1 };
     ws['!cols'] = cols.map(() => ({ wch: 18 }));
 
@@ -591,167 +511,18 @@ const ConferenciaApp = {
     const stamp = `${now.getFullYear()}-${pad2(now.getMonth()+1)}-${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}`;
 
     XLSX.writeFile(wb, `bipagens_todas_rotas_${stamp}.xlsx`);
-  },
-
-  // =======================
-  // CLOUD: carregar rotas meta
-  // =======================
-  async loadRoutesFromCloud() {
-    if (!this.cloudEnabled || !this.supa) return;
-    try {
-      const { data, error } = await this.supa
-        .from('routes')
-        .select('route_id,cluster,destination_facility_id,destination_facility_name,updated_at')
-        .order('route_id', { ascending: true });
-
-      if (error) throw error;
-      if (!data) return;
-
-      for (const row of data) {
-        const routeId = String(row.route_id);
-        const route = this.routes.get(routeId) || this.makeEmptyRoute(routeId);
-
-        route.cluster = row.cluster || route.cluster || '';
-        route.destinationFacilityId = row.destination_facility_id || route.destinationFacilityId || '';
-        route.destinationFacilityName = row.destination_facility_name || route.destinationFacilityName || '';
-
-        this.routes.set(routeId, route);
-      }
-
-      this.saveToStorage();
-      this.renderRoutesSelects();
-    } catch (e) {
-      console.warn('Cloud routes load error:', e);
-    }
-  },
-
-  // =======================
-  // CLOUD: carregar itens da rota (conferidos/fora/duplicados)
-  // =======================
-  async loadRouteItemsFromCloud(routeId) {
-    if (!this.cloudEnabled || !this.supa) return;
-    const rid = String(routeId);
-    const r = this.routes.get(rid);
-    if (!r) return;
-
-    try {
-      const { data, error } = await this.supa
-        .from('route_items')
-        .select('route_id,shipment_id,scanned_at,is_out_of_route,duplicate_count')
-        .eq('route_id', rid);
-
-      if (error) throw error;
-      if (!data) return;
-
-      // mescla no estado local sem quebrar ids importados
-      for (const row of data) {
-        const sid = String(row.shipment_id);
-        const scannedAt = row.scanned_at ? new Date(row.scanned_at).getTime() : Date.now();
-        r.timestamps.set(sid, scannedAt);
-
-        const dup = Number(row.duplicate_count || 0);
-        if (dup > 0) r.duplicados.set(sid, dup + 1); // interno = contagem total (>=2)
-
-        if (row.is_out_of_route) {
-          r.foraDeRota.add(sid);
-        } else {
-          // se for esperado, marca conferido
-          if (r.ids.has(sid) || r.faltantes.has(sid)) {
-            r.faltantes.delete(sid);
-            r.conferidos.add(sid);
-          } else {
-            // se não era esperado (sem import), ainda assim tratamos como conferido
-            r.conferidos.add(sid);
-          }
-        }
-      }
-
-      // evita ficar “sem faltantes” quando veio só da nuvem
-      if (!r.faltantes.size && r.ids.size) {
-        r.faltantes = new Set(r.ids);
-        for (const c of r.conferidos) r.faltantes.delete(c);
-      }
-
-      this.saveToStorage();
-    } catch (e) {
-      console.warn('Cloud route_items load error:', e);
-    }
-  },
-
-  // =======================
-  // CLOUD: upsert meta de rota
-  // =======================
-  async upsertRouteMetaToCloud(route) {
-    if (!this.cloudEnabled || !this.supa) return;
-
-    try {
-      const payload = {
-        route_id: String(route.routeId),
-        cluster: route.cluster || null,
-        destination_facility_id: route.destinationFacilityId || null,
-        destination_facility_name: route.destinationFacilityName || null
-      };
-
-      const { error } = await this.supa
-        .from('routes')
-        .upsert(payload, { onConflict: 'route_id' });
-
-      if (error) throw error;
-    } catch (e) {
-      console.warn('upsert routes error:', e);
-    }
-  },
-
-  // =======================
-  // CLOUD: upsert scan
-  // =======================
-  async upsertScanToCloud(routeId, shipmentId, fields) {
-    if (!this.cloudEnabled || !this.supa) return;
-
-    const payload = {
-      route_id: String(routeId),
-      shipment_id: String(shipmentId),
-      scanned_at: fields?.scanned_at || new Date().toISOString(),
-      is_out_of_route: !!fields?.is_out_of_route,
-      duplicate_count: Number(fields?.duplicate_count || 0),
-    };
-
-    try {
-      const { error } = await this.supa
-        .from('route_items')
-        .upsert(payload, { onConflict: 'route_id,shipment_id' });
-
-      if (error) throw error;
-    } catch (e) {
-      console.warn('upsert route_items error:', e);
-    }
-  },
-
-  // (opcional) delete rota no cloud (precisa policy de delete)
-  async deleteRouteFromCloud(routeId) {
-    if (!this.cloudEnabled || !this.supa) return;
-    try {
-      await this.supa.from('route_items').delete().eq('route_id', String(routeId));
-      await this.supa.from('routes').delete().eq('route_id', String(routeId));
-    } catch (e) {
-      // sem policy delete, vai falhar — mas não quebra o app
-    }
-  },
+  }
 };
 
 // =======================
-// Eventos (IMPORTANTE: não travar por cloud)
+// Eventos
 // =======================
-$(document).ready(async () => {
+$(document).ready(() => {
+  console.log('JS carregou', new Date().toISOString());
   ConferenciaApp.loadFromStorage();
-  ConferenciaApp.initCloud();
   ConferenciaApp.renderRoutesSelects();
-
-  // carrega do cloud em background (sem travar UI)
-  await ConferenciaApp.loadRoutesFromCloud().catch(() => {});
 });
 
-// Importar HTML
 $(document).on('click', '#extract-btn', () => {
   const raw = $('#html-input').val();
   if (!raw.trim()) return alert('Cole o HTML antes de importar.');
@@ -762,12 +533,11 @@ $(document).on('click', '#extract-btn', () => {
   alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
-// Carregar rota
-$(document).on('click', '#load-route', async () => {
+$(document).on('click', '#load-route', () => {
   const id = $('#saved-routes').val();
   if (!id) return alert('Selecione uma rota salva.');
 
-  await ConferenciaApp.setCurrentRoute(id);
+  ConferenciaApp.setCurrentRoute(id);
 
   $('#initial-interface').addClass('d-none');
   $('#manual-interface').addClass('d-none');
@@ -776,28 +546,24 @@ $(document).on('click', '#load-route', async () => {
   $('#barcode-input').focus();
 });
 
-// Excluir rota
 $(document).on('click', '#delete-route', () => {
   const id = $('#saved-routes').val();
   if (!id) return alert('Selecione uma rota para excluir.');
   ConferenciaApp.deleteRoute(id);
 });
 
-// Limpar todas
 $(document).on('click', '#clear-all-routes', () => {
   ConferenciaApp.clearAllRoutes();
   alert('Todas as rotas foram removidas.');
 });
 
-// Trocar rota dentro
-$(document).on('click', '#switch-route', async () => {
+$(document).on('click', '#switch-route', () => {
   const id = $('#saved-routes-inapp').val();
   if (!id) return;
-  await ConferenciaApp.setCurrentRoute(id);
+  ConferenciaApp.setCurrentRoute(id);
   $('#barcode-input').focus();
 });
 
-// Manual
 $(document).on('click', '#manual-btn', () => {
   $('#initial-interface').addClass('d-none');
   $('#manual-interface').removeClass('d-none');
@@ -828,9 +594,6 @@ $(document).on('click', '#submit-manual', () => {
     ConferenciaApp.saveToStorage();
     ConferenciaApp.renderRoutesSelects();
 
-    // cloud meta best-effort
-    ConferenciaApp.upsertRouteMetaToCloud(route).catch(() => {});
-
     alert(`Rota ${routeId} salva com ${route.totalInicial} ID(s).`);
 
     $('#manual-interface').addClass('d-none');
@@ -841,7 +604,7 @@ $(document).on('click', '#submit-manual', () => {
   }
 });
 
-// ENTER no input (use keydown pra evitar falhas em alguns leitores)
+// Enter no input (robusto)
 $(document).on('keydown', '#barcode-input', (e) => {
   if (e.key === 'Enter' || e.which === 13) {
     e.preventDefault();
@@ -860,7 +623,6 @@ $(document).on('keydown', '#barcode-input', (e) => {
   }
 });
 
-// Checar CSV
 $(document).on('click', '#check-csv', () => {
   const r = ConferenciaApp.current;
   if (!r) return alert('Selecione uma rota antes.');
@@ -899,20 +661,18 @@ $(document).on('click', '#check-csv', () => {
   reader.readAsText(file, 'UTF-8');
 });
 
-// Export CSV rota atual
+// Exportações
 $(document).on('click', '#export-csv-rota-atual', () => {
   ConferenciaApp.exportRotaAtualCsv();
 });
 
-// Export XLSX todas rotas
 $(document).on('click', '#export-xlsx-todas-rotas', () => {
   ConferenciaApp.exportTodasRotasXlsx();
 });
 
-// Sem bind no finalizar (não faz download)
+// Finalizar sem download
 $(document).on('click', '#finish-btn', () => {
-  alert('Finalizar não exporta automaticamente. Use os botões de exportação acima.');
+  alert('Finalizar não exporta automaticamente. Use os botões de exportação.');
 });
 
-// Voltar
 $(document).on('click', '#back-btn', () => location.reload());
