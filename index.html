@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Conferência de Rota</title>
+
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+
+  <style>
+    .d-none { display: none !important; }
+    .list-section { max-height: 400px; overflow-y: auto; }
+  </style>
+</head>
+
+<body>
+<div class="container pt-4" id="html">
+  <div class="row">
+    <div class="col-sm-2"></div>
+
+    <div class="col-sm-8">
+
+      <!-- Interface inicial -->
+      <div id="initial-interface">
+        <div class="text-center mb-3">
+          <h2>Conferência de Rota</h2>
+        </div>
+
+        <!-- Rotas salvas -->
+        <div class="card mb-3">
+          <div class="card-body">
+            <h5 class="mb-2">Rotas salvas</h5>
+
+            <div class="row">
+              <div class="col-md-8">
+                <select id="saved-routes" class="form-control">
+                  <option value="">(Nenhuma selecionada)</option>
+                </select>
+              </div>
+              <div class="col-md-4 mt-2 mt-md-0">
+                <button id="load-route" class="btn btn-success btn-block">Carregar rota</button>
+              </div>
+            </div>
+
+            <div class="row mt-2">
+              <div class="col-md-6">
+                <button id="delete-route" class="btn btn-outline-danger btn-block">Excluir rota</button>
+              </div>
+              <div class="col-md-6 mt-2 mt-md-0">
+                <button id="clear-all-routes" class="btn btn-outline-secondary btn-block">Limpar todas</button>
+              </div>
+            </div>
+
+            <small class="text-muted d-block mt-2">
+              Você pode colar vários HTMLs abaixo. O sistema detecta e salva várias rotas.
+            </small>
+          </div>
+        </div>
+
+        <textarea id="html-input" class="form-control mb-3" rows="8"
+          placeholder="Insira o HTML bruto (pode colar mais de uma rota)"></textarea>
+
+        <div class="text-center">
+          <button id="extract-btn" class="btn btn-primary mb-2">Importar/Salvar Rotas do HTML</button>
+          <button id="manual-btn" class="btn btn-secondary">Adicionar IDs Manualmente</button>
+        </div>
+      </div>
+
+      <!-- Interface de conferência -->
+      <div id="conference-interface" class="d-none">
+        <div class="text-center mb-3">
+          <h2 id="destination-facility-title"></h2>
+          <h2 id="destination-facility-name"></h2>
+        </div>
+
+        <h3 id="cluster-title"></h3>
+        <h4 id="route-title"></h4>
+
+        <!-- Trocar rota sem voltar -->
+        <div class="alert alert-light border">
+          <div class="row align-items-center">
+            <div class="col-md-8">
+              <select id="saved-routes-inapp" class="form-control"></select>
+            </div>
+            <div class="col-md-4 mt-2 mt-md-0">
+              <button id="switch-route" class="btn btn-outline-primary btn-block">Trocar rota</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="my-2">
+          <div>Pacotes extraídos: <strong><span id="extracted-total">0</span></strong></div>
+          <div>Pacotes conferidos: <strong><span id="verified-total">0</span></strong></div>
+
+          <div class="progress my-2">
+            <div id="progress-bar" class="progress-bar" role="progressbar" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <input type="text" id="barcode-input" class="form-control"
+          placeholder="Leia ou digite o código de barras" autofocus>
+
+        <div class="row text-center mt-4">
+          <div class="col-md-3">
+            <h5>Conferidos</h5>
+            <ul id="conferidos-list" class="list-group list-section"></ul>
+          </div>
+          <div class="col-md-3">
+            <h5>Faltantes</h5>
+            <ul id="faltantes-list" class="list-group list-section"></ul>
+          </div>
+          <div class="col-md-3">
+            <h5>Fora de Rota</h5>
+            <ul id="fora-rota-list" class="list-group list-section"></ul>
+          </div>
+          <div class="col-md-3">
+            <h5>Duplicados</h5>
+            <ul id="duplicados-list" class="list-group list-section"></ul>
+          </div>
+        </div>
+
+        <div class="text-center my-3">
+          <input type="file" id="csv-input" accept=".csv" class="form-control mb-2">
+          <button id="check-csv" class="btn btn-info mb-2">Checar CSV</button><br>
+
+          <!-- NOVO: rota atual CSV -->
+          <button id="export-csv-rota-atual" class="btn btn-success mb-2">
+            Exportar rota atual (CSV)
+          </button><br>
+
+          <!-- NOVO: todas as rotas XLSX -->
+          <button id="export-xlsx-todas-rotas" class="btn btn-success mb-2">
+            Exportar todas as rotas (XLSX)
+          </button><br>
+
+          <!-- Mantido (sem bind, fica sem ação) -->
+          <button id="finish-btn" class="btn btn-danger">Finalizar Conferência</button>
+          <button id="back-btn" class="btn btn-secondary">Voltar</button>
+        </div>
+      </div>
+
+      <!-- Interface manual -->
+      <div id="manual-interface" class="d-none">
+        <h4>Adicionar IDs Manualmente</h4>
+
+        <div class="row">
+          <div class="col-md-6">
+            <input id="manual-routeid" class="form-control mb-2" placeholder="RouteId (ex: 12345)">
+          </div>
+          <div class="col-md-6">
+            <input id="manual-cluster" class="form-control mb-2" placeholder="Cluster (opcional)">
+          </div>
+        </div>
+
+        <textarea id="manual-input" class="form-control mb-3" rows="8"
+          placeholder="Separe IDs por vírgula, ;, espaço ou linha"></textarea>
+
+        <div class="text-center">
+          <button id="submit-manual" class="btn btn-primary">Salvar rota manual</button>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="col-sm-2"></div>
+  </div>
+</div>
+
+<!-- SCRIPTS: ORDEM IMPORTA -->
+<script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
+<script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
+
+<!-- jsPDF (se você ainda usa PDF em algum lugar) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<!-- SheetJS (Excel) - precisa vir ANTES do conferencia.js -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<!-- Seu script -->
+<script src="conferencia.js" defer></script>
+</body>
+</html>
