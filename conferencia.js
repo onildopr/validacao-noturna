@@ -533,24 +533,22 @@ $(document).on('click', '#extract-btn', () => {
   alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
-$(document).on('click', '#load-route', () => {
-  const id = $('#saved-routes').val();
-  if (!id) return alert('Selecione uma rota salva.');
+$(document).on('click', '#extract-btn', () => {
+  const $htmlInput = $('#html-input');
+  const raw = $htmlInput.val();
 
-  ConferenciaApp.setCurrentRoute(id);
+  if (!raw.trim()) return alert('Cole o HTML antes de importar.');
 
-  $('#initial-interface').addClass('d-none');
-  $('#manual-interface').addClass('d-none');
-  $('#conference-interface').removeClass('d-none');
+  const qtd = ConferenciaApp.importRoutesFromHtml(raw);
 
-  $('#barcode-input').focus();
+  // ✅ limpa o campo SEMPRE após tentar importar
+  $htmlInput.val('');
+
+  if (!qtd) return alert('Nenhuma rota importada. Confira se o HTML está completo.');
+
+  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
-$(document).on('click', '#delete-route', () => {
-  const id = $('#saved-routes').val();
-  if (!id) return alert('Selecione uma rota para excluir.');
-  ConferenciaApp.deleteRoute(id);
-});
 
 $(document).on('click', '#clear-all-routes', () => {
   ConferenciaApp.clearAllRoutes();
@@ -676,3 +674,4 @@ $(document).on('click', '#finish-btn', () => {
 });
 
 $(document).on('click', '#back-btn', () => location.reload());
+
