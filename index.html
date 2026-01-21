@@ -123,19 +123,17 @@
           <input type="file" id="csv-input" accept=".csv" class="form-control mb-2">
           <button id="check-csv" class="btn btn-info mb-2">Checar CSV</button><br>
 
-          <!-- NOVO: rota atual CSV -->
           <button id="export-csv-rota-atual" class="btn btn-success mb-2">
             Exportar rota atual (CSV)
           </button><br>
 
-          <!-- NOVO: todas as rotas XLSX -->
           <button id="export-xlsx-todas-rotas" class="btn btn-success mb-2">
             Exportar todas as rotas (XLSX)
           </button><br>
 
-          <!-- Mantido (sem bind, fica sem ação) -->
-          <button id="finish-btn" class="btn btn-danger">Finalizar Conferência</button>
-          <button id="back-btn" class="btn btn-secondary">Voltar</button>
+          <!-- sem ação (sem bind) -->
+          <button id="finish-btn" class="btn btn-danger" type="button">Finalizar Conferência</button>
+          <button id="back-btn" class="btn btn-secondary" type="button">Voltar</button>
         </div>
       </div>
 
@@ -156,7 +154,7 @@
           placeholder="Separe IDs por vírgula, ;, espaço ou linha"></textarea>
 
         <div class="text-center">
-          <button id="submit-manual" class="btn btn-primary">Salvar rota manual</button>
+          <button id="submit-manual" class="btn btn-primary" type="button">Salvar rota manual</button>
         </div>
       </div>
 
@@ -171,23 +169,22 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
 <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
 
-<!-- jsPDF (se você ainda usa PDF em algum lugar) -->
+<!-- jsPDF (opcional) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<!-- CONFIG SUPABASE (antes do supabase-js e antes do seu script) -->
 <script>
   window.SUPABASE_URL = "https://fyiidislmfzcfjvwsbmw.supabase.co";
   window.SUPABASE_KEY = "sb_publishable_vly1ftC1NMTiYm0YxXfUmA_pZ7yHxaR";
 </script>
 
-
-<!-- SheetJS (Excel) - precisa vir ANTES do conferencia.js -->
+<!-- Supabase JS -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="conferencia.js" defer></script>
 
+<!-- SheetJS (Excel) - TEM que vir antes do seu JS -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
-<!-- Seu script -->
-<script src="conferencia.js" defer></script>
+<!-- Seu script (APENAS UMA VEZ) -->
+<script src="conferencia.js"></script>
 </body>
 </html>
-
-
