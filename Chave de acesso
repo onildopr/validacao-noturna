@@ -1,0 +1,4 @@
+window.APP_CONFIG = {
+  SUPABASE_URL: "https://fyiidislmfzcfjvwsbmw.supabase.co",
+  SUPABASE_KEY: "COLE_AQUI_SUA_NOVA_PUBLISHABLE_KEY_ROTACIONADA"
+};
