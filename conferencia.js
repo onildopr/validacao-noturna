@@ -1,96 +1,46 @@
-/* global $, XLSX */
-
 const { jsPDF } = window.jspdf || {};
 
-const STORAGE_KEY = 'conferencia.routes.v1';
+const STORAGE_KEY_PREFIX = 'conferencia.routes.daycache.v1'; // cache local por dia
+const SYNC_INTERVAL_MS = 20000;
 
 const ConferenciaApp = {
-  routes: new Map(),     // routeId -> routeObject
+  routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
   currentRouteId: null,
   viaCsv: false,
 
+  // Sync mensal/dia
+  workDay: null,               // YYYY-MM-DD
+  monthFileHandle: null,       // FileSystemFileHandle
+  monthData: null,             // JSON do mês carregado
+  lastCloudReadAt: 0,
+  lastCloudWriteAt: 0,
+  syncing: false,
+  pendingWrite: false,
+
   // =======================
-  // Persistência (LOCAL)
+  // Util data/strings
   // =======================
-  loadFromStorage() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
+  pad2(n) { return String(n).padStart(2, '0'); },
 
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') return;
-
-      this.routes.clear();
-
-      for (const [routeId, r] of Object.entries(parsed)) {
-        const route = this.makeEmptyRoute(routeId);
-
-        route.cluster = r.cluster || '';
-        route.destinationFacilityId = r.destinationFacilityId || '';
-        route.destinationFacilityName = r.destinationFacilityName || '';
-        route.totalInicial = Number(r.totalInicial || 0);
-
-        (r.ids || []).forEach(id => route.ids.add(String(id)));
-        (r.conferidos || []).forEach(id => route.conferidos.add(String(id)));
-        (r.foraDeRota || []).forEach(id => route.foraDeRota.add(String(id)));
-        route.faltantes = new Set((r.faltantes || []).map(String));
-
-        route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [String(k), v]));
-        route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [String(k), v]));
-
-        // reconstrói faltantes se vier vazio
-        if (!route.faltantes.size && route.ids.size) {
-          route.faltantes = new Set(route.ids);
-          for (const c of route.conferidos) route.faltantes.delete(c);
-        }
-
-        this.routes.set(String(routeId), route);
-      }
-    } catch (e) {
-      console.warn('Falha ao carregar storage:', e);
-    }
+  todayLocalISO() {
+    const d = new Date();
+    return `${d.getFullYear()}-${this.pad2(d.getMonth()+1)}-${this.pad2(d.getDate())}`;
   },
 
-  saveToStorage() {
-    try {
-      const obj = {};
-      for (const [routeId, r] of this.routes.entries()) {
-        obj[routeId] = {
-          routeId: r.routeId,
-          cluster: r.cluster,
-          destinationFacilityId: r.destinationFacilityId,
-          destinationFacilityName: r.destinationFacilityName,
-          totalInicial: r.totalInicial,
-
-          ids: Array.from(r.ids),
-          faltantes: Array.from(r.faltantes),
-          conferidos: Array.from(r.conferidos),
-          foraDeRota: Array.from(r.foraDeRota),
-
-          timestamps: Object.fromEntries(r.timestamps),
-          duplicados: Object.fromEntries(r.duplicados),
-        };
-      }
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
-    } catch (e) {
-      console.warn('Falha ao salvar storage:', e);
-    }
+  monthKeyFromDay(dayISO) {
+    // "2026-01"
+    return String(dayISO || '').slice(0, 7);
   },
 
-  deleteRoute(routeId) {
-    if (!routeId) return;
-    const id = String(routeId);
-    this.routes.delete(id);
-    if (this.currentRouteId === id) this.currentRouteId = null;
-    this.saveToStorage();
-    this.renderRoutesSelects();
+  storageKeyForDay(dayISO) {
+    return `${STORAGE_KEY_PREFIX}.${dayISO}`;
   },
 
-  clearAllRoutes() {
-    this.routes.clear();
-    this.currentRouteId = null;
-    localStorage.removeItem(STORAGE_KEY);
-    this.renderRoutesSelects();
+  setStatus(txt, kind='muted') {
+    const $s = $('#sync-status');
+    $s.removeClass('text-muted text-success text-danger text-warning');
+    $s.addClass(`text-${kind}`);
+    $s.text(txt);
   },
 
   // =======================
@@ -104,11 +54,11 @@ const ConferenciaApp = {
       destinationFacilityName: '',
 
       timestamps: new Map(), // id -> epoch (ms)
-      ids: new Set(),        // importados
-      faltantes: new Set(),  // ids ainda não conferidos
-      conferidos: new Set(), // bipados corretos
-      foraDeRota: new Set(), // bipados fora
-      duplicados: new Map(), // id -> count (>=2 significa duplicado)
+      ids: new Set(),
+      faltantes: new Set(),
+      conferidos: new Set(),
+      foraDeRota: new Set(),
+      duplicados: new Map(), // id -> count
 
       totalInicial: 0
     };
@@ -119,6 +69,377 @@ const ConferenciaApp = {
     return this.routes.get(String(this.currentRouteId)) || null;
   },
 
+  // =======================
+  // Persistência local (cache por dia)
+  // =======================
+  loadFromStorage(dayISO) {
+    try {
+      const key = this.storageKeyForDay(dayISO);
+      const raw = localStorage.getItem(key);
+      if (!raw) return;
+
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return;
+
+      this.routes.clear();
+      this.currentRouteId = null;
+
+      for (const [routeId, r] of Object.entries(parsed)) {
+        const route = this.makeEmptyRoute(routeId);
+
+        route.cluster = r.cluster || '';
+        route.destinationFacilityId = r.destinationFacilityId || '';
+        route.destinationFacilityName = r.destinationFacilityName || '';
+        route.totalInicial = Number(r.totalInicial || 0);
+
+        (r.ids || []).forEach(id => route.ids.add(id));
+        (r.conferidos || []).forEach(id => route.conferidos.add(id));
+        (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
+        route.faltantes = new Set(r.faltantes || []);
+
+        route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [k, v]));
+        route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, v]));
+
+        if (!route.faltantes.size && route.ids.size) {
+          route.faltantes = new Set(route.ids);
+          for (const c of route.conferidos) route.faltantes.delete(c);
+        }
+
+        this.routes.set(String(routeId), route);
+      }
+    } catch (e) {
+      console.warn('Falha ao carregar storage:', e);
+    }
+  },
+
+  saveToStorage(dayISO) {
+    try {
+      const key = this.storageKeyForDay(dayISO);
+      const obj = {};
+      for (const [routeId, r] of this.routes.entries()) {
+        obj[routeId] = this.serializeRoute(r);
+      }
+      localStorage.setItem(key, JSON.stringify(obj));
+    } catch (e) {
+      console.warn('Falha ao salvar storage:', e);
+    }
+  },
+
+  serializeRoute(r) {
+    return {
+      routeId: r.routeId,
+      cluster: r.cluster,
+      destinationFacilityId: r.destinationFacilityId,
+      destinationFacilityName: r.destinationFacilityName,
+      totalInicial: r.totalInicial,
+
+      ids: Array.from(r.ids),
+      faltantes: Array.from(r.faltantes),
+      conferidos: Array.from(r.conferidos),
+      foraDeRota: Array.from(r.foraDeRota),
+
+      timestamps: Object.fromEntries(r.timestamps),
+      duplicados: Object.fromEntries(r.duplicados),
+    };
+  },
+
+  deserializeRoute(routeId, r) {
+    const route = this.makeEmptyRoute(routeId);
+
+    route.cluster = r.cluster || '';
+    route.destinationFacilityId = r.destinationFacilityId || '';
+    route.destinationFacilityName = r.destinationFacilityName || '';
+    route.totalInicial = Number(r.totalInicial || 0);
+
+    (r.ids || []).forEach(id => route.ids.add(id));
+    (r.conferidos || []).forEach(id => route.conferidos.add(id));
+    (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
+    route.faltantes = new Set(r.faltantes || []);
+
+    route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [k, v]));
+    route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, v]));
+
+    if (!route.faltantes.size && route.ids.size) {
+      route.faltantes = new Set(route.ids);
+      for (const c of route.conferidos) route.faltantes.delete(c);
+    }
+
+    return route;
+  },
+
+  // =======================
+  // Cloud file (Drive) - JSON mensal
+  // =======================
+  async pickMonthFileHandle() {
+    if (!window.showOpenFilePicker) {
+      alert('Seu navegador não suporta File System Access API. Use Chrome atualizado.');
+      return;
+    }
+    try {
+      const [handle] = await window.showOpenFilePicker({
+        types: [{
+          description: 'Arquivo JSON de conferência do mês',
+          accept: { 'application/json': ['.json'] }
+        }],
+        multiple: false
+      });
+
+      this.monthFileHandle = handle;
+      $('#month-file-name').text(handle?.name || '(arquivo selecionado)');
+      this.setStatus('arquivo selecionado', 'success');
+
+      // Carrega o mês e aplica o dia atual
+      await this.loadMonthFile();
+      await this.applyWorkDay(this.workDay || this.todayLocalISO());
+    } catch (e) {
+      console.warn(e);
+      this.setStatus('seleção cancelada', 'muted');
+    }
+  },
+
+  async loadMonthFile() {
+    if (!this.monthFileHandle) return;
+
+    this.setStatus('lendo arquivo...', 'warning');
+    try {
+      const file = await this.monthFileHandle.getFile();
+      const text = await file.text();
+
+      let json;
+      if (!text.trim()) {
+        // arquivo vazio => inicializa
+        json = null;
+      } else {
+        json = JSON.parse(text);
+      }
+
+      if (!json || typeof json !== 'object') {
+        json = { version: 1, month: this.monthKeyFromDay(this.workDay || this.todayLocalISO()), days: {} };
+      }
+
+      if (!json.days || typeof json.days !== 'object') json.days = {};
+      if (!json.version) json.version = 1;
+
+      this.monthData = json;
+      this.lastCloudReadAt = Date.now();
+      this.setStatus('arquivo carregado', 'success');
+    } catch (e) {
+      console.error('Erro ao ler JSON mensal:', e);
+      this.setStatus('erro ao ler arquivo', 'danger');
+    }
+  },
+
+  async writeMonthFile() {
+    if (!this.monthFileHandle || !this.monthData) return;
+
+    // evita escrita concorrente
+    if (this.syncing) {
+      this.pendingWrite = true;
+      return;
+    }
+
+    this.syncing = true;
+    this.setStatus('salvando...', 'warning');
+
+    try {
+      const writable = await this.monthFileHandle.createWritable();
+      const out = JSON.stringify(this.monthData, null, 2);
+      await writable.write(out);
+      await writable.close();
+      this.lastCloudWriteAt = Date.now();
+      this.setStatus('sincronizado', 'success');
+    } catch (e) {
+      console.error('Erro ao salvar JSON mensal:', e);
+      this.setStatus('erro ao salvar', 'danger');
+    } finally {
+      this.syncing = false;
+      if (this.pendingWrite) {
+        this.pendingWrite = false;
+        // roda mais uma vez
+        setTimeout(() => this.writeMonthFile(), 50);
+      }
+    }
+  },
+
+  ensureMonthMetaForDay(dayISO) {
+    if (!this.monthData) {
+      this.monthData = { version: 1, month: this.monthKeyFromDay(dayISO), days: {} };
+    }
+    const mk = this.monthKeyFromDay(dayISO);
+    this.monthData.month = this.monthData.month || mk;
+    if (!this.monthData.days) this.monthData.days = {};
+    if (!this.monthData.days[dayISO]) {
+      this.monthData.days[dayISO] = { routes: {} };
+    }
+    if (!this.monthData.days[dayISO].routes) this.monthData.days[dayISO].routes = {};
+  },
+
+  // Carrega rotas do dia a partir do JSON mensal
+  loadDayFromMonthData(dayISO) {
+    this.routes.clear();
+    this.currentRouteId = null;
+
+    if (!this.monthData || !this.monthData.days || !this.monthData.days[dayISO]) return;
+
+    const routesObj = this.monthData.days[dayISO].routes || {};
+    for (const [routeId, r] of Object.entries(routesObj)) {
+      const route = this.deserializeRoute(routeId, r);
+      this.routes.set(String(routeId), route);
+    }
+  },
+
+  // Grava rotas do dia no JSON mensal
+  writeDayToMonthData(dayISO) {
+    this.ensureMonthMetaForDay(dayISO);
+    const routesObj = {};
+    for (const [routeId, r] of this.routes.entries()) {
+      routesObj[String(routeId)] = this.serializeRoute(r);
+    }
+    this.monthData.days[dayISO].routes = routesObj;
+  },
+
+  // Merge: cloud(day) + local(day) => local(day) atualizado
+  mergeCloudDayIntoLocal(dayISO) {
+    if (!this.monthData?.days?.[dayISO]?.routes) return;
+
+    const cloudRoutes = this.monthData.days[dayISO].routes;
+    const allRouteIds = new Set([
+      ...Object.keys(cloudRoutes),
+      ...Array.from(this.routes.keys())
+    ]);
+
+    for (const rid of allRouteIds) {
+      const local = this.routes.get(String(rid));
+      const cloud = cloudRoutes[String(rid)];
+
+      if (!local && cloud) {
+        this.routes.set(String(rid), this.deserializeRoute(rid, cloud));
+        continue;
+      }
+      if (local && !cloud) continue;
+      if (!local || !cloud) continue;
+
+      // Merge campos básicos
+      local.cluster = local.cluster || cloud.cluster || '';
+      local.destinationFacilityId = local.destinationFacilityId || cloud.destinationFacilityId || '';
+      local.destinationFacilityName = local.destinationFacilityName || cloud.destinationFacilityName || '';
+      local.totalInicial = Math.max(Number(local.totalInicial || 0), Number(cloud.totalInicial || 0));
+
+      // Merge Sets
+      const cloudIds = new Set(cloud.ids || []);
+      const cloudFalt = new Set(cloud.faltantes || []);
+      const cloudConf = new Set(cloud.conferidos || []);
+      const cloudFora = new Set(cloud.foraDeRota || []);
+
+      for (const id of cloudIds) local.ids.add(id);
+      for (const id of cloudFalt) local.faltantes.add(id);
+      for (const id of cloudConf) local.conferidos.add(id);
+      for (const id of cloudFora) local.foraDeRota.add(id);
+
+      // Merge Maps (timestamps = maior, duplicados = maior)
+      const cloudTs = cloud.timestamps || {};
+      for (const [id, ts] of Object.entries(cloudTs)) {
+        const cur = local.timestamps.get(id) || 0;
+        const val = Number(ts || 0);
+        if (val > cur) local.timestamps.set(id, val);
+      }
+
+      const cloudDup = cloud.duplicados || {};
+      for (const [id, cnt] of Object.entries(cloudDup)) {
+        const cur = Number(local.duplicados.get(id) || 0);
+        const val = Number(cnt || 0);
+        if (val > cur) local.duplicados.set(id, val);
+      }
+
+      // Recalcula faltantes coerentes
+      for (const id of local.conferidos) {
+        local.faltantes.delete(id);
+      }
+    }
+
+    // Regra global: se um ID está conferido na rota correta, remove "fora de rota" das outras
+    this.globalCleanupForaDeRotaForConferidos();
+  },
+
+  globalCleanupForaDeRotaForConferidos() {
+    // mapa: id -> rota onde está conferido (pode existir mais de uma, mas tratamos como "válido" em qualquer)
+    const conferidosIds = new Set();
+    for (const r of this.routes.values()) {
+      for (const id of r.conferidos) conferidosIds.add(id);
+    }
+
+    if (!conferidosIds.size) return;
+
+    for (const r of this.routes.values()) {
+      for (const id of conferidosIds) {
+        if (r.conferidos.has(id)) {
+          // se conferido aqui, garante que não esteja fora de rota aqui
+          if (r.foraDeRota.has(id)) r.foraDeRota.delete(id);
+        } else {
+          // se não é conferido aqui, não deve ficar preso como fora de rota aqui se ele foi validado em outra rota
+          if (r.foraDeRota.has(id)) r.foraDeRota.delete(id);
+          if (r.duplicados.has(id)) r.duplicados.delete(id);
+        }
+      }
+    }
+  },
+
+  async syncTick() {
+    if (!this.monthFileHandle) return;          // sem arquivo => offline
+    if (!this.workDay) return;
+
+    // lê o arquivo, faz merge, escreve de volta
+    await this.loadMonthFile();
+    this.mergeCloudDayIntoLocal(this.workDay);
+
+    // grava local -> cloud(day)
+    this.writeDayToMonthData(this.workDay);
+    await this.writeMonthFile();
+
+    // salva cache local
+    this.saveToStorage(this.workDay);
+
+    // atualiza selects/UI
+    this.renderRoutesSelects();
+    this.refreshUIFromCurrent();
+  },
+
+  startSyncLoop() {
+    setInterval(() => {
+      // não trava UI: roda e ignora erro
+      this.syncTick().catch((e) => console.warn('syncTick error', e));
+    }, SYNC_INTERVAL_MS);
+  },
+
+  // =======================
+  // Troca de dia
+  // =======================
+  async applyWorkDay(dayISO) {
+    this.workDay = dayISO;
+    $('#work-day').val(dayISO);
+
+    // carrega do arquivo mensal (se houver)
+    if (this.monthFileHandle) {
+      await this.loadMonthFile();
+      this.ensureMonthMetaForDay(dayISO);
+      this.loadDayFromMonthData(dayISO);
+      this.saveToStorage(dayISO); // cache
+      this.renderRoutesSelects();
+      this.refreshUIFromCurrent();
+      this.setStatus('dia carregado', 'success');
+      return;
+    }
+
+    // sem arquivo => apenas cache local
+    this.loadFromStorage(dayISO);
+    this.renderRoutesSelects();
+    this.refreshUIFromCurrent();
+    this.setStatus('offline (sem arquivo)', 'muted');
+  },
+
+  // =======================
+  // UI / Rotas
+  // =======================
   setCurrentRoute(routeId) {
     const id = String(routeId);
     if (!this.routes.has(id)) {
@@ -128,18 +449,15 @@ const ConferenciaApp = {
     this.currentRouteId = id;
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
-    this.saveToStorage();
+    this.saveToStorage(this.workDay);
   },
 
-  // =======================
-  // UI
-  // =======================
   renderRoutesSelects() {
     const $sel1 = $('#saved-routes');
     const $sel2 = $('#saved-routes-inapp');
 
     const routesSorted = Array.from(this.routes.values())
-      .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
+      .sort((a, b) => a.routeId.localeCompare(b.routeId));
 
     const makeLabel = (r) => {
       const parts = [];
@@ -165,7 +483,17 @@ const ConferenciaApp = {
 
   refreshUIFromCurrent() {
     const r = this.current;
-    if (!r) return;
+    if (!r) {
+      $('#route-title').html('');
+      $('#cluster-title').html('');
+      $('#destination-facility-title').html('');
+      $('#destination-facility-name').html('');
+      $('#extracted-total').text('0');
+      $('#verified-total').text('0');
+      $('#progress-bar').css('width', '0%').text('0%');
+      $('#conferidos-list, #faltantes-list, #fora-rota-list, #duplicados-list').html('');
+      return;
+    }
 
     $('#route-title').html(`ROTA: <strong>${r.routeId}</strong>`);
     $('#cluster-title').html(r.cluster ? `CLUSTER: <strong>${r.cluster}</strong>` : '');
@@ -218,6 +546,37 @@ const ConferenciaApp = {
     this.atualizarProgresso();
   },
 
+  deleteRoute(routeId) {
+    if (!routeId) return;
+    this.routes.delete(String(routeId));
+    if (this.currentRouteId === String(routeId)) this.currentRouteId = null;
+
+    this.saveToStorage(this.workDay);
+    if (this.monthFileHandle && this.monthData) {
+      this.writeDayToMonthData(this.workDay);
+      this.writeMonthFile().catch(() => {});
+    }
+
+    this.renderRoutesSelects();
+    this.refreshUIFromCurrent();
+  },
+
+  clearAllRoutes() {
+    this.routes.clear();
+    this.currentRouteId = null;
+
+    localStorage.removeItem(this.storageKeyForDay(this.workDay));
+
+    if (this.monthFileHandle && this.monthData) {
+      this.ensureMonthMetaForDay(this.workDay);
+      this.monthData.days[this.workDay].routes = {};
+      this.writeMonthFile().catch(() => {});
+    }
+
+    this.renderRoutesSelects();
+    this.refreshUIFromCurrent();
+  },
+
   // =======================
   // Normalização / Som
   // =======================
@@ -245,22 +604,19 @@ const ConferenciaApp = {
   // Fora de rota inteligente (global)
   // =======================
   findCorrectRouteForId(id) {
-    const needle = String(id);
-
     for (const [rid, r] of this.routes.entries()) {
-      if (r.ids && r.ids.has(needle)) return String(rid);
+      if (r.ids && r.ids.has(id)) return String(rid);
     }
     for (const [rid, r] of this.routes.entries()) {
-      if (r.faltantes && r.faltantes.has(needle)) return String(rid);
+      if (r.faltantes && r.faltantes.has(id)) return String(rid);
     }
     for (const [rid, r] of this.routes.entries()) {
-      if (r.conferidos && r.conferidos.has(needle)) return String(rid);
+      if (r.conferidos && r.conferidos.has(id)) return String(rid);
     }
     return null;
   },
 
   cleanupIdFromOtherRoutes(id, targetRouteId) {
-    const needle = String(id);
     const target = String(targetRouteId);
 
     for (const [rid, r] of this.routes.entries()) {
@@ -268,25 +624,25 @@ const ConferenciaApp = {
 
       let changed = false;
 
-      if (r.foraDeRota && r.foraDeRota.has(needle)) {
-        r.foraDeRota.delete(needle);
+      if (r.foraDeRota && r.foraDeRota.has(id)) {
+        r.foraDeRota.delete(id);
         changed = true;
       }
 
-      if (r.duplicados && r.duplicados.has(needle)) {
-        r.duplicados.delete(needle);
+      if (r.duplicados && r.duplicados.has(id)) {
+        r.duplicados.delete(id);
         changed = true;
       }
 
       if (changed) {
         const stillRelevant =
-          (r.conferidos && r.conferidos.has(needle)) ||
-          (r.faltantes && r.faltantes.has(needle)) ||
-          (r.ids && r.ids.has(needle)) ||
-          (r.foraDeRota && r.foraDeRota.has(needle)) ||
-          (r.duplicados && r.duplicados.has(needle));
+          (r.conferidos && r.conferidos.has(id)) ||
+          (r.faltantes && r.faltantes.has(id)) ||
+          (r.ids && r.ids.has(id)) ||
+          (r.foraDeRota && r.foraDeRota.has(id)) ||
+          (r.duplicados && r.duplicados.has(id));
 
-        if (!stillRelevant && r.timestamps) r.timestamps.delete(needle);
+        if (!stillRelevant && r.timestamps) r.timestamps.delete(id);
       }
     }
   },
@@ -298,50 +654,50 @@ const ConferenciaApp = {
     const r = this.current;
     if (!r || !codigo) return;
 
-    const id = String(codigo);
     const now = Date.now();
 
-    const correctRouteId = this.findCorrectRouteForId(id);
+    const correctRouteId = this.findCorrectRouteForId(codigo);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
 
-    // se for o ID correto nesta rota, remove de outras rotas onde estava fora
     if (isCorrectHere) {
-      this.cleanupIdFromOtherRoutes(id, this.currentRouteId);
+      this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
     }
 
-    // duplicata (já conferido ou já fora de rota)
-    if (r.conferidos.has(id) || r.foraDeRota.has(id)) {
-      const count = r.duplicados.get(id) || 1;
-      r.duplicados.set(id, count + 1);
-      r.timestamps.set(id, now);
+    // duplicata se já conferido OU já fora de rota nessa rota
+    if (r.conferidos.has(codigo) || r.foraDeRota.has(codigo)) {
+      const count = r.duplicados.get(codigo) || 1;
+      r.duplicados.set(codigo, count + 1);
+      r.timestamps.set(codigo, now);
 
       if (!this.viaCsv) this.playAlertSound();
-
       $('#barcode-input').val('').focus();
-      this.saveToStorage();
+
+      this.saveToStorage(this.workDay);
       this.atualizarListas();
       return;
     }
 
-    // conferência normal
-    if (r.faltantes.has(id)) {
-      r.faltantes.delete(id);
-      r.conferidos.add(id);
-      r.timestamps.set(id, now);
+    if (r.faltantes.has(codigo)) {
+      r.faltantes.delete(codigo);
+      r.conferidos.add(codigo);
+      r.timestamps.set(codigo, now);
+
+      // se entrou como conferido aqui, remove fora de rota em outras rotas
+      this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
 
       $('#barcode-input').val('').focus();
-      this.saveToStorage();
+      this.saveToStorage(this.workDay);
       this.atualizarListas();
       return;
     }
 
     // fora de rota
-    r.foraDeRota.add(id);
-    r.timestamps.set(id, now);
+    r.foraDeRota.add(codigo);
+    r.timestamps.set(codigo, now);
     if (!this.viaCsv) this.playAlertSound();
 
     $('#barcode-input').val('').focus();
-    this.saveToStorage();
+    this.saveToStorage(this.workDay);
     this.atualizarListas();
   },
 
@@ -389,8 +745,8 @@ const ConferenciaApp = {
       const idsExtraidos = new Set();
 
       while ((match = regexEnvio.exec(block)) !== null) {
-        const shipmentId = String(match[1]);
-        const receiverId = String(match[2] || '');
+        const shipmentId = match[1];
+        const receiverId = match[2];
         if (!receiverId.includes('_')) idsExtraidos.add(shipmentId);
       }
 
@@ -406,55 +762,87 @@ const ConferenciaApp = {
       imported++;
     }
 
-    this.saveToStorage();
+    this.saveToStorage(this.workDay);
+
+    // grava no arquivo mensal também
+    if (this.monthFileHandle && this.monthData) {
+      this.writeDayToMonthData(this.workDay);
+      this.writeMonthFile().catch(() => {});
+    }
+
     this.renderRoutesSelects();
     return imported;
   },
 
   // =======================
-  // EXPORT: rota atual CSV (modo local)
+  // EXPORT: rota atual CSV (FORMATO ANTIGO PADRÃO)
   // =======================
-  exportRotaAtualCsv() {
+  exportRotaAtualCsvPadrao() {
     const r = this.current;
     if (!r) {
       alert('Nenhuma rota selecionada.');
       return;
     }
 
-    const rows = [];
-    rows.push(['ID', 'STATUS', 'DUPLICADO_X']);
+    const all = [
+      ...Array.from(r.conferidos),
+      ...Array.from(r.foraDeRota),
+      ...Array.from(r.duplicados.keys())
+    ];
 
-    const idsOrdenados = Array.from(r.ids).sort((a, b) => String(a).localeCompare(String(b)));
-    for (const id of idsOrdenados) {
-      const dup = r.duplicados.get(id) || 0;
-      const status = r.conferidos.has(id) ? 'CONFERIDO' : 'FALTANTE';
-      rows.push([id, status, dup ? `${dup}x` : '']);
+    if (all.length === 0) {
+      alert('Nenhum ID para exportar.');
+      return;
     }
 
-    const foraOrdenados = Array.from(r.foraDeRota).sort((a, b) => String(a).localeCompare(String(b)));
-    for (const id of foraOrdenados) {
-      const dup = r.duplicados.get(id) || 0;
-      const status = dup > 0 ? 'DUPLICADO' : 'FORA_DE_ROTA';
-      rows.push([id, status, dup ? `${dup}x` : '']);
-    }
-
-    const esc = (v) => {
-      const s = String(v ?? '');
-      if (/[",\n\r;]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-      return s;
+    const parseDateSafe = (value) => {
+      if (!value) return new Date();
+      if (value instanceof Date) return value;
+      if (typeof value === 'number') return new Date(value);
+      if (typeof value === 'string') {
+        if (/^\d{4}-\d{2}-\d{2}T/.test(value)) {
+          const d = new Date(value);
+          if (!isNaN(d.getTime())) return d;
+        }
+        const m = value.match(/^(\d{2})\/(\d{2})\/(\d{4})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+        if (m) {
+          const [, dd, mm, yyyy, HH, MM, SS = '00'] = m;
+          const iso = `${yyyy}-${mm}-${dd}T${HH}:${MM}:${SS}`;
+          const d = new Date(iso);
+          if (!isNaN(d.getTime())) return d;
+        }
+        if (/^\d{13}$/.test(value)) return new Date(Number(value));
+        const d = new Date(value);
+        if (!isNaN(d.getTime())) return d;
+      }
+      return new Date();
     };
 
-    const csv = rows.map(line => line.map(esc).join(',')).join('\r\n');
+    const zona = 'Horário Padrão de Brasília';
+    const header = 'date,time,time_zone,format,text,notes,favorite,date_utc,time_utc,metadata,duplicates';
 
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const linhas = all.map(id => {
+      const lidaEm = parseDateSafe(r.timestamps.get(id));
+      const pad2 = n => String(n).padStart(2, '0');
+      const date = `${lidaEm.getFullYear()}-${pad2(lidaEm.getMonth()+1)}-${pad2(lidaEm.getDate())}`;
+      const time = `${pad2(lidaEm.getHours())}:${pad2(lidaEm.getMinutes())}:${pad2(lidaEm.getSeconds())}`;
+
+      const dateUtc = lidaEm.toISOString().slice(0, 10);
+      const timeUtc = lidaEm.toISOString().split('T')[1].split('.')[0];
+      const dupCount = r.duplicados.get(id) ? (Number(r.duplicados.get(id)) - 1) : 0;
+
+      return `${date},${time},${zona},Code 128,${id},,0,${dateUtc},${timeUtc},,${dupCount}`;
+    });
+
+    const conteudo = [header, ...linhas].join('\r\n');
+    const blob = new Blob([conteudo], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
 
-    const pad2 = (n) => String(n).padStart(2, '0');
-    const now = new Date();
-    const stamp = `${now.getFullYear()}-${pad2(now.getMonth()+1)}-${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}`;
+    const cluster = (r.cluster || 'semCluster').replace(/[^\w\-]+/g, '_');
+    const rota = (r.routeId || 'semRota').replace(/[^\w\-]+/g, '_');
 
-    link.download = `rota_${r.routeId}_validacao_${stamp}.csv`;
+    link.download = `${cluster}_${rota}_padrao.csv`;
     link.click();
   },
 
@@ -481,7 +869,7 @@ const ConferenciaApp = {
       const header = cluster ? `${routeId}-${cluster}` : routeId;
 
       const ids = Array.from(r.conferidos || []);
-      // ordena por timestamp e depois ID
+
       ids.sort((x, y) => {
         const tx = r.timestamps?.get(x) ? Number(r.timestamps.get(x)) : 0;
         const ty = r.timestamps?.get(y) ? Number(r.timestamps.get(y)) : 0;
@@ -501,73 +889,98 @@ const ConferenciaApp = {
 
     const wb = XLSX.utils.book_new();
     const ws = XLSX.utils.aoa_to_sheet(aoa);
+
     ws['!freeze'] = { xSplit: 0, ySplit: 1 };
     ws['!cols'] = cols.map(() => ({ wch: 18 }));
 
     XLSX.utils.book_append_sheet(wb, ws, 'Bipagens');
 
-    const pad2 = (n) => String(n).padStart(2, '0');
     const now = new Date();
-    const stamp = `${now.getFullYear()}-${pad2(now.getMonth()+1)}-${pad2(now.getDate())}_${pad2(now.getHours())}${pad2(now.getMinutes())}`;
+    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
 
-    XLSX.writeFile(wb, `bipagens_todas_rotas_${stamp}.xlsx`);
+    XLSX.writeFile(wb, `bipagens_todas_rotas_${this.workDay || this.todayLocalISO()}_${stamp}.xlsx`);
   }
 };
 
 // =======================
-// Eventos
+// Eventos / Boot
 // =======================
-$(document).ready(() => {
-  console.log('JS carregou', new Date().toISOString());
-  ConferenciaApp.loadFromStorage();
-  ConferenciaApp.renderRoutesSelects();
+$(document).ready(async () => {
+  // set day default
+  const today = ConferenciaApp.todayLocalISO();
+  $('#work-day').val(today);
+  await ConferenciaApp.applyWorkDay(today);
+
+  ConferenciaApp.startSyncLoop();
 });
 
-$(document).on('click', '#extract-btn', () => {
+// Selecionar arquivo mensal (Drive)
+$(document).on('click', '#btn-pick-month-file', () => {
+  ConferenciaApp.pickMonthFileHandle();
+});
+
+// Troca de dia
+$(document).on('change', '#work-day', async (e) => {
+  const day = e.target.value;
+  if (!day) return;
+  await ConferenciaApp.applyWorkDay(day);
+});
+
+// Importar HTML
+$('#extract-btn').click(() => {
   const raw = $('#html-input').val();
   if (!raw.trim()) return alert('Cole o HTML antes de importar.');
 
   const qtd = ConferenciaApp.importRoutesFromHtml(raw);
   if (!qtd) return alert('Nenhuma rota importada. Confira se o HTML está completo.');
 
-  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
-});
-
-$(document).on('click', '#extract-btn', () => {
-  const $htmlInput = $('#html-input');
-  const raw = $htmlInput.val();
-
-  if (!raw.trim()) return alert('Cole o HTML antes de importar.');
-
-  const qtd = ConferenciaApp.importRoutesFromHtml(raw);
-
-  // ✅ limpa o campo SEMPRE após tentar importar
-  $htmlInput.val('');
-
-  if (!qtd) return alert('Nenhuma rota importada. Confira se o HTML está completo.');
+  // ✅ limpa o campo após importar
+  $('#html-input').val('');
 
   alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
+// Carregar rota
+$('#load-route').click(() => {
+  const id = $('#saved-routes').val();
+  if (!id) return alert('Selecione uma rota salva.');
 
-$(document).on('click', '#clear-all-routes', () => {
+  ConferenciaApp.setCurrentRoute(id);
+
+  $('#initial-interface').addClass('d-none');
+  $('#manual-interface').addClass('d-none');
+  $('#conference-interface').removeClass('d-none');
+  $('#barcode-input').focus();
+});
+
+// Excluir rota
+$('#delete-route').click(() => {
+  const id = $('#saved-routes').val();
+  if (!id) return alert('Selecione uma rota para excluir.');
+  ConferenciaApp.deleteRoute(id);
+});
+
+// Limpar todas
+$('#clear-all-routes').click(() => {
   ConferenciaApp.clearAllRoutes();
-  alert('Todas as rotas foram removidas.');
+  alert('Todas as rotas do dia foram removidas.');
 });
 
-$(document).on('click', '#switch-route', () => {
+// Trocar rota
+$('#switch-route').click(() => {
   const id = $('#saved-routes-inapp').val();
   if (!id) return;
   ConferenciaApp.setCurrentRoute(id);
   $('#barcode-input').focus();
 });
 
-$(document).on('click', '#manual-btn', () => {
+// Manual
+$('#manual-btn').click(() => {
   $('#initial-interface').addClass('d-none');
   $('#manual-interface').removeClass('d-none');
 });
 
-$(document).on('click', '#submit-manual', () => {
+$('#submit-manual').click(() => {
   try {
     const routeId = ($('#manual-routeid').val() || '').trim();
     if (!routeId) return alert('Informe o RouteId.');
@@ -581,15 +994,20 @@ $(document).on('click', '#submit-manual', () => {
     route.cluster = cluster || route.cluster;
 
     for (const id of manualIds) {
-      const sid = String(id);
-      route.ids.add(sid);
-      if (!route.conferidos.has(sid)) route.faltantes.add(sid);
+      route.ids.add(id);
+      if (!route.conferidos.has(id)) route.faltantes.add(id);
     }
 
     route.totalInicial = route.ids.size;
     ConferenciaApp.routes.set(String(routeId), route);
 
-    ConferenciaApp.saveToStorage();
+    ConferenciaApp.saveToStorage(ConferenciaApp.workDay);
+
+    if (ConferenciaApp.monthFileHandle && ConferenciaApp.monthData) {
+      ConferenciaApp.writeDayToMonthData(ConferenciaApp.workDay);
+      ConferenciaApp.writeMonthFile().catch(() => {});
+    }
+
     ConferenciaApp.renderRoutesSelects();
 
     alert(`Rota ${routeId} salva com ${route.totalInicial} ID(s).`);
@@ -602,11 +1020,9 @@ $(document).on('click', '#submit-manual', () => {
   }
 });
 
-// Enter no input (robusto)
-$(document).on('keydown', '#barcode-input', (e) => {
-  if (e.key === 'Enter' || e.which === 13) {
-    e.preventDefault();
-
+// Leitura do barcode (ENTER)
+$('#barcode-input').on('keypress', (e) => {
+  if (e.which === 13) {
     ConferenciaApp.viaCsv = false;
 
     const raw = $('#barcode-input').val();
@@ -621,12 +1037,13 @@ $(document).on('keydown', '#barcode-input', (e) => {
   }
 });
 
-$(document).on('click', '#check-csv', () => {
+// Checar CSV (importa bipagens)
+$('#check-csv').click(() => {
   const r = ConferenciaApp.current;
   if (!r) return alert('Selecione uma rota antes.');
 
   const fileInput = document.getElementById('csv-input');
-  if (!fileInput || fileInput.files.length === 0) return alert('Selecione um arquivo CSV.');
+  if (fileInput.files.length === 0) return alert('Selecione um arquivo CSV.');
 
   ConferenciaApp.viaCsv = true;
 
@@ -635,7 +1052,7 @@ $(document).on('click', '#check-csv', () => {
 
   reader.onload = e => {
     const csvText = e.target.result;
-    const linhas = String(csvText || '').split(/\r?\n/);
+    const linhas = csvText.split(/\r?\n/);
     if (!linhas.length) return alert('Arquivo CSV vazio.');
 
     const header = linhas[0].split(',');
@@ -659,19 +1076,24 @@ $(document).on('click', '#check-csv', () => {
   reader.readAsText(file, 'UTF-8');
 });
 
-// Exportações
+// Exports
 $(document).on('click', '#export-csv-rota-atual', () => {
-  ConferenciaApp.exportRotaAtualCsv();
+  ConferenciaApp.exportRotaAtualCsvPadrao();
 });
 
 $(document).on('click', '#export-xlsx-todas-rotas', () => {
   ConferenciaApp.exportTodasRotasXlsx();
 });
 
-// Finalizar sem download
-$(document).on('click', '#finish-btn', () => {
-  alert('Finalizar não exporta automaticamente. Use os botões de exportação.');
-});
+// Sem bind no finalizar
+$('#back-btn').click(() => {
+  // volta para a tela inicial sem perder conexão do arquivo
+  $('#conference-interface').addClass('d-none');
+  $('#manual-interface').addClass('d-none');
+  $('#initial-interface').removeClass('d-none');
 
-$(document).on('click', '#back-btn', () => location.reload());
+  // opcional: limpa campo de leitura e foca
+  $('#barcode-input').val('');
+  $('#html-input').focus();
+});
 
