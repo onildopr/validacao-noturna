@@ -962,8 +962,29 @@ $('#delete-route').click(() => {
 
 // Limpar todas
 $('#clear-all-routes').click(() => {
+  // 1ª confirmação (sim/não)
+  const ok1 = confirm(
+    'ATENÇÃO: isso vai APAGAR TODAS as rotas do DIA selecionado.\n\n' +
+    'Quer continuar?'
+  );
+  if (!ok1) return;
+
+  // 2ª confirmação (digitação)
+  const day = ConferenciaApp.workDay || $('#work-day').val() || '(dia desconhecido)';
+  const typed = prompt(
+    `CONFIRMAÇÃO FINAL\n\n` +
+    `Para apagar TUDO do dia ${day}, digite exatamente:\n` +
+    `APAGAR\n\n` +
+    `(Qualquer outra coisa cancela)`
+  );
+
+  if (typed !== 'APAGAR') {
+    alert('Ação cancelada. Nada foi apagado.');
+    return;
+  }
+
   ConferenciaApp.clearAllRoutes();
-  alert('Todas as rotas do dia foram removidas.');
+  alert(`Tudo do dia ${day} foi removido.`);
 });
 
 // Trocar rota
