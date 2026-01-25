@@ -17,6 +17,10 @@ const ConferenciaApp = {
   syncing: false,
   pendingWrite: false,
 
+
+  // Manual save / acompanhamento
+  dirty: false,              // há alterações pendentes para salvar no arquivo mensal?
+  lastEvents: [],            // log simples de bipagens (últimos eventos)
   // =======================
   // Util data/strings
   // =======================
@@ -41,6 +45,91 @@ const ConferenciaApp = {
     $s.removeClass('text-muted text-success text-danger text-warning');
     $s.addClass(`text-${kind}`);
     $s.text(txt);
+  },
+
+
+  // =======================
+  // Manual save / acompanhamento
+  // =======================
+  markDirty(reason = '') {
+    this.dirty = true;
+    const msg = reason ? `pendente salvar (${reason})` : 'pendente salvar';
+    this.setStatus(msg, 'warning');
+    $('#dirty-flag').removeClass('d-none');
+  },
+
+  markClean() {
+    this.dirty = false;
+    $('#dirty-flag').addClass('d-none');
+    this.setStatus('salvo no arquivo do mês', 'success');
+  },
+
+  pushEvent(evt) {
+    // evt: {ts, type: 'ok'|'fora'|'dup', code, currentRouteId, correctRouteId}
+    this.lastEvents.unshift(evt);
+    if (this.lastEvents.length > 80) this.lastEvents.length = 80;
+    this.renderAcompanhamento();
+  },
+
+  renderAcompanhamento() {
+    // badge pendente
+    if (this.dirty) $('#dirty-flag').removeClass('d-none');
+    else $('#dirty-flag').addClass('d-none');
+
+    // resumo por rota
+    const routesSorted = Array.from(this.routes.values())
+      .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
+
+    const resumo = routesSorted.map(r => {
+      const total = r.totalInicial || r.ids.size;
+      return `ROTA ${r.routeId}: ${r.conferidos.size}/${total}`;
+    }).slice(0, 14).join('<br>');
+
+    $('#acompanhamento-resumo').html(resumo || '<span class="text-muted">sem rotas</span>');
+
+    // log
+    const items = this.lastEvents.slice(0, 30).map(ev => {
+      const d = new Date(ev.ts || Date.now());
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+
+      const base = `${hh}:${mm}:${ss} • ${ev.code}`;
+      if (ev.type === 'fora') {
+        const extra = ev.correctRouteId ? ` <small class="text-muted">(pertence ROTA ${ev.correctRouteId})</small>` : ' <small class="text-muted">(rota desconhecida)</small>';
+        return `<li class="list-group-item list-group-item-warning">${base}${extra}</li>`;
+      }
+      if (ev.type === 'dup') {
+        return `<li class="list-group-item list-group-item-secondary">${base} <small class="text-muted">(duplicado)</small></li>`;
+      }
+      return `<li class="list-group-item list-group-item-success">${base} <small class="text-muted">(ok)</small></li>`;
+    });
+
+    $('#acompanhamento-log').html(items.join('') || '<li class="list-group-item text-muted">sem eventos</li>');
+  },
+
+  async manualSaveToMonthFile() {
+    if (!this.monthFileHandle) {
+      alert('Selecione o arquivo mensal primeiro.');
+      return;
+    }
+    if (!this.workDay) return;
+
+    // fluxo seguro: lê -> merge -> escreve
+    await this.loadMonthFile();
+    this.ensureMonthMetaForDay(this.workDay);
+
+    // traz o que está no arquivo para não perder nada
+    this.mergeCloudDayIntoLocal(this.workDay);
+
+    // grava o estado local consolidado no arquivo
+    this.writeDayToMonthData(this.workDay);
+    await this.writeMonthFile();
+
+    // cache local
+    this.saveToStorage(this.workDay);
+
+    this.markClean();
   },
 
   // =======================
@@ -418,24 +507,34 @@ const ConferenciaApp = {
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
 
-    // carrega do arquivo mensal (se houver)
+    // ✅ sempre começa pelo cache local do dia (não perde rotas)
+    this.loadFromStorage(dayISO);
+
+    // se houver arquivo mensal, apenas LÊ + MERGE (sem salvar automaticamente)
     if (this.monthFileHandle) {
       await this.loadMonthFile();
       this.ensureMonthMetaForDay(dayISO);
-      this.loadDayFromMonthData(dayISO);
-      this.saveToStorage(dayISO); // cache
+
+      // cloud(day) -> local(day)
+      this.mergeCloudDayIntoLocal(dayISO);
+
+      // atualiza cache local consolidado
+      this.saveToStorage(dayISO);
+
       this.renderRoutesSelects();
       this.refreshUIFromCurrent();
-      this.setStatus('dia carregado', 'success');
+      this.renderAcompanhamento();
+      this.setStatus('dia carregado (merge local + arquivo)', 'success');
       return;
     }
 
     // sem arquivo => apenas cache local
-    this.loadFromStorage(dayISO);
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
+    this.renderAcompanhamento();
     this.setStatus('offline (sem arquivo)', 'muted');
   },
+
 
   // =======================
   // UI / Rotas
@@ -450,6 +549,7 @@ const ConferenciaApp = {
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
     this.saveToStorage(this.workDay);
+    this.renderAcompanhamento();
   },
 
   renderRoutesSelects() {
@@ -532,7 +632,17 @@ const ConferenciaApp = {
 
     $('#fora-rota-list').html(
       `<h6>Fora de Rota (<span class='badge badge-warning'>${r.foraDeRota.size}</span>)</h6>` +
-      Array.from(r.foraDeRota).map(id => `<li class='list-group-item list-group-item-warning'>${id}</li>`).join('')
+      Array.from(r.foraDeRota).map(id => {
+        const correct = this.findCorrectRouteForId(id);
+        if (correct && String(correct) !== String(this.currentRouteId)) {
+          const rr = this.routes.get(String(correct));
+          const extra = rr
+            ? ` <small class="text-muted">(pertence: ROTA ${rr.routeId}${rr.cluster ? ' • ' + rr.cluster : ''})</small>`
+            : ` <small class="text-muted">(pertence: ROTA ${correct})</small>`;
+          return `<li class='list-group-item list-group-item-warning'>${id}${extra}</li>`;
+        }
+        return `<li class='list-group-item list-group-item-warning'>${id}</li>`;
+      }).join('')
     );
 
     $('#duplicados-list').html(
@@ -551,30 +661,30 @@ const ConferenciaApp = {
     this.routes.delete(String(routeId));
     if (this.currentRouteId === String(routeId)) this.currentRouteId = null;
 
+    // cache local (rápido)
     this.saveToStorage(this.workDay);
-    if (this.monthFileHandle && this.monthData) {
-      this.writeDayToMonthData(this.workDay);
-      this.writeMonthFile().catch(() => {});
-    }
+
+    // ✅ não salva automaticamente no arquivo mensal — fica pendente para "Salvar no arquivo do mês"
+    this.markDirty('excluir rota');
 
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
+    this.renderAcompanhamento();
   },
 
   clearAllRoutes() {
     this.routes.clear();
     this.currentRouteId = null;
 
+    // remove cache do dia
     localStorage.removeItem(this.storageKeyForDay(this.workDay));
 
-    if (this.monthFileHandle && this.monthData) {
-      this.ensureMonthMetaForDay(this.workDay);
-      this.monthData.days[this.workDay].routes = {};
-      this.writeMonthFile().catch(() => {});
-    }
+    // ✅ não salva automaticamente no arquivo mensal — fica pendente para "Salvar no arquivo do mês"
+    this.markDirty('limpar dia');
 
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
+    this.renderAcompanhamento();
   },
 
   // =======================
@@ -672,6 +782,9 @@ const ConferenciaApp = {
       if (!this.viaCsv) this.playAlertSound();
       $('#barcode-input').val('').focus();
 
+      this.pushEvent({ ts: now, type: 'dup', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
+      this.markDirty('bipagem');
+
       this.saveToStorage(this.workDay);
       this.atualizarListas();
       return;
@@ -686,6 +799,9 @@ const ConferenciaApp = {
       this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
 
       $('#barcode-input').val('').focus();
+      this.pushEvent({ ts: now, type: 'ok', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
+      this.markDirty('bipagem');
+
       this.saveToStorage(this.workDay);
       this.atualizarListas();
       return;
@@ -697,6 +813,9 @@ const ConferenciaApp = {
     if (!this.viaCsv) this.playAlertSound();
 
     $('#barcode-input').val('').focus();
+    this.pushEvent({ ts: now, type: 'fora', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
+    this.markDirty('bipagem');
+
     this.saveToStorage(this.workDay);
     this.atualizarListas();
   },
@@ -764,13 +883,10 @@ const ConferenciaApp = {
 
     this.saveToStorage(this.workDay);
 
-    // grava no arquivo mensal também
-    if (this.monthFileHandle && this.monthData) {
-      this.writeDayToMonthData(this.workDay);
-      this.writeMonthFile().catch(() => {});
-    }
+    this.markDirty('import HTML');
 
     this.renderRoutesSelects();
+    this.renderAcompanhamento();
     return imported;
   },
 
@@ -911,7 +1027,7 @@ $(document).ready(async () => {
   $('#work-day').val(today);
   await ConferenciaApp.applyWorkDay(today);
 
-  ConferenciaApp.startSyncLoop();
+  // ConferenciaApp.startSyncLoop(); // autosync desativado (salvamento manual)
 });
 
 // Selecionar arquivo mensal (Drive)
@@ -1023,11 +1139,7 @@ $('#submit-manual').click(() => {
     ConferenciaApp.routes.set(String(routeId), route);
 
     ConferenciaApp.saveToStorage(ConferenciaApp.workDay);
-
-    if (ConferenciaApp.monthFileHandle && ConferenciaApp.monthData) {
-      ConferenciaApp.writeDayToMonthData(ConferenciaApp.workDay);
-      ConferenciaApp.writeMonthFile().catch(() => {});
-    }
+    ConferenciaApp.markDirty('inserção manual');
 
     ConferenciaApp.renderRoutesSelects();
 
@@ -1118,3 +1230,14 @@ $('#back-btn').click(() => {
   $('#html-input').focus();
 });
 
+
+
+// Salvar manual no arquivo do mês
+$(document).on('click', '#btn-save-month', async () => {
+  try {
+    await ConferenciaApp.manualSaveToMonthFile();
+  } catch (e) {
+    console.error(e);
+    alert('Falha ao salvar no arquivo do mês.');
+  }
+});
