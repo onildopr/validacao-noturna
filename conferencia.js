@@ -82,7 +82,7 @@ const ConferenciaApp = {
 
     const resumo = routesSorted.map(r => {
       const total = r.totalInicial || r.ids.size;
-      return `ROTA ${r.routeId}: ${r.conferidos.size}/${total}`;
+      return `ROTA ${r.cluster}: ${r.conferidos.size}/${total}`;
     }).slice(0, 14).join('<br>');
 
     $('#acompanhamento-resumo').html(resumo || '<span class="text-muted">sem rotas</span>');
@@ -1241,3 +1241,4 @@ $(document).on('click', '#btn-save-month', async () => {
     alert('Falha ao salvar no arquivo do mês.');
   }
 });
+
