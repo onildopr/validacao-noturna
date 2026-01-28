@@ -6,6 +6,8 @@ const SYNC_INTERVAL_MS = 20000;
 const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
   currentRouteId: null,
+  currentPlate: null,
+  plateRoutes: new Map(), // plateKey -> Set(routeId)
   viaCsv: false,
 
   // Sync mensal/dia
@@ -141,6 +143,8 @@ const ConferenciaApp = {
       cluster: '',
       destinationFacilityId: '',
       destinationFacilityName: '',
+      plateInfo: null,
+      routeQrInfo: null,
 
       timestamps: new Map(), // id -> epoch (ms)
       ids: new Set(),
@@ -179,6 +183,8 @@ const ConferenciaApp = {
         route.cluster = r.cluster || '';
         route.destinationFacilityId = r.destinationFacilityId || '';
         route.destinationFacilityName = r.destinationFacilityName || '';
+        route.plateInfo = r.plateInfo || null;
+        route.routeQrInfo = r.routeQrInfo || null;
         route.totalInicial = Number(r.totalInicial || 0);
 
         (r.ids || []).forEach(id => route.ids.add(id));
@@ -214,6 +220,17 @@ const ConferenciaApp = {
     }
   },
 
+  rebuildPlateRoutesFromRoutes() {
+    this.plateRoutes.clear();
+    for (const [routeId, r] of this.routes.entries()) {
+      if (!r.plateInfo) continue;
+      const key = this.plateKeyFromInfo(r.plateInfo);
+      if (!key) continue;
+      if (!this.plateRoutes.has(key)) this.plateRoutes.set(key, new Set());
+      this.plateRoutes.get(key).add(String(routeId));
+    }
+  },
+
   serializeRoute(r) {
     return {
       routeId: r.routeId,
@@ -221,6 +238,8 @@ const ConferenciaApp = {
       destinationFacilityId: r.destinationFacilityId,
       destinationFacilityName: r.destinationFacilityName,
       totalInicial: r.totalInicial,
+      plateInfo: r.plateInfo || null,
+      routeQrInfo: r.routeQrInfo || null,
 
       ids: Array.from(r.ids),
       faltantes: Array.from(r.faltantes),
@@ -238,6 +257,8 @@ const ConferenciaApp = {
     route.cluster = r.cluster || '';
     route.destinationFacilityId = r.destinationFacilityId || '';
     route.destinationFacilityName = r.destinationFacilityName || '';
+    route.plateInfo = r.plateInfo || null;
+    route.routeQrInfo = r.routeQrInfo || null;
     route.totalInicial = Number(r.totalInicial || 0);
 
     (r.ids || []).forEach(id => route.ids.add(id));
@@ -412,6 +433,8 @@ const ConferenciaApp = {
       local.cluster = local.cluster || cloud.cluster || '';
       local.destinationFacilityId = local.destinationFacilityId || cloud.destinationFacilityId || '';
       local.destinationFacilityName = local.destinationFacilityName || cloud.destinationFacilityName || '';
+      local.plateInfo = local.plateInfo || cloud.plateInfo || null;
+      local.routeQrInfo = local.routeQrInfo || cloud.routeQrInfo || null;
       local.totalInicial = Math.max(Number(local.totalInicial || 0), Number(cloud.totalInicial || 0));
 
       // Merge Sets
@@ -506,6 +529,8 @@ const ConferenciaApp = {
   async applyWorkDay(dayISO) {
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
+    this.currentPlate = null;
+    this.plateRoutes.clear();
 
     // ✅ sempre começa pelo cache local do dia (não perde rotas)
     this.loadFromStorage(dayISO);
@@ -521,16 +546,20 @@ const ConferenciaApp = {
       // atualiza cache local consolidado
       this.saveToStorage(dayISO);
 
+      this.rebuildPlateRoutesFromRoutes();
       this.renderRoutesSelects();
       this.refreshUIFromCurrent();
+      this.renderCurrentPlate();
       this.renderAcompanhamento();
       this.setStatus('dia carregado (merge local + arquivo)', 'success');
       return;
     }
 
     // sem arquivo => apenas cache local
+    this.rebuildPlateRoutesFromRoutes();
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
+    this.renderCurrentPlate();
     this.renderAcompanhamento();
     this.setStatus('offline (sem arquivo)', 'muted');
   },
@@ -548,6 +577,7 @@ const ConferenciaApp = {
     this.currentRouteId = id;
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
+    this.renderCurrentPlate();
     this.saveToStorage(this.workDay);
     this.renderAcompanhamento();
   },
@@ -564,6 +594,7 @@ const ConferenciaApp = {
       parts.push(`ROTA ${r.routeId}`);
       if (r.cluster) parts.push(`CLUSTER ${r.cluster}`);
       if (r.destinationFacilityId) parts.push(`XPT ${r.destinationFacilityId}`);
+      if (r.plateInfo?.licensePlate) parts.push(`PLACA ${r.plateInfo.licensePlate}`);
       return parts.join(' • ');
     };
 
@@ -586,6 +617,7 @@ const ConferenciaApp = {
     if (!r) {
       $('#route-title').html('');
       $('#cluster-title').html('');
+      $('#plate-title').html('');
       $('#destination-facility-title').html('');
       $('#destination-facility-name').html('');
       $('#extracted-total').text('0');
@@ -597,6 +629,7 @@ const ConferenciaApp = {
 
     $('#route-title').html(`ROTA: <strong>${r.routeId}</strong>`);
     $('#cluster-title').html(r.cluster ? `CLUSTER: <strong>${r.cluster}</strong>` : '');
+    $('#plate-title').html(r.plateInfo ? this.formatPlateLabel(r.plateInfo) : '');
     $('#destination-facility-title').html(r.destinationFacilityId ? `<strong>XPT:</strong> ${r.destinationFacilityId}` : '');
     $('#destination-facility-name').html(r.destinationFacilityName ? `<strong>DESTINO:</strong> ${r.destinationFacilityName}` : '');
 
@@ -604,6 +637,19 @@ const ConferenciaApp = {
     $('#verified-total').text(r.conferidos.size);
 
     this.atualizarListas();
+  },
+
+  renderCurrentPlate() {
+    const r = this.current;
+    if (r?.plateInfo) {
+      $('#plate-title').html(this.formatPlateLabel(r.plateInfo));
+      return;
+    }
+    if (this.currentPlate) {
+      $('#plate-title').html(this.formatPlateLabel(this.currentPlate));
+      return;
+    }
+    $('#plate-title').html('');
   },
 
   atualizarProgresso() {
@@ -660,6 +706,7 @@ const ConferenciaApp = {
     if (!routeId) return;
     this.routes.delete(String(routeId));
     if (this.currentRouteId === String(routeId)) this.currentRouteId = null;
+    this.rebuildPlateRoutesFromRoutes();
 
     // cache local (rápido)
     this.saveToStorage(this.workDay);
@@ -675,6 +722,8 @@ const ConferenciaApp = {
   clearAllRoutes() {
     this.routes.clear();
     this.currentRouteId = null;
+    this.currentPlate = null;
+    this.plateRoutes.clear();
 
     // remove cache do dia
     localStorage.removeItem(this.storageKeyForDay(this.workDay));
@@ -701,6 +750,156 @@ const ConferenciaApp = {
     if (m) return m[1].slice(0, 11);
 
     return null;
+  },
+
+  parseQrPayload(raw) {
+    if (!raw) return null;
+    const s = String(raw).trim();
+    if (!s.startsWith('{') && !s.startsWith('[')) return null;
+    try {
+      return JSON.parse(s);
+    } catch (e) {
+      return null;
+    }
+  },
+
+  identifyQrPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+
+    const hasPlate = payload.license_plate || payload.licensePlate;
+    if (hasPlate) return { type: 'plate', data: payload };
+
+    const hasRoute = payload.container_id || payload.route_id || payload.assignment || payload.cluster || payload.facility_id;
+    if (hasRoute) return { type: 'route', data: payload };
+
+    return null;
+  },
+
+  buildPlateInfo(payload) {
+    return {
+      plateId: payload.id || payload.carrier_id || null,
+      licensePlate: payload.license_plate || payload.licensePlate || '',
+      carrierName: payload.carrier_name || payload.carrierName || '',
+      vehicleType: payload.vehicle_type_description || payload.vehicleType || '',
+      scannedAt: Date.now()
+    };
+  },
+
+  plateKeyFromInfo(info) {
+    if (!info) return null;
+    return info.licensePlate || String(info.plateId || '').trim();
+  },
+
+  formatPlateLabel(info) {
+    if (!info) return '';
+    const parts = [];
+    if (info.licensePlate) parts.push(`PLACA ${info.licensePlate}`);
+    if (info.carrierName) parts.push(info.carrierName);
+    if (info.vehicleType) parts.push(info.vehicleType);
+    return parts.join(' • ');
+  },
+
+  handlePlateQr(payload) {
+    const info = this.buildPlateInfo(payload);
+    const key = this.plateKeyFromInfo(info);
+    if (!key) {
+      alert('QR de placa inválido (sem identificação).');
+      return;
+    }
+
+    this.currentPlate = info;
+    if (!this.plateRoutes.has(key)) {
+      this.plateRoutes.set(key, new Set());
+    }
+    this.setStatus(`placa lida: ${this.formatPlateLabel(info)}`, 'success');
+    this.renderCurrentPlate();
+  },
+
+  resolveRouteFromQr(payload) {
+    const routeId = payload.route_id || payload.container_id || payload.routeId || payload.containerId || null;
+    const cluster = payload.cluster || payload.assignment || '';
+
+    if (routeId && this.routes.has(String(routeId))) {
+      return { route: this.routes.get(String(routeId)), routeId: String(routeId), cluster };
+    }
+
+    if (cluster) {
+      const matches = Array.from(this.routes.values()).filter(r => String(r.cluster || '').trim() === String(cluster).trim());
+      if (matches.length === 1) {
+        return { route: matches[0], routeId: String(matches[0].routeId), cluster };
+      }
+    }
+
+    if (routeId) {
+      const newRoute = this.makeEmptyRoute(routeId);
+      newRoute.cluster = cluster || newRoute.cluster;
+      return { route: newRoute, routeId: String(routeId), cluster };
+    }
+
+    return { route: null, routeId: null, cluster };
+  },
+
+  handleRouteQr(payload) {
+    if (!this.currentPlate) {
+      alert('Bipe a placa antes de registrar a rota.');
+      return;
+    }
+
+    const { route, routeId, cluster } = this.resolveRouteFromQr(payload);
+    if (!route || !routeId) {
+      alert('QR de rota inválido (não consegui identificar a rota).');
+      return;
+    }
+
+    if (cluster && !route.cluster) route.cluster = cluster;
+
+    route.routeQrInfo = {
+      containerId: payload.container_id || payload.containerId || null,
+      routeId: payload.route_id || payload.routeId || null,
+      assignment: payload.assignment || null,
+      facilityId: payload.facility_id || payload.facilityId || null,
+      cluster: payload.cluster || payload.assignment || null,
+      scannedAt: Date.now()
+    };
+
+    route.plateInfo = this.currentPlate;
+    this.routes.set(String(routeId), route);
+
+    const plateKey = this.plateKeyFromInfo(this.currentPlate);
+    if (plateKey) {
+      if (!this.plateRoutes.has(plateKey)) this.plateRoutes.set(plateKey, new Set());
+      this.plateRoutes.get(plateKey).add(String(routeId));
+    }
+
+    this.currentRouteId = String(routeId);
+    this.saveToStorage(this.workDay);
+    this.markDirty('QR rota');
+    this.renderRoutesSelects();
+    this.refreshUIFromCurrent();
+    this.renderAcompanhamento();
+    this.setStatus(`rota vinculada à placa ${this.currentPlate.licensePlate || ''}`, 'success');
+  },
+
+  handleScan(raw) {
+    const payload = this.parseQrPayload(raw);
+    const qr = this.identifyQrPayload(payload);
+    if (qr?.type === 'plate') {
+      this.handlePlateQr(qr.data);
+      $('#barcode-input').val('').focus();
+      return;
+    }
+    if (qr?.type === 'route') {
+      this.handleRouteQr(qr.data);
+      $('#barcode-input').val('').focus();
+      return;
+    }
+
+    const id = this.normalizarCodigo(raw);
+    if (!id) {
+      $('#barcode-input').val('').focus();
+      return;
+    }
+    this.conferirId(id);
   },
 
   playAlertSound() {
@@ -1159,14 +1358,7 @@ $('#barcode-input').on('keypress', (e) => {
     ConferenciaApp.viaCsv = false;
 
     const raw = $('#barcode-input').val();
-    const id = ConferenciaApp.normalizarCodigo(raw);
-
-    if (!id) {
-      $('#barcode-input').val('').focus();
-      return;
-    }
-
-    ConferenciaApp.conferirId(id);
+    ConferenciaApp.handleScan(raw);
   }
 });
 
