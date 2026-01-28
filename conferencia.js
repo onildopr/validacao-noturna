@@ -21,6 +21,17 @@ const ConferenciaApp = {
   // Manual save / acompanhamento
   dirty: false,              // há alterações pendentes para salvar no arquivo mensal?
   lastEvents: [],            // log simples de bipagens (últimos eventos)
+
+  // =======================
+  // Carretas (Placa -> Rotas QR)
+  // =======================
+  carretas: {
+    currentPlateKey: null,
+    plates: new Map(),        // plateKey -> {raw, license_plate, carrier_name, vehicle_type_description, routes:Set(routeKey), tsFirst, tsLast}
+    routeToPlate: new Map(),  // routeKey -> plateKey
+    routesRaw: new Map(),     // routeKey -> rawText
+  },
+
   // =======================
   // Util data/strings
   // =======================
@@ -76,36 +87,208 @@ const ConferenciaApp = {
     if (this.dirty) $('#dirty-flag').removeClass('d-none');
     else $('#dirty-flag').addClass('d-none');
 
-    // resumo por rota
-    const routesSorted = Array.from(this.routes.values())
-      .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
+    // === Resumo por CLUSTER (consolidado) ===
+    const mapa = new Map(); // cluster -> { conferidos, total }
+    for (const r of this.routes.values()) {
+      const key = (r.cluster && String(r.cluster).trim()) ? String(r.cluster).trim() : '(sem cluster)';
+      const total = (r.totalInicial || r.ids.size || 0);
+      const conf = (r.conferidos ? r.conferidos.size : 0);
 
-    const resumo = routesSorted.map(r => {
-      const total = r.totalInicial || r.ids.size;
-      return `ROTA ${r.cluster}: ${r.conferidos.size}/${total}`;
-    }).slice(0, 14).join('<br>');
+      if (!mapa.has(key)) mapa.set(key, { conferidos: 0, total: 0 });
+      const acc = mapa.get(key);
+      acc.conferidos += conf;
+      acc.total += total;
+    }
 
-    $('#acompanhamento-resumo').html(resumo || '<span class="text-muted">sem rotas</span>');
+    const resumo = Array.from(mapa.entries())
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+      .slice(0, 14)
+      .map(([cluster, v]) => {
+        const ok = (v.total > 0 && v.conferidos === v.total) ? ' ✅' : '';
+        return `CLUSTER ${cluster}: ${v.conferidos}/${v.total}${ok}`;
+      })
+      .join('<br>');
 
-    // log
+    $('#acompanhamento-resumo').html(
+      resumo || '<span class="text-muted">sem clusters</span>'
+    );
+
+    // === Log de bipagens ===
     const items = this.lastEvents.slice(0, 30).map(ev => {
-      const d = new Date(ev.ts || Date.now());
-      const hh = String(d.getHours()).padStart(2, '0');
-      const mm = String(d.getMinutes()).padStart(2, '0');
-      const ss = String(d.getSeconds()).padStart(2, '0');
-
+      const d = new Date(ev.ts);
+      const hh = String(d.getHours()).padStart(2,'0');
+      const mm = String(d.getMinutes()).padStart(2,'0');
+      const ss = String(d.getSeconds()).padStart(2,'0');
       const base = `${hh}:${mm}:${ss} • ${ev.code}`;
+
       if (ev.type === 'fora') {
-        const extra = ev.correctRouteId ? ` <small class="text-muted">(pertence ROTA ${ev.correctRouteId})</small>` : ' <small class="text-muted">(rota desconhecida)</small>';
+        const rr = ev.correctRouteId ? this.routes.get(String(ev.correctRouteId)) : null;
+        const cl = rr && rr.cluster ? String(rr.cluster).trim() : '';
+        const extra = (cl ? ` <small class="text-muted">(CLUSTER ${cl})</small>` : ' <small class="text-muted">(cluster desconhecido)</small>');
         return `<li class="list-group-item list-group-item-warning">${base}${extra}</li>`;
       }
       if (ev.type === 'dup') {
-        return `<li class="list-group-item list-group-item-secondary">${base} <small class="text-muted">(duplicado)</small></li>`;
+        return `<li class="list-group-item list-group-item-secondary">${base} (duplicado)</li>`;
       }
-      return `<li class="list-group-item list-group-item-success">${base} <small class="text-muted">(ok)</small></li>`;
+      return `<li class="list-group-item list-group-item-success">${base} (ok)</li>`;
     });
 
     $('#acompanhamento-log').html(items.join('') || '<li class="list-group-item text-muted">sem eventos</li>');
+  },
+
+  // =======================
+  // Relatório Noturno (sidebar)
+  // =======================
+  escHtml(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  },
+
+  locateIdInOtherRoutes(id, excludeRouteId) {
+    const ex = String(excludeRouteId ?? '');
+    // prioridade: conferido > fora de rota > pertence (ids/faltantes)
+    for (const r of this.routes.values()) {
+      if (String(r.routeId) === ex) continue;
+      if (r.conferidos && r.conferidos.has(id)) {
+        return { where: 'conferido', routeId: String(r.routeId), cluster: String(r.cluster || '').trim() };
+      }
+    }
+    for (const r of this.routes.values()) {
+      if (String(r.routeId) === ex) continue;
+      if (r.foraDeRota && r.foraDeRota.has(id)) {
+        return { where: 'fora', routeId: String(r.routeId), cluster: String(r.cluster || '').trim() };
+      }
+    }
+    for (const r of this.routes.values()) {
+      if (String(r.routeId) === ex) continue;
+      if ((r.ids && r.ids.has(id)) || (r.faltantes && r.faltantes.has(id))) {
+        return { where: 'pertence', routeId: String(r.routeId), cluster: String(r.cluster || '').trim() };
+      }
+    }
+    return null;
+  },
+
+  buildNightReportHtml() {
+    const esc = (x) => this.escHtml(x);
+
+    const routesSorted = Array.from(this.routes.values()).sort((a, b) => {
+      const ca = String(a.cluster || '').trim();
+      const cb = String(b.cluster || '').trim();
+      const byC = ca.localeCompare(cb);
+      if (byC) return byC;
+      return String(a.routeId).localeCompare(String(b.routeId));
+    });
+
+    const items = routesSorted.map(r => {
+      const total = Number(r.totalInicial || r.ids.size || 0);
+      const conf = Number(r.conferidos?.size || 0);
+      const falt = Number(r.faltantes?.size || 0);
+      const ok = total > 0 ? (conf === total) : (falt === 0);
+      return {
+        routeId: String(r.routeId),
+        cluster: String(r.cluster || '').trim(),
+        total, conf, falt,
+        ok,
+        route: r
+      };
+    });
+
+    const completas = items.filter(x => x.ok);
+    const incompletas = items.filter(x => !x.ok);
+
+    const headerLine = (it) => {
+      const c = it.cluster ? `CLUSTER ${esc(it.cluster)}` : 'CLUSTER (vazio)';
+      const perc = it.total ? Math.floor((it.conf / it.total) * 100) : 0;
+      const badge = it.ok ? `<span class="badge badge-success ml-2">100%</span>` : `<span class="badge badge-warning ml-2">${esc(it.falt) } falt.</span>`;
+      return `${c} <small class="text-muted">• Rota ${esc(it.routeId)} • ${esc(it.conf)}/${esc(it.total)} (${perc}%)</small>${badge}`;
+    };
+
+    const listCompletas = completas.length
+      ? completas.map(it => `<li class="list-group-item d-flex justify-content-between align-items-center">${headerLine(it)}</li>`).join('')
+      : `<li class="list-group-item text-muted">Nenhuma rota 100%.</li>`;
+
+    const blocosIncompletas = incompletas.length
+      ? incompletas.map((it, idx) => {
+          const collapseId = `nr_${esc(it.routeId)}_${idx}`;
+          const r = it.route;
+          const faltantes = Array.from(r.faltantes || []);
+          faltantes.sort((a,b)=>String(a).localeCompare(String(b)));
+
+          const faltHtml = faltantes.map(id => {
+            const loc = this.locateIdInOtherRoutes(id, r.routeId);
+            if (!loc) return `<li class="list-group-item list-group-item-danger">${esc(id)}</li>`;
+            const whereTxt = (loc.where === 'conferido')
+              ? 'conferido'
+              : (loc.where === 'fora')
+                ? 'bipado (fora de rota)'
+                : 'pertence à rota';
+            const cl = loc.cluster ? `CLUSTER ${esc(loc.cluster)}` : 'CLUSTER (vazio)';
+            return `<li class="list-group-item list-group-item-warning">
+                      ${esc(id)}
+                      <small class="text-muted ml-2">→ ${whereTxt} em ${cl} (Rota ${esc(loc.routeId)})</small>
+                    </li>`;
+          }).join('') || `<li class="list-group-item text-muted">Sem faltantes</li>`;
+
+          return `
+            <div class="card mb-2">
+              <div class="card-header p-2">
+                <button class="btn btn-link p-0" type="button" data-toggle="collapse" data-target="#${collapseId}">
+                  ${headerLine(it)}
+                </button>
+              </div>
+              <div id="${collapseId}" class="collapse">
+                <ul class="list-group list-group-flush">
+                  ${faltHtml}
+                </ul>
+              </div>
+            </div>
+          `;
+        }).join('')
+      : `<div class="text-muted">Nenhuma rota com faltantes.</div>`;
+
+    return `
+      <div class="mb-2">
+        <div class="small text-muted">Relatório do dia ${esc(this.workDay || this.todayLocalISO())}</div>
+        <div class="small text-muted">Mostra todas as rotas, rotas 100% e faltantes (indicando onde foram vistos em outras rotas).</div>
+      </div>
+
+      <div class="mb-2">
+        <span class="badge badge-success">100%: ${completas.length}</span>
+        <span class="badge badge-warning ml-1">Com faltantes: ${incompletas.length}</span>
+        <span class="badge badge-light ml-1">Total: ${routesSorted.length}</span>
+      </div>
+
+      <div class="mt-2">
+        <div class="font-weight-bold mb-1">Rotas 100%</div>
+        <ul class="list-group mb-3">
+          ${listCompletas}
+        </ul>
+
+        <div class="font-weight-bold mb-1">Rotas com faltantes</div>
+        ${blocosIncompletas}
+      </div>
+    `;
+  },
+
+  showNightReport() {
+    const html = this.buildNightReportHtml();
+    $('#night-report').html(html).removeClass('d-none');
+    $('#acompanhamento-resumo').addClass('d-none');
+    $('#acompanhamento-log').closest('div').addClass('d-none');
+    $('#finish-night-btn').addClass('d-none');
+    $('#night-report-close').removeClass('d-none');
+  },
+
+  hideNightReport() {
+    $('#night-report').addClass('d-none').html('');
+    $('#acompanhamento-resumo').removeClass('d-none');
+    $('#acompanhamento-log').closest('div').removeClass('d-none');
+    $('#finish-night-btn').removeClass('d-none');
+    $('#night-report-close').addClass('d-none');
   },
 
   async manualSaveToMonthFile() {
@@ -149,7 +332,18 @@ const ConferenciaApp = {
       foraDeRota: new Set(),
       duplicados: new Map(), // id -> count
 
-      totalInicial: 0
+      totalInicial: 0,
+
+      // vínculo Carreta/QR
+      plateKey: '',
+      plateRaw: '',
+      plateLicense: '',
+      routeQrKey: '',
+      routeQrRaw: '',
+
+      // timestamps de bipagem (para export CSV estilo scanner)
+      plateScanTs: 0,
+      routeQrScanTs: 0
     };
   },
 
@@ -180,6 +374,19 @@ const ConferenciaApp = {
         route.destinationFacilityId = r.destinationFacilityId || '';
         route.destinationFacilityName = r.destinationFacilityName || '';
         route.totalInicial = Number(r.totalInicial || 0);
+
+        route.plateKey = r.plateKey || '';
+        route.plateRaw = r.plateRaw || '';
+        route.plateLicense = r.plateLicense || '';
+        route.routeQrKey = r.routeQrKey || '';
+        route.routeQrRaw = r.routeQrRaw || '';
+
+    route.plateScanTs = Number(r.plateScanTs || 0);
+    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
+
+        route.plateScanTs = Number(r.plateScanTs || 0);
+        route.routeQrScanTs = Number(r.routeQrScanTs || 0);        route.plateScanTs = Number(r.plateScanTs || 0);
+        route.routeQrScanTs = Number(r.routeQrScanTs || 0);
 
         (r.ids || []).forEach(id => route.ids.add(id));
         (r.conferidos || []).forEach(id => route.conferidos.add(id));
@@ -222,6 +429,15 @@ const ConferenciaApp = {
       destinationFacilityName: r.destinationFacilityName,
       totalInicial: r.totalInicial,
 
+      plateKey: r.plateKey || '',
+      plateRaw: r.plateRaw || '',
+      plateLicense: r.plateLicense || '',
+      routeQrKey: r.routeQrKey || '',
+      routeQrRaw: r.routeQrRaw || '',
+
+      plateScanTs: Number(r.plateScanTs || 0),
+      routeQrScanTs: Number(r.routeQrScanTs || 0),
+
       ids: Array.from(r.ids),
       faltantes: Array.from(r.faltantes),
       conferidos: Array.from(r.conferidos),
@@ -239,6 +455,12 @@ const ConferenciaApp = {
     route.destinationFacilityId = r.destinationFacilityId || '';
     route.destinationFacilityName = r.destinationFacilityName || '';
     route.totalInicial = Number(r.totalInicial || 0);
+
+    route.plateKey = r.plateKey || '';
+    route.plateRaw = r.plateRaw || '';
+    route.plateLicense = r.plateLicense || '';
+    route.routeQrKey = r.routeQrKey || '';
+    route.routeQrRaw = r.routeQrRaw || '';
 
     (r.ids || []).forEach(id => route.ids.add(id));
     (r.conferidos || []).forEach(id => route.conferidos.add(id));
@@ -561,7 +783,7 @@ const ConferenciaApp = {
 
     const makeLabel = (r) => {
       const parts = [];
-      parts.push(`ROTA ${r.routeId}`);
+      parts.push(`CLUSTER ${r.cluster}`);
       if (r.cluster) parts.push(`CLUSTER ${r.cluster}`);
       if (r.destinationFacilityId) parts.push(`XPT ${r.destinationFacilityId}`);
       return parts.join(' • ');
@@ -636,15 +858,16 @@ const ConferenciaApp = {
         const correct = this.findCorrectRouteForId(id);
         if (correct && String(correct) !== String(this.currentRouteId)) {
           const rr = this.routes.get(String(correct));
-          const extra = rr
-            ? ` <small class="text-muted">(pertence: ROTA ${rr.routeId}${rr.cluster ? ' • ' + rr.cluster : ''})</small>`
-            : ` <small class="text-muted">(pertence: ROTA ${correct})</small>`;
+          const cl = rr && rr.cluster ? String(rr.cluster).trim() : '';
+          const extra = cl
+            ? ` <small class="text-muted">(CLUSTER ${cl})</small>`
+            : ` <small class="text-muted">(cluster desconhecido)</small>`;
           return `<li class='list-group-item list-group-item-warning'>${id}${extra}</li>`;
         }
         return `<li class='list-group-item list-group-item-warning'>${id}</li>`;
       }).join('')
     );
-
+        
     $('#duplicados-list').html(
       `<h6>Duplicados (<span class='badge badge-secondary'>${r.duplicados.size}</span>)</h6>` +
       Array.from(r.duplicados.entries())
@@ -702,6 +925,210 @@ const ConferenciaApp = {
 
     return null;
   },
+
+  // =======================
+  // Leitura inteligente (Placa/QR Rota/ID)
+  // =======================
+  parseScanPayload(raw) {
+    const cleaned = String(raw || '').trim();
+    if (!cleaned) return { kind: 'empty' };
+
+    // 1) tenta JSON (QR da placa / QR da rota)
+    if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
+      try {
+        const obj = JSON.parse(cleaned);
+
+        // QR PLACA (carreta)
+        if (obj && typeof obj === 'object' && obj.license_plate) {
+          const plateKey = String(obj.license_plate || '').trim().toUpperCase();
+          return {
+            kind: 'plate',
+            plateKey,
+            plate: {
+              raw: cleaned,
+              license_plate: plateKey,
+              carrier_name: obj.carrier_name || '',
+              vehicle_type_description: obj.vehicle_type_description || '',
+              carrier_id: obj.carrier_id || '',
+              vehicle_type_id: obj.vehicle_type_id || '',
+              id: obj.id || ''
+            }
+          };
+        }
+
+        // QR ROTA (container/assignment/etc)
+        if (obj && typeof obj === 'object' && (obj.container_id || obj.assignment || obj.routeId || obj.route_id)) {
+          const candidate = obj.routeId || obj.route_id || obj.container_id || obj.assignment;
+          const routeIdCandidate = candidate != null ? String(candidate) : '';
+          const routeKey = (obj.container_id != null)
+            ? `container:${obj.container_id}`
+            : (obj.assignment != null)
+              ? `assignment:${obj.assignment}`
+              : (routeIdCandidate ? `route:${routeIdCandidate}` : `json:${cleaned}`);
+
+          return {
+            kind: 'routeqr',
+            routeKey,
+            routeIdCandidate,
+            route: { raw: cleaned, obj }
+          };
+        }
+      } catch (e) {
+        // cai para parse normal
+      }
+    }
+
+    // 2) tenta ID de envio (padrão do sistema atual)
+    const shipmentId = this.normalizarCodigo(cleaned);
+    if (shipmentId) return { kind: 'shipment', shipmentId };
+
+    // 3) fallback: placa em texto
+    const plateLike = cleaned.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (/^[A-Z]{3}\d[A-Z]\d{2}$/.test(plateLike) || /^[A-Z]{3}\d{4}$/.test(plateLike)) {
+      return {
+        kind: 'plate',
+        plateKey: plateLike,
+        plate: { raw: cleaned, license_plate: plateLike, carrier_name: '', vehicle_type_description: '' }
+      };
+    }
+
+    // 4) rota numérica simples
+    const digits = cleaned.replace(/\D/g, '');
+    if (digits.length >= 4) {
+      const routeIdCandidate = digits;
+      return {
+        kind: 'routeqr',
+        routeKey: `route:${routeIdCandidate}`,
+        routeIdCandidate,
+        route: { raw: cleaned, obj: null }
+      };
+    }
+
+    return { kind: 'unknown' };
+  },
+
+  ensurePlate(plateInfo) {
+    const now = Date.now();
+    const key = String(plateInfo.license_plate || '').trim().toUpperCase();
+    if (!key) return null;
+
+    if (!this.carretas.plates.has(key)) {
+      this.carretas.plates.set(key, {
+        raw: plateInfo.raw || '',
+        license_plate: key,
+        carrier_name: plateInfo.carrier_name || '',
+        vehicle_type_description: plateInfo.vehicle_type_description || '',
+        routes: new Set(),
+        tsFirst: now,
+        tsLast: now
+      });
+    } else {
+      const p = this.carretas.plates.get(key);
+      p.tsLast = now;
+      if (plateInfo.raw) p.raw = plateInfo.raw;
+      if (plateInfo.carrier_name) p.carrier_name = plateInfo.carrier_name;
+      if (plateInfo.vehicle_type_description) p.vehicle_type_description = plateInfo.vehicle_type_description;
+    }
+    return key;
+  },
+
+  vincularRouteQrNaPlaca(routeKey, routeRaw, plateKey, routeIdCandidate = '') {
+    if (!routeKey || !plateKey) return false;
+
+    const plate = this.carretas.plates.get(plateKey);
+    if (!plate) return false;
+
+    plate.routes.add(routeKey);
+    this.carretas.routeToPlate.set(routeKey, plateKey);
+    if (routeRaw) this.carretas.routesRaw.set(routeKey, routeRaw);
+
+    // tenta vincular também ao objeto de rota (se existir no sistema)
+    // IMPORTANTE: no seu cenário o QR da rota NÃO traz routeId; ele traz "assignment" (ex.: J9_AM3), que corresponde ao CLUSTER.
+    // Então vinculamos por cluster (e o dia já é isolado pelo cache do sistema).
+    const assignMatch = String(routeKey).match(/^assignment:(.+)$/);
+    const clusterCandidate = (assignMatch && assignMatch[1]) ? String(assignMatch[1]).trim() : '';
+
+    let linked = 0;
+
+    // 1) Principal: vincular por CLUSTER = assignment
+    if (clusterCandidate) {
+      for (const r of this.routes.values()) {
+        const c = (r.cluster != null) ? String(r.cluster).trim() : '';
+        if (c && c === clusterCandidate) {
+          r.plateKey = plateKey;
+          r.plateRaw = plate.raw || '';
+          r.plateLicense = plate.license_plate || plateKey;
+          r.routeQrKey = routeKey;
+          r.routeQrRaw = routeRaw || '';
+          
+          r.plateScanTs = Number(plate.tsLast || Date.now());
+          r.routeQrScanTs = Date.now();
+linked++;
+        }
+      }
+    }
+
+    // 2) Fallback: se por algum motivo vier um routeId em outro formato, tenta achar diretamente pelo Map
+    if (!linked) {
+      const candidateIds = [];
+      if (routeIdCandidate) candidateIds.push(String(routeIdCandidate));
+      const m = String(routeKey).match(/^route:(.+)$/);
+      if (m && m[1]) candidateIds.push(String(m[1]));
+
+      for (const cid of candidateIds) {
+        if (this.routes.has(String(cid))) {
+          const r = this.routes.get(String(cid));
+          r.plateKey = plateKey;
+          r.plateRaw = plate.raw || '';
+          r.plateLicense = plate.license_plate || plateKey;
+          r.routeQrKey = routeKey;
+          r.routeQrRaw = routeRaw || '';
+          
+          r.plateScanTs = Number(plate.tsLast || Date.now());
+          r.routeQrScanTs = Date.now();
+linked++;
+        }
+      }
+    }
+
+this.saveToStorage(this.workDay);
+    this.markDirty('carreta');
+    return true;
+  },
+
+  renderCarretaUI() {
+    const plateKey = this.carretas.currentPlateKey;
+    const $cur = $('#carreta-current');
+    const $list = $('#carreta-routes');
+    const $sum = $('#carreta-summary');
+
+    if (!plateKey) {
+      $cur.html('<span class="text-muted">Nenhuma placa ativa</span>');
+      $list.html('<li class="list-group-item text-muted">bipe uma placa para começar</li>');
+      $sum.text('');
+      return;
+    }
+
+    const p = this.carretas.plates.get(plateKey);
+    if (!p) return;
+
+    const meta = [];
+    meta.push(`<strong>${p.license_plate}</strong>`);
+    if (p.vehicle_type_description) meta.push(`<span class="text-muted">(${p.vehicle_type_description})</span>`);
+    if (p.carrier_name) meta.push(`<span class="text-muted">• ${p.carrier_name}</span>`);
+    $cur.html(meta.join(' '));
+
+    const routesArr = Array.from(p.routes);
+    routesArr.sort((a, b) => String(a).localeCompare(String(b)));
+
+    $list.html(
+      routesArr.map(rk => `<li class="list-group-item">${rk}</li>`).join('') ||
+      '<li class="list-group-item text-muted">sem rotas nessa placa</li>'
+    );
+
+    $sum.text(`${routesArr.length} rota(s) vinculada(s)`);
+  },
+
 
   playAlertSound() {
     try {
@@ -859,14 +1286,15 @@ const ConferenciaApp = {
         route.destinationFacilityName = facMatch[2];
       }
 
-      const regexEnvio = /"id":(4\d{10})[\s\S]*?"receiver_id":"([^"]+)"/g;
-      let match;
       const idsExtraidos = new Set();
 
-      while ((match = regexEnvio.exec(block)) !== null) {
-        const shipmentId = match[1];
-        const receiverId = match[2];
-        if (!receiverId.includes('_')) idsExtraidos.add(shipmentId);
+      // Extrai IDs de envio de forma tolerante (sem depender de receiver_id).
+      // Padrão: "id": 11 dígitos (na prática começam com 4...)
+      const regexId = /"id":\s*(\d{11})/g;
+      let mId;
+      while ((mId = regexId.exec(block)) !== null) {
+        const shipmentId = mId[1];
+        if (/^4\d{10}$/.test(shipmentId)) idsExtraidos.add(shipmentId);
       }
 
       if (!idsExtraidos.size) continue;
@@ -893,6 +1321,194 @@ const ConferenciaApp = {
   // =======================
   // EXPORT: rota atual CSV (FORMATO ANTIGO PADRÃO)
   // =======================
+
+  // =======================
+  // EXPORT: CSV com PLACA + QR ROTA (novo)
+  // =======================
+  // CSV estilo "scanner" (igual exemplo)
+  // Cada linha é um evento com colunas: date,time,time_zone,format,text,notes,favorite,date_utc,time_utc,metadata
+  // =======================
+  csvEscape(v) {
+    const s = (v == null) ? '' : String(v);
+    return '"' + s.replace(/"/g, '""') + '"';
+  },
+
+  buildScannerCsvHeader() {
+    return '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
+  },
+
+  buildScannerCsvRow(dt, text, metadata = '') {
+    const d = (dt instanceof Date) ? dt : new Date(Number(dt || Date.now()));
+    const pad2 = n => String(n).padStart(2, '0');
+
+    const date = `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+    const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    const dateUtc = d.toISOString().slice(0, 10);
+    const timeUtc = d.toISOString().split('T')[1].split('.')[0];
+
+    // Mantém o mesmo rótulo do exemplo do usuário (RO/AM UTC-4)
+    const tzLabel = 'Horário Padrão do Amazonas';
+
+    return [
+      this.csvEscape(date),
+      this.csvEscape(time),
+      this.csvEscape(tzLabel),
+      this.csvEscape('QR Code'),
+      this.csvEscape(text),
+      this.csvEscape(''),
+      this.csvEscape('0'),
+      this.csvEscape(dateUtc),
+      this.csvEscape(timeUtc),
+      this.csvEscape(metadata || '')
+    ].join(',');
+  },
+
+  // Monta as linhas (scanner) de uma rota: PLACA -> QR ROTA -> IDs (por timestamp)
+  buildScannerCsvLinesForRoute(r) {
+    const lines = [];
+    const ids = [
+      ...Array.from(r.conferidos || []),
+      ...Array.from(r.foraDeRota || []),
+      ...Array.from((r.duplicados || new Map()).keys())
+    ];
+
+    if (!ids.length && !r.plateRaw && !r.routeQrRaw && !r.plateLicense && !r.routeQrKey) return lines;
+
+    // ordena IDs pelo timestamp
+    ids.sort((a, b) => {
+      const ta = r.timestamps?.get(a) ? Number(r.timestamps.get(a)) : 0;
+      const tb = r.timestamps?.get(b) ? Number(r.timestamps.get(b)) : 0;
+      return (ta - tb) || String(a).localeCompare(String(b));
+    });
+
+    // timestamps base (se não tiver, usa o primeiro ID ou agora)
+    const firstIdTs = ids.length ? (r.timestamps?.get(ids[0]) || Date.now()) : Date.now();
+    const plateTs = r.plateScanTs || firstIdTs;
+    const routeTs = r.routeQrScanTs || (plateTs ? (Number(plateTs) + 1) : firstIdTs);
+
+    // texto PLACA (preferir JSON bruto)
+    const plateText = (r.plateRaw && String(r.plateRaw).trim())
+      ? String(r.plateRaw).trim()
+      : (r.plateLicense ? JSON.stringify({ license_plate: r.plateLicense }) : '');
+
+    // texto ROTA (preferir JSON bruto)
+    const routeText = (r.routeQrRaw && String(r.routeQrRaw).trim())
+      ? String(r.routeQrRaw).trim()
+      : (r.routeQrKey ? JSON.stringify({ assignment: String(r.routeQrKey).replace(/^assignment:/, '') }) : '');
+
+    if (plateText) lines.push(this.buildScannerCsvRow(plateTs, plateText, ''));
+    if (routeText) lines.push(this.buildScannerCsvRow(routeTs, routeText, ''));
+
+    // ids
+    for (const id of ids) {
+      const ts = r.timestamps?.get(id) || Date.now();
+      lines.push(this.buildScannerCsvRow(ts, String(id), ''));
+    }
+
+    return lines;
+  },
+
+  // - 1 arquivo por rota (rota atual)
+  // - 1 arquivo com todas as rotas
+  // - 1 arquivo "mapa" (placa -> rotas qrs)
+  // =======================
+  
+  exportRotaAtualCsvComPlacaERota() {
+    const r = this.current;
+    if (!r) {
+      alert('Nenhuma rota selecionada.');
+      return;
+    }
+
+    const lines = [this.buildScannerCsvHeader(), ...this.buildScannerCsvLinesForRoute(r)];
+    if (lines.length <= 1) {
+      alert('Nenhum dado para exportar.');
+      return;
+    }
+
+    const content = lines.join('\r\n');
+    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+
+    const cluster = (r.cluster || 'semCluster').replace(/[^\w\-]+/g, '_');
+    const rota = (r.routeId || 'semRota').replace(/[^\w\-]+/g, '_');
+    link.download = `${cluster}_${rota}_placa_rota_scanner.csv`;
+    link.click();
+  },
+
+
+  
+  exportTodasRotasCsvComPlacaERota() {
+    if (!this.routes || this.routes.size === 0) {
+      alert('Não há rotas salvas para exportar.');
+      return;
+    }
+
+    const routesSorted = Array.from(this.routes.values())
+      .sort((a, b) => {
+        // tenta manter a ordem aproximada de bipagem (routeQrScanTs), senão por cluster/routeId
+        const ta = Number(a.routeQrScanTs || a.plateScanTs || 0);
+        const tb = Number(b.routeQrScanTs || b.plateScanTs || 0);
+        if (ta && tb && ta !== tb) return ta - tb;
+        const ca = String(a.cluster || '').localeCompare(String(b.cluster || ''));
+        if (ca !== 0) return ca;
+        return String(a.routeId).localeCompare(String(b.routeId));
+      });
+
+    const lines = [this.buildScannerCsvHeader()];
+    for (const r of routesSorted) {
+      const seg = this.buildScannerCsvLinesForRoute(r);
+      for (const ln of seg) lines.push(ln);
+    }
+
+    if (lines.length <= 1) {
+      alert('Nenhum dado para exportar.');
+      return;
+    }
+
+    const content = lines.join('\r\n');
+    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
+    link.download = `placa_rota_scanner_todas_${this.workDay || this.todayLocalISO()}_${stamp}.csv`;
+    link.click();
+  },
+
+
+  exportMapaCarretasCsv() {
+    if (!this.carretas.plates || this.carretas.plates.size === 0) {
+      alert('Nenhuma placa/rota vinculada ainda.');
+      return;
+    }
+
+    const header = 'plate,carrier,vehicle_type,route_qr_key,route_qr_raw';
+    const linhas = [];
+
+    for (const [plateKey, p] of this.carretas.plates.entries()) {
+      const carrier = (p.carrier_name || '').replace(/,/g, ' ');
+      const vt = (p.vehicle_type_description || '').replace(/,/g, ' ');
+      for (const rk of Array.from(p.routes)) {
+        const raw = (this.carretas.routesRaw.get(rk) || '').replace(/\r?\n/g, ' ');
+        const rawEsc = `"${String(raw).replace(/"/g,'""')}"`;
+        linhas.push(`${plateKey},${carrier},${vt},${rk},${rawEsc}`);
+      }
+    }
+
+    const conteudo = [header, ...linhas].join('\r\n');
+    const blob = new Blob([conteudo], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
+    link.download = `mapa_carretas_${this.workDay || this.todayLocalISO()}_${stamp}.csv`;
+    link.click();
+  },
+
   exportRotaAtualCsvPadrao() {
     const r = this.current;
     if (!r) {
@@ -1040,6 +1656,37 @@ $(document).on('change', '#work-day', async (e) => {
   const day = e.target.value;
   if (!day) return;
   await ConferenciaApp.applyWorkDay(day);
+});
+
+// =======================
+// Relatório noturno (sidebar)
+// =======================
+$(document).on('click', '#finish-night-btn', () => {
+  try {
+    ConferenciaApp.showNightReport();
+    // garante que o conteúdo do relatório fique visível
+    const el = document.querySelector('#night-report');
+    if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  } catch (e) {
+    console.error(e);
+    alert('Falha ao gerar o relatório noturno.');
+  }
+});
+
+// Botão vermelho da tela principal também pode abrir o relatório noturno
+$(document).on('click', '#finish-btn', () => {
+  try {
+    ConferenciaApp.showNightReport();
+    const el = document.querySelector('#night-report');
+    if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  } catch (e) {
+    console.error(e);
+    alert('Falha ao gerar o relatório noturno.');
+  }
+});
+
+$(document).on('click', '#night-report-close', () => {
+  ConferenciaApp.hideNightReport();
 });
 
 // Importar HTML
@@ -1242,3 +1889,108 @@ $(document).on('click', '#btn-save-month', async () => {
   }
 });
 
+
+// =======================
+// Carretas: abrir/voltar + leitura
+// =======================
+$(document).on('click', '#carreta-btn', () => {
+  $('#initial-interface').addClass('d-none');
+  $('#conference-interface').addClass('d-none');
+  $('#manual-interface').addClass('d-none');
+  $('#carreta-interface').removeClass('d-none');
+
+  ConferenciaApp.renderCarretaUI();
+  $('#carreta-input').val('').focus();
+});
+
+$(document).on('click', '#carreta-back-btn', () => {
+  $('#carreta-interface').addClass('d-none');
+  $('#initial-interface').removeClass('d-none');
+  $('#carreta-input').val('');
+  $('#html-input').focus();
+});
+
+$(document).on('click', '#carreta-clear-current', () => {
+  ConferenciaApp.carretas.currentPlateKey = null;
+  ConferenciaApp.renderCarretaUI();
+  $('#carreta-input').val('').focus();
+});
+
+// leitura na tela de carretas (scanner costuma enviar ENTER; alguns enviam via keydown)
+const processCarretaScan = (rawValue) => {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return;
+
+  const parsed = ConferenciaApp.parseScanPayload(raw);
+
+  if (parsed.kind === 'plate') {
+    const key = ConferenciaApp.ensurePlate(parsed.plate);
+    ConferenciaApp.carretas.currentPlateKey = key;
+    ConferenciaApp.renderCarretaUI();
+    return;
+  }
+
+  if (parsed.kind === 'routeqr') {
+    const pk = ConferenciaApp.carretas.currentPlateKey;
+    if (!pk) {
+      alert('Bipe uma PLACA primeiro.');
+      return;
+    }
+    ConferenciaApp.vincularRouteQrNaPlaca(
+      parsed.routeKey,
+      (parsed.route && parsed.route.raw) ? parsed.route.raw : raw,
+      pk,
+      parsed.routeIdCandidate || ''
+    );
+    ConferenciaApp.renderCarretaUI();
+    return;
+  }
+
+  // Se cair aqui, pode ser ID de envio; nessa tela a gente só avisa para não misturar
+  if (parsed.kind === 'shipment') {
+    alert('Aqui é a tela da CARRETA. Bipe a PLACA e os QRs das ROTAS (assignment/container).');
+    return;
+  }
+
+  alert('QR não reconhecido. Bipe uma PLACA (JSON com license_plate) ou um QR de ROTA (JSON com assignment/container_id).');
+};
+
+$(document).on('keydown', '#carreta-input', (e) => {
+  if (e.key === 'Enter' || e.which === 13) {
+    e.preventDefault();
+    const raw = $('#carreta-input').val();
+    $('#carreta-input').val('');
+    processCarretaScan(raw);
+  }
+});
+
+$(document).on('keypress', '#carreta-input', (e) => {
+  if (e.which === 13) {
+    const raw = $('#carreta-input').val();
+    $('#carreta-input').val('');
+    processCarretaScan(raw);
+  }
+});
+
+// suporte a colar (alguns leitores “digitam” e você cola do CSV)
+$(document).on('paste', '#carreta-input', (e) => {
+  const pasted = (e.originalEvent && e.originalEvent.clipboardData)
+    ? e.originalEvent.clipboardData.getData('text')
+    : '';
+  setTimeout(() => {
+    const raw = $('#carreta-input').val() || pasted;
+    $('#carreta-input').val('');
+    processCarretaScan(raw);
+  }, 0);
+});
+
+// Exports novos (CSV com placa/rota)
+$(document).on('click', '#export-csv-rota-atual-placa', () => {
+  ConferenciaApp.exportRotaAtualCsvComPlacaERota();
+});
+$(document).on('click', '#export-csv-todas-rotas-placa', () => {
+  ConferenciaApp.exportTodasRotasCsvComPlacaERota();
+});
+$(document).on('click', '#export-csv-mapa-carretas', () => {
+  ConferenciaApp.exportMapaCarretasCsv();
+});
