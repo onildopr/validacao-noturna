@@ -141,6 +141,8 @@ const ConferenciaApp = {
       cluster: '',
       destinationFacilityId: '',
       destinationFacilityName: '',
+      plateQr: '',
+      routeQr: '',
 
       timestamps: new Map(), // id -> epoch (ms)
       ids: new Set(),
@@ -179,6 +181,8 @@ const ConferenciaApp = {
         route.cluster = r.cluster || '';
         route.destinationFacilityId = r.destinationFacilityId || '';
         route.destinationFacilityName = r.destinationFacilityName || '';
+        route.plateQr = r.plateQr || '';
+        route.routeQr = r.routeQr || '';
         route.totalInicial = Number(r.totalInicial || 0);
 
         (r.ids || []).forEach(id => route.ids.add(id));
@@ -220,6 +224,8 @@ const ConferenciaApp = {
       cluster: r.cluster,
       destinationFacilityId: r.destinationFacilityId,
       destinationFacilityName: r.destinationFacilityName,
+      plateQr: r.plateQr,
+      routeQr: r.routeQr,
       totalInicial: r.totalInicial,
 
       ids: Array.from(r.ids),
@@ -238,6 +244,8 @@ const ConferenciaApp = {
     route.cluster = r.cluster || '';
     route.destinationFacilityId = r.destinationFacilityId || '';
     route.destinationFacilityName = r.destinationFacilityName || '';
+    route.plateQr = r.plateQr || '';
+    route.routeQr = r.routeQr || '';
     route.totalInicial = Number(r.totalInicial || 0);
 
     (r.ids || []).forEach(id => route.ids.add(id));
@@ -412,6 +420,8 @@ const ConferenciaApp = {
       local.cluster = local.cluster || cloud.cluster || '';
       local.destinationFacilityId = local.destinationFacilityId || cloud.destinationFacilityId || '';
       local.destinationFacilityName = local.destinationFacilityName || cloud.destinationFacilityName || '';
+      local.plateQr = local.plateQr || cloud.plateQr || '';
+      local.routeQr = local.routeQr || cloud.routeQr || '';
       local.totalInicial = Math.max(Number(local.totalInicial || 0), Number(cloud.totalInicial || 0));
 
       // Merge Sets
@@ -588,6 +598,8 @@ const ConferenciaApp = {
       $('#cluster-title').html('');
       $('#destination-facility-title').html('');
       $('#destination-facility-name').html('');
+      $('#route-plate-qr').val('');
+      $('#route-qr').val('');
       $('#extracted-total').text('0');
       $('#verified-total').text('0');
       $('#progress-bar').css('width', '0%').text('0%');
@@ -599,6 +611,8 @@ const ConferenciaApp = {
     $('#cluster-title').html(r.cluster ? `CLUSTER: <strong>${r.cluster}</strong>` : '');
     $('#destination-facility-title').html(r.destinationFacilityId ? `<strong>XPT:</strong> ${r.destinationFacilityId}` : '');
     $('#destination-facility-name').html(r.destinationFacilityName ? `<strong>DESTINO:</strong> ${r.destinationFacilityName}` : '');
+    $('#route-plate-qr').val(r.plateQr || '');
+    $('#route-qr').val(r.routeQr || '');
 
     $('#extracted-total').text(r.totalInicial || r.ids.size);
     $('#verified-total').text(r.conferidos.size);
@@ -859,6 +873,12 @@ const ConferenciaApp = {
         route.destinationFacilityName = facMatch[2];
       }
 
+      const plateMatch = /"(?:vehicleLicensePlate|vehiclePlate|licensePlate|placa)":"([^"]+)"/i.exec(block);
+      if (plateMatch) route.plateQr = route.plateQr || plateMatch[1];
+
+      const routeQrMatch = /"(?:routeQr|routeQR|qrRoute|routeCode)":"([^"]+)"/i.exec(block);
+      if (routeQrMatch) route.routeQr = route.routeQr || routeQrMatch[1];
+
       const regexEnvio = /"id":(4\d{10})[\s\S]*?"receiver_id":"([^"]+)"/g;
       let match;
       const idsExtraidos = new Set();
@@ -1015,6 +1035,68 @@ const ConferenciaApp = {
     const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
 
     XLSX.writeFile(wb, `bipagens_todas_rotas_${this.workDay || this.todayLocalISO()}_${stamp}.xlsx`);
+  },
+
+  // =======================
+  // EXPORT: placas -> rotas -> pacotes (CSV)
+  // =======================
+  exportCsvPlacasRotasPacotes() {
+    if (!this.routes || this.routes.size === 0) {
+      alert('Não há rotas salvas para exportar.');
+      return;
+    }
+
+    const routesSorted = Array.from(this.routes.values())
+      .sort((a, b) => {
+        const plateA = String(a.plateQr || '').trim();
+        const plateB = String(b.plateQr || '').trim();
+        const plateCmp = plateA.localeCompare(plateB);
+        if (plateCmp !== 0) return plateCmp;
+
+        const routeA = String(a.routeQr || a.routeId || '').trim();
+        const routeB = String(b.routeQr || b.routeId || '').trim();
+        return routeA.localeCompare(routeB);
+      });
+
+    const escapeCsv = (value) => {
+      const s = String(value ?? '');
+      return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+
+    const header = ['qr_placa', 'qr_rota', 'pacote'];
+    const rows = [];
+
+    for (const r of routesSorted) {
+      const plateQr = String(r.plateQr || '').trim();
+      const routeQr = String(r.routeQr || r.routeId || '').trim();
+      const ids = r.ids.size ? Array.from(r.ids) : Array.from(r.conferidos);
+
+      if (!ids.length) continue;
+
+      ids.sort((x, y) => {
+        const tx = r.timestamps?.get(x) ? Number(r.timestamps.get(x)) : 0;
+        const ty = r.timestamps?.get(y) ? Number(r.timestamps.get(y)) : 0;
+        return (tx - ty) || String(x).localeCompare(String(y));
+      });
+
+      for (const id of ids) {
+        rows.push([plateQr, routeQr, id]);
+      }
+    }
+
+    if (!rows.length) {
+      alert('Não há pacotes para exportar.');
+      return;
+    }
+
+    const conteudo = [header, ...rows].map(row => row.map(escapeCsv).join(',')).join('\r\n');
+    const blob = new Blob([conteudo], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+
+    const stamp = this.workDay || this.todayLocalISO();
+    link.download = `placas_rotas_pacotes_${stamp}.csv`;
+    link.click();
   }
 };
 
@@ -1111,6 +1193,18 @@ $('#switch-route').click(() => {
   $('#barcode-input').focus();
 });
 
+// Atualiza QRs da rota atual
+$(document).on('input', '#route-plate-qr, #route-qr', () => {
+  const r = ConferenciaApp.current;
+  if (!r) return;
+
+  r.plateQr = ($('#route-plate-qr').val() || '').trim();
+  r.routeQr = ($('#route-qr').val() || '').trim();
+
+  ConferenciaApp.saveToStorage(ConferenciaApp.workDay);
+  ConferenciaApp.markDirty('QR da rota');
+});
+
 // Manual
 $('#manual-btn').click(() => {
   $('#initial-interface').addClass('d-none');
@@ -1123,12 +1217,16 @@ $('#submit-manual').click(() => {
     if (!routeId) return alert('Informe o RouteId.');
 
     const cluster = ($('#manual-cluster').val() || '').trim();
+    const plateQr = ($('#manual-plate-qr').val() || '').trim();
+    const routeQr = ($('#manual-route-qr').val() || '').trim();
     const manualIds = $('#manual-input').val().split(/[\s,;]+/).map(x => x.trim()).filter(Boolean);
 
     if (!manualIds.length) return alert('Nenhum ID válido inserido.');
 
     const route = ConferenciaApp.routes.get(String(routeId)) || ConferenciaApp.makeEmptyRoute(routeId);
     route.cluster = cluster || route.cluster;
+    route.plateQr = plateQr || route.plateQr;
+    route.routeQr = routeQr || route.routeQr;
 
     for (const id of manualIds) {
       route.ids.add(id);
@@ -1212,6 +1310,10 @@ $('#check-csv').click(() => {
 // Exports
 $(document).on('click', '#export-csv-rota-atual', () => {
   ConferenciaApp.exportRotaAtualCsvPadrao();
+});
+
+$(document).on('click', '#export-csv-placa-rota', () => {
+  ConferenciaApp.exportCsvPlacasRotasPacotes();
 });
 
 $(document).on('click', '#export-xlsx-todas-rotas', () => {
