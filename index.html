@@ -62,7 +62,19 @@
         </div>
       </div>
 
-      <hr>
+      
+<div class="mt-2">
+  <button id="finish-night-btn" class="btn btn-sm btn-danger btn-block">
+    Finalizar conferência noturna
+  </button>
+  <button id="night-report-close" class="btn btn-sm btn-outline-secondary btn-block d-none">
+    Voltar ao acompanhamento
+  </button>
+</div>
+
+<div id="night-report" class="d-none mt-3"></div>
+
+<hr>
 
 
       <!-- Salvamento manual -->
@@ -139,6 +151,7 @@
               <div class="text-center">
                 <button id="extract-btn" class="btn btn-primary mb-2">Importar/Salvar Rotas do HTML</button>
                 <button id="manual-btn" class="btn btn-secondary">Adicionar IDs Manualmente</button>
+                <button id="carreta-btn" class="btn btn-dark ml-2">Bipar rotas da carreta</button>
               </div>
             </div>
 
@@ -202,6 +215,14 @@
                 <button id="export-csv-rota-atual" class="btn btn-success mb-2">
                   Exportar rota atual (CSV)
                 </button><br>
+                <button id="export-csv-rota-atual-placa" class="btn btn-outline-success mb-2">
+                  Exportar rota atual (CSV + placa/rota)
+                </button><br>
+
+                <button id="export-csv-todas-rotas-placa" class="btn btn-outline-success mb-2">
+                  Exportar todas as rotas (CSV + placa/rota)
+                </button><br>
+
 
                 <button id="export-xlsx-todas-rotas" class="btn btn-success mb-2">
                   Exportar todas as rotas (XLSX)
@@ -213,6 +234,49 @@
             </div>
 
             <!-- Interface manual -->
+            <!-- Interface CARRETA -->
+            <div id="carreta-interface" class="d-none">
+              <div class="text-center mb-3">
+                <h2>Bipar rotas da carreta</h2>
+                <div class="text-muted">1) Bipe a placa • 2) Bipe os QRs das rotas dessa placa • 3) Bipe outra placa e repita</div>
+              </div>
+
+              <div class="card mb-3">
+                <div class="card-body">
+                  <div class="mb-2">
+                    <div class="small text-muted">Placa ativa:</div>
+                    <div id="carreta-current" class="h5 mb-0"></div>
+                    <div id="carreta-summary" class="text-muted mt-1"></div>
+                  </div>
+
+                  <input type="text" id="carreta-input" class="form-control" autocomplete="off" autocapitalize="off" spellcheck="false"
+                    placeholder="Bipe aqui: QR da PLACA ou QR da ROTA">
+
+                  <div class="mt-3">
+                    <div class="small text-muted mb-1">Rotas vinculadas nessa placa:</div>
+                    <ul id="carreta-routes" class="list-group list-section"></ul>
+                  </div>
+
+                  <div class="row mt-3">
+                    <div class="col-md-4">
+                      <button id="carreta-clear-current" class="btn btn-outline-secondary btn-block">Limpar placa ativa</button>
+                    </div>
+                    <div class="col-md-4 mt-2 mt-md-0">
+                      <button id="export-csv-mapa-carretas" class="btn btn-outline-info btn-block">Exportar mapa (placa x rotas)</button>
+                    </div>
+                    <div class="col-md-4 mt-2 mt-md-0">
+                      <button id="carreta-back-btn" class="btn btn-secondary btn-block">Voltar</button>
+                    </div>
+                  </div>
+
+                  <small class="text-muted d-block mt-3">
+                    Obs.: se o QR da rota tiver um número que bate com o RouteId do sistema, ele já vincula automaticamente a placa/rota na rota salva.
+                  </small>
+                </div>
+              </div>
+            </div>
+
+
             <div id="manual-interface" class="d-none">
               <h4>Adicionar IDs Manualmente</h4>
 
@@ -253,4 +317,3 @@
 <script src="conferencia.js" defer></script>
 </body>
 </html>
-
