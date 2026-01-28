@@ -152,6 +152,20 @@
               <h3 id="cluster-title"></h3>
               <h4 id="route-title"></h4>
 
+              <div class="card mb-3">
+                <div class="card-body">
+                  <h6 class="mb-2">QRs da rota</h6>
+                  <div class="form-row">
+                    <div class="col-md-6 mb-2 mb-md-0">
+                      <input type="text" id="route-plate-qr" class="form-control" placeholder="QR da placa">
+                    </div>
+                    <div class="col-md-6">
+                      <input type="text" id="route-qr" class="form-control" placeholder="QR da rota">
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <!-- Trocar rota sem voltar -->
               <div class="alert alert-light border">
                 <div class="row align-items-center">
@@ -207,6 +221,10 @@
                   Exportar todas as rotas (XLSX)
                 </button><br>
 
+                <button id="export-csv-placa-rota" class="btn btn-success mb-2">
+                  Exportar placas/rotas/pacotes (CSV)
+                </button><br>
+
                 <button id="finish-btn" class="btn btn-danger" type="button">Finalizar Conferência</button>
                 <button id="back-btn" class="btn btn-secondary" type="button">Voltar</button>
               </div>
@@ -222,6 +240,14 @@
                 </div>
                 <div class="col-md-6">
                   <input id="manual-cluster" class="form-control mb-2" placeholder="Cluster (opcional)">
+                </div>
+              </div>
+              <div class="row">
+                <div class="col-md-6">
+                  <input id="manual-plate-qr" class="form-control mb-2" placeholder="QR da placa (opcional)">
+                </div>
+                <div class="col-md-6">
+                  <input id="manual-route-qr" class="form-control mb-2" placeholder="QR da rota (opcional)">
                 </div>
               </div>
 
