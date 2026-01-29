@@ -4,6 +4,7 @@ const STORAGE_KEY_PREFIX = 'conferencia.routes.daycache.v1'; // cache local por 
 const SYNC_INTERVAL_MS = 20000;
 
 const ConferenciaApp = {
+  
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
   currentRouteId: null,
   viaCsv: false,
@@ -30,21 +31,78 @@ const ConferenciaApp = {
     plates: new Map(),        // plateKey -> {raw, license_plate, carrier_name, vehicle_type_description, routes:Set(routeKey), tsFirst, tsLast}
     routeToPlate: new Map(),  // routeKey -> plateKey
     routesRaw: new Map(),     // routeKey -> rawText
+    routesJson: new Map(),    // routeKey -> jsonText (para export)
+    routesTs: new Map(),      // routeKey -> tsScan
+    
+
+  },
+  normalizeCluster(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^\w\-]+/g, "");
+  },
+  pad2(value) {
+  return String(value ?? "").padStart(2, "0");
   },
 
-  // =======================
-  // Util data/strings
-  // =======================
-  pad2(n) { return String(n).padStart(2, '0'); },
-
-  todayLocalISO() {
+    todayLocalISO() {
     const d = new Date();
-    return `${d.getFullYear()}-${this.pad2(d.getMonth()+1)}-${this.pad2(d.getDate())}`;
+    const tzOffset = d.getTimezoneOffset() * 60000;
+    return new Date(d - tzOffset).toISOString().slice(0, 10);
+  },
+  normalizeCaretKey(k) {
+    const key = String(k || '').trim().toLowerCase();
+
+    // remove acentos
+    const noAcc = key.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+    // mapeia variações comuns
+    if (noAcc === 'assignment' || noAcc === 'assigment' || noAcc === 'asssignment') return 'assignment';
+    if (noAcc === 'license_plate') return 'license_plate';
+    if (noAcc === 'carrier_name') return 'carrier_name';
+    if (noAcc === 'carrier_id') return 'carrier_id';
+    if (noAcc === 'vehicle_type_description') return 'vehicle_type_description';
+    if (noAcc === 'container_id') return 'container_id';
+    if (noAcc === 'facility_id') return 'facility_id';
+    if (noAcc === 'id') return 'id';
+
+    return noAcc;
   },
 
-  monthKeyFromDay(dayISO) {
-    // "2026-01"
-    return String(dayISO || '').slice(0, 7);
+  parseCaretKV(raw) {
+    // pega só a parte antes de "Placa" / "Rota" (se existir)
+    const cleaned = String(raw || '').replace(/\r/g, '').trim();
+    const first = cleaned.split('\n')[0].trim();
+
+    const kv = {};
+
+    // separa por vírgula e tenta pegar pares "chave^Çvalor"
+    const tokens = first.split(',').map(t => t.trim()).filter(Boolean);
+
+    for (const tok of tokens) {
+      // exemplos de token:
+      // ^license_plate^Ç^SHM6F53^
+      // âssignment^Ç^J11_AM5^{
+      // ^container_id^Ç10356375
+      const m = tok.match(/^(\^?)([^\\^]+?)\^Ç\^?(.+?)\^?$/);
+      if (!m) continue;
+
+      const rawKey = m[2];
+      let val = m[3];
+
+      const key = this.normalizeCaretKey(rawKey);
+
+      // limpa valor
+      val = String(val)
+        .replace(/^\^+|\^+$/g, '')
+        .replace(/[{}]/g, '')
+        .trim();
+
+      kv[key] = val;
+    }
+
+    return kv;
   },
 
   storageKeyForDay(dayISO) {
@@ -384,9 +442,11 @@ const ConferenciaApp = {
     route.plateScanTs = Number(r.plateScanTs || 0);
     route.routeQrScanTs = Number(r.routeQrScanTs || 0);
 
-        route.plateScanTs = Number(r.plateScanTs || 0);
-        route.routeQrScanTs = Number(r.routeQrScanTs || 0);        route.plateScanTs = Number(r.plateScanTs || 0);
-        route.routeQrScanTs = Number(r.routeQrScanTs || 0);
+    
+    route.plateScanTs = Number(r.plateScanTs || 0);
+    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
+
+    
 
         (r.ids || []).forEach(id => route.ids.add(id));
         (r.conferidos || []).forEach(id => route.conferidos.add(id));
@@ -462,6 +522,11 @@ const ConferenciaApp = {
     route.routeQrKey = r.routeQrKey || '';
     route.routeQrRaw = r.routeQrRaw || '';
 
+    
+
+    route.plateScanTs = Number(r.plateScanTs || 0);
+    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
+
     (r.ids || []).forEach(id => route.ids.add(id));
     (r.conferidos || []).forEach(id => route.conferidos.add(id));
     (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
@@ -503,8 +568,13 @@ const ConferenciaApp = {
       await this.loadMonthFile();
       await this.applyWorkDay(this.workDay || this.todayLocalISO());
     } catch (e) {
+      // Usuário cancelou o seletor de arquivo (não é erro)
+      if (e && (e.name === 'AbortError' || e.code === 20)) {
+        this.setStatus('seleção cancelada', 'muted');
+        return;
+      }
       console.warn(e);
-      this.setStatus('seleção cancelada', 'muted');
+      this.setStatus('erro na seleção do arquivo', 'danger');
     }
   },
 
@@ -783,10 +853,9 @@ const ConferenciaApp = {
 
     const makeLabel = (r) => {
       const parts = [];
-      parts.push(`CLUSTER ${r.cluster}`);
       if (r.cluster) parts.push(`CLUSTER ${r.cluster}`);
       if (r.destinationFacilityId) parts.push(`XPT ${r.destinationFacilityId}`);
-      return parts.join(' • ');
+      return parts.join(' • ') || `(sem dados) • Rota ${r.routeId}`;
     };
 
     $sel1.html(
@@ -930,10 +999,72 @@ const ConferenciaApp = {
   // Leitura inteligente (Placa/QR Rota/ID)
   // =======================
   parseScanPayload(raw) {
+    const self = ConferenciaApp; // <- fixa o contexto
     const cleaned = String(raw || '').trim();
     if (!cleaned) return { kind: 'empty' };
 
-    // 1) tenta JSON (QR da placa / QR da rota)
+    // 0) QR em formato “caret” (ex.: ^license_plate^Ç^SHW8J07^, ...)
+// Esse formato vem do leitor; transformamos em KV tolerante (aceita "âssignment", "asssignment", etc).
+const firstLine = cleaned.split(/\?/)[0].trim();
+if (firstLine.includes('^') && firstLine.includes('Ç')) {
+  const kv = this.parseCaretKV(firstLine);
+
+  // QR PLACA (carreta)
+  if (kv.license_plate) {
+    const plateKey = String(kv.license_plate).trim().toUpperCase();
+    const plateObj = {
+      id: kv.id || '',
+      carrier_id: kv.carrier_id || '',
+      carrier_name: kv.carrier_name || '',
+      license_plate: plateKey,
+      vehicle_type_description: kv.vehicle_type_description || ''
+    };
+    const jsonText = JSON.stringify(plateObj);
+    return {
+      kind: 'plate',
+      plateKey,
+      plate: {
+        raw: firstLine,
+        jsonText,
+        license_plate: plateKey,
+        carrier_name: plateObj.carrier_name || '',
+        vehicle_type_description: plateObj.vehicle_type_description || '',
+        carrier_id: plateObj.carrier_id || '',
+        id: plateObj.id || ''
+      }
+    };
+  }
+
+  // QR ROTA (container / assignment)
+  if (kv.container_id || kv.assignment) {
+    let assignment = kv.assignment ? String(kv.assignment).trim() : '';
+    assignment = this.normalizeCluster(assignment);
+ // normaliza (remove lixo e deixa comparável ao cluster)
+
+    const obj = {
+      container_id: kv.container_id ? Number(kv.container_id) : undefined,
+      facility_id: kv.facility_id || '',
+      assignment: assignment
+    };
+    Object.keys(obj).forEach(k => obj[k] === undefined && delete obj[k]);
+
+    const routeKey = assignment
+      ? `assignment:${assignment}`
+      : (kv.container_id ? `container:${kv.container_id}` : `caret:${firstLine}`);
+
+    const jsonText = JSON.stringify(obj);
+
+    return {
+      kind: 'routeqr',
+      routeKey,
+      routeIdCandidate: '',
+      route: { raw: firstLine, obj, jsonText }
+    };
+  }
+}
+
+
+  // 1) tenta JSON (QR da placa / QR da rota)
     if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
       try {
         const obj = JSON.parse(cleaned);
@@ -979,7 +1110,7 @@ const ConferenciaApp = {
     }
 
     // 2) tenta ID de envio (padrão do sistema atual)
-    const shipmentId = this.normalizarCodigo(cleaned);
+    const shipmentId = self.normalizarCodigo(cleaned);
     if (shipmentId) return { kind: 'shipment', shipmentId };
 
     // 3) fallback: placa em texto
@@ -1015,6 +1146,8 @@ const ConferenciaApp = {
     if (!this.carretas.plates.has(key)) {
       this.carretas.plates.set(key, {
         raw: plateInfo.raw || '',
+        jsonText: plateInfo.jsonText || '',
+        tsScan: now,
         license_plate: key,
         carrier_name: plateInfo.carrier_name || '',
         vehicle_type_description: plateInfo.vehicle_type_description || '',
@@ -1026,6 +1159,8 @@ const ConferenciaApp = {
       const p = this.carretas.plates.get(key);
       p.tsLast = now;
       if (plateInfo.raw) p.raw = plateInfo.raw;
+      if (plateInfo.jsonText) p.jsonText = plateInfo.jsonText;
+      p.tsScan = now;
       if (plateInfo.carrier_name) p.carrier_name = plateInfo.carrier_name;
       if (plateInfo.vehicle_type_description) p.vehicle_type_description = plateInfo.vehicle_type_description;
     }
@@ -1040,26 +1175,40 @@ const ConferenciaApp = {
 
     plate.routes.add(routeKey);
     this.carretas.routeToPlate.set(routeKey, plateKey);
-    if (routeRaw) this.carretas.routesRaw.set(routeKey, routeRaw);
+
+    const rawStr = (typeof routeRaw === 'string')
+      ? routeRaw
+      : ((routeRaw && routeRaw.raw) ? String(routeRaw.raw) : '');
+
+    const jsonText = (routeRaw && typeof routeRaw === 'object' && routeRaw.jsonText)
+      ? String(routeRaw.jsonText)
+      : '';
+
+    if (rawStr) this.carretas.routesRaw.set(routeKey, rawStr);
+    if (jsonText) this.carretas.routesJson.set(routeKey, jsonText);
+    if (!this.carretas.routesTs.get(routeKey)) this.carretas.routesTs.set(routeKey, Date.now());
 
     // tenta vincular também ao objeto de rota (se existir no sistema)
     // IMPORTANTE: no seu cenário o QR da rota NÃO traz routeId; ele traz "assignment" (ex.: J9_AM3), que corresponde ao CLUSTER.
     // Então vinculamos por cluster (e o dia já é isolado pelo cache do sistema).
     const assignMatch = String(routeKey).match(/^assignment:(.+)$/);
-    const clusterCandidate = (assignMatch && assignMatch[1]) ? String(assignMatch[1]).trim() : '';
+    const clusterCandidate = this.normalizeCluster(assignMatch?.[1] || '');
 
     let linked = 0;
 
     // 1) Principal: vincular por CLUSTER = assignment
     if (clusterCandidate) {
       for (const r of this.routes.values()) {
-        const c = (r.cluster != null) ? String(r.cluster).trim() : '';
-        if (c && c === clusterCandidate) {
+        const c = this.normalizeCluster(r.cluster);
+        if (c && clusterCandidate && c === clusterCandidate) {
           r.plateKey = plateKey;
-          r.plateRaw = plate.raw || '';
+          r.plateRaw = plate.jsonText || plate.raw || '';
           r.plateLicense = plate.license_plate || plateKey;
           r.routeQrKey = routeKey;
-          r.routeQrRaw = routeRaw || '';
+          r.routeQrRaw = (typeof routeRaw === 'string' ? routeRaw : (routeRaw && routeRaw.raw) ? routeRaw.raw : '') || '';
+          // se houver jsonText no parse, usa no export
+          const _json = (routeRaw && routeRaw.jsonText) ? routeRaw.jsonText : '';
+          if (_json) r.routeQrRaw = _json;
           
           r.plateScanTs = Number(plate.tsLast || Date.now());
           r.routeQrScanTs = Date.now();
@@ -1079,10 +1228,13 @@ linked++;
         if (this.routes.has(String(cid))) {
           const r = this.routes.get(String(cid));
           r.plateKey = plateKey;
-          r.plateRaw = plate.raw || '';
+          r.plateRaw = plate.jsonText || plate.raw || '';
           r.plateLicense = plate.license_plate || plateKey;
           r.routeQrKey = routeKey;
-          r.routeQrRaw = routeRaw || '';
+          r.routeQrRaw = (typeof routeRaw === 'string' ? routeRaw : (routeRaw && routeRaw.raw) ? routeRaw.raw : '') || '';
+          // se houver jsonText no parse, usa no export
+          const _json = (routeRaw && routeRaw.jsonText) ? routeRaw.jsonText : '';
+          if (_json) r.routeQrRaw = _json;
           
           r.plateScanTs = Number(plate.tsLast || Date.now());
           r.routeQrScanTs = Date.now();
@@ -1094,6 +1246,82 @@ linked++;
 this.saveToStorage(this.workDay);
     this.markDirty('carreta');
     return true;
+  },
+  checkLinksForCurrentPlate() {
+  const plateKey = this.carretas.currentPlateKey;
+  if (!plateKey) return alert('Nenhuma placa ativa.');
+
+  const p = this.carretas.plates.get(plateKey);
+  if (!p) return alert('Placa ativa não encontrada na memória.');
+
+  const routes = Array.from(p.routes || []);
+  routes.sort((a,b)=>String(a).localeCompare(String(b)));
+
+  // quais clusters importados existem
+  const clustersImportados = new Set(
+    Array.from(this.routes.values()).map(r => this.normalizeCluster(r.cluster)).filter(Boolean)
+  );
+
+  // checa para cada routeKey se o cluster existe nas rotas importadas
+  const detalhes = routes.map(rk => {
+    const m = String(rk).match(/^assignment:(.+)$/);
+    const cl = this.normalizeCluster(m?.[1] || '');
+    const ok = cl && clustersImportados.has(cl);
+    return `- ${rk}  => cluster: ${cl || '(vazio)'}  ${ok ? '[OK]' : '[NÃO ENCONTRADO NAS ROTAS IMPORTADAS]'}`;
+  });
+
+  const msg =
+    `PLACA ATIVA: ${plateKey}\n` +
+    `ROTAS VINCULADAS: ${routes.length}\n\n` +
+    (detalhes.length ? detalhes.join('\n') : '(nenhuma rota vinculada)\n') +
+    `\n\nObs: [OK] significa que existe rota importada com cluster igual ao do QR.`;
+
+  alert(msg);
+  },
+
+  clearBipagemForPlate(plateKeyRaw) {
+    const plateKey = String(plateKeyRaw || '').trim().toUpperCase();
+    if (!plateKey) return alert('Informe uma placa válida.');
+
+    const p = this.carretas.plates.get(plateKey);
+    if (!p) return alert('Essa placa não está carregada/vinculada.');
+
+    // 1) remove vínculo das rotas QR na estrutura carretas
+    const routeKeys = Array.from(p.routes || []);
+    for (const rk of routeKeys) {
+      this.carretas.routeToPlate.delete(rk);
+      this.carretas.routesRaw.delete(rk);
+      this.carretas.routesJson.delete(rk);
+      this.carretas.routesTs.delete(rk);
+    }
+
+    // zera lista de rotas na placa
+    p.routes = new Set();
+
+    // 2) limpa também nas rotas do sistema (conferência)
+    for (const r of this.routes.values()) {
+      if ((r.plateKey || '').toUpperCase() === plateKey) {
+        r.plateKey = '';
+        r.plateRaw = '';
+        r.plateLicense = '';
+        r.routeQrKey = '';
+        r.routeQrRaw = '';
+        r.plateScanTs = 0;
+        r.routeQrScanTs = 0;
+      }
+    }
+
+    // se a placa ativa era essa, mantém ativa mas sem rotas
+    if (this.carretas.currentPlateKey === plateKey) {
+      this.carretas.currentPlateKey = plateKey;
+    }
+
+    this.saveToStorage(this.workDay);
+    this.markDirty('excluir bipagem placa');
+    this.renderCarretaUI();
+    this.renderAcompanhamento();
+
+    alert(`Bipagem/vínculos removidos para a placa ${plateKey}.`);
   },
 
   renderCarretaUI() {
@@ -1278,7 +1506,7 @@ this.saveToStorage(this.workDay);
       const route = this.routes.get(routeId) || this.makeEmptyRoute(routeId);
 
       const clusterMatch = /"cluster":"([^"]+)"/.exec(block);
-      if (clusterMatch) route.cluster = clusterMatch[1];
+      if (clusterMatch) route.cluster = this.normalizeCluster(clusterMatch[1]);
 
       const facMatch = /"destinationFacilityId":"([^"]+)","name":"([^"]+)"/.exec(block);
       if (facMatch) {
@@ -1323,6 +1551,26 @@ this.saveToStorage(this.workDay);
   // =======================
 
   // =======================
+// Export helpers
+// =======================
+getIdsForExportByTimestamp(r) {
+  if (!r) return [];
+  const set = new Set([
+    ...Array.from(r.conferidos || []),
+    ...Array.from(r.foraDeRota || []),
+    ...Array.from((r.duplicados || new Map()).keys())
+  ]);
+  const ids = Array.from(set);
+
+  ids.sort((a, b) => {
+    const ta = r.timestamps?.get(a) ? Number(r.timestamps.get(a)) : 0;
+    const tb = r.timestamps?.get(b) ? Number(r.timestamps.get(b)) : 0;
+    return (ta - tb) || String(a).localeCompare(String(b));
+  });
+  return ids;
+},
+
+// =======================
   // EXPORT: CSV com PLACA + QR ROTA (novo)
   // =======================
   // CSV estilo "scanner" (igual exemplo)
@@ -1337,7 +1585,7 @@ this.saveToStorage(this.workDay);
     return '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
   },
 
-  buildScannerCsvRow(dt, text, metadata = '') {
+  buildScannerCsvRow(dt, format, text, metadata = '') {
     const d = (dt instanceof Date) ? dt : new Date(Number(dt || Date.now()));
     const pad2 = n => String(n).padStart(2, '0');
 
@@ -1353,7 +1601,7 @@ this.saveToStorage(this.workDay);
       this.csvEscape(date),
       this.csvEscape(time),
       this.csvEscape(tzLabel),
-      this.csvEscape('QR Code'),
+      this.csvEscape(format || 'QR Code'),
       this.csvEscape(text),
       this.csvEscape(''),
       this.csvEscape('0'),
@@ -1396,13 +1644,13 @@ this.saveToStorage(this.workDay);
       ? String(r.routeQrRaw).trim()
       : (r.routeQrKey ? JSON.stringify({ assignment: String(r.routeQrKey).replace(/^assignment:/, '') }) : '');
 
-    if (plateText) lines.push(this.buildScannerCsvRow(plateTs, plateText, ''));
-    if (routeText) lines.push(this.buildScannerCsvRow(routeTs, routeText, ''));
+    if (plateText) lines.push(this.buildScannerCsvRow(plateTs, 'QR Code', plateText, ''));
+    if (routeText) lines.push(this.buildScannerCsvRow(routeTs, 'QR Code', routeText, ''));
 
     // ids
     for (const id of ids) {
       const ts = r.timestamps?.get(id) || Date.now();
-      lines.push(this.buildScannerCsvRow(ts, String(id), ''));
+      lines.push(this.buildScannerCsvRow(ts, 'Code 128', String(id), ''));
     }
 
     return lines;
@@ -1414,69 +1662,136 @@ this.saveToStorage(this.workDay);
   // =======================
   
   exportRotaAtualCsvComPlacaERota() {
-    const r = this.current;
-    if (!r) {
-      alert('Nenhuma rota selecionada.');
-      return;
-    }
+  const r = this.current;
+  if (!r) return alert('Nenhuma rota selecionada.');
 
-    const lines = [this.buildScannerCsvHeader(), ...this.buildScannerCsvLinesForRoute(r)];
-    if (lines.length <= 1) {
-      alert('Nenhum dado para exportar.');
-      return;
-    }
+  if (!r.plateKey || !r.routeQrKey) {
+    return alert('Esta rota ainda não está vinculada a uma PLACA e a um QR de ROTA. Use "Bipar rotas da carreta" primeiro.');
+  }
 
-    const content = lines.join('\r\n');
-    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
+  const ids = this.getIdsForExportByTimestamp(r);
+  if (!ids.length) return alert('Nenhum ID para exportar.');
 
-    const cluster = (r.cluster || 'semCluster').replace(/[^\w\-]+/g, '_');
-    const rota = (r.routeId || 'semRota').replace(/[^\w\-]+/g, '_');
-    link.download = `${cluster}_${rota}_placa_rota_scanner.csv`;
-    link.click();
-  },
+  const rows = [];
+  const tz = 'Horário Padrão do Amazonas';
+  const header = '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
+
+  const addRow = (dt, format, text) => {
+    const d = dt instanceof Date ? dt : new Date(Number(dt || Date.now()));
+    const date = `${d.getFullYear()}-${this.pad2(d.getMonth()+1)}-${this.pad2(d.getDate())}`;
+    const time = `${this.pad2(d.getHours())}:${this.pad2(d.getMinutes())}:${this.pad2(d.getSeconds())}`;
+    const dateUtc = d.toISOString().slice(0,10);
+    const timeUtc = d.toISOString().split('T')[1].split('.')[0];
+    const esc = (v) => `"${String(v ?? '').replace(/"/g,'""')}"`;
+    rows.push([esc(date), esc(time), esc(tz), esc(format), esc(text), '""', '"0"', esc(dateUtc), esc(timeUtc), '""'].join(','));
+  };
+
+  // PLACA (uma vez)
+  const plateObj = this.carretas.plates.get(r.plateKey);
+  const plateText = plateObj?.jsonText || plateObj?.raw || r.plateRaw || r.plateLicense || r.plateKey;
+  addRow(plateObj?.tsScan || Date.now(), 'QR Code', plateText);
+
+  // ROTA (uma vez)
+  const routeJson = this.carretas.routesJson?.get(r.routeQrKey);
+  const routeTs = this.carretas.routesTs?.get(r.routeQrKey);
+  const routeText = routeJson || r.routeQrRaw || r.routeQrKey;
+  addRow(routeTs || Date.now(), 'QR Code', routeText);
+
+  // IDS (Code 128)
+  for (const id of ids) {
+    const ts = r.timestamps?.get(id) || Date.now();
+    addRow(ts, 'Code 128', id);
+  }
+
+  const csv = [header, ...rows].join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+
+  const cluster = (r.cluster || 'semCluster').replace(/[^\w\-]+/g, '_');
+  link.download = `RECEBIMENTO_${this.workDay || this.todayLocalISO()}_${cluster}_ROTA_${r.routeId}_PLACA.csv`;
+  link.click();
+},
 
 
   
   exportTodasRotasCsvComPlacaERota() {
-    if (!this.routes || this.routes.size === 0) {
-      alert('Não há rotas salvas para exportar.');
-      return;
+  if (!this.routes || this.routes.size === 0) return alert('Não há rotas salvas para exportar.');
+
+  // Agrupa por PLACA e dentro por CLUSTER/ROTA (não por ordem de leitura)
+  const plateGroups = new Map(); // plateKey -> [routeObj]
+  for (const r of this.routes.values()) {
+    if (!r.plateKey || !r.routeQrKey) continue; // só rotas vinculadas
+    if (!plateGroups.has(r.plateKey)) plateGroups.set(r.plateKey, []);
+    plateGroups.get(r.plateKey).push(r);
+  }
+
+  if (!plateGroups.size) {
+    return alert('Nenhuma rota está vinculada a PLACA/QR de rota. Use "Bipar rotas da carreta" primeiro.');
+  }
+
+  const tz = 'Horário Padrão do Amazonas';
+  const header = '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
+  const rows = [];
+
+  const addRow = (dt, format, text) => {
+    const d = dt instanceof Date ? dt : new Date(Number(dt || Date.now()));
+    const date = `${d.getFullYear()}-${this.pad2(d.getMonth()+1)}-${this.pad2(d.getDate())}`;
+    const time = `${this.pad2(d.getHours())}:${this.pad2(d.getMinutes())}:${this.pad2(d.getSeconds())}`;
+    const dateUtc = d.toISOString().slice(0,10);
+    const timeUtc = d.toISOString().split('T')[1].split('.')[0];
+    const esc = (v) => `"${String(v ?? '').replace(/"/g,'""')}"`;
+    rows.push([esc(date), esc(time), esc(tz), esc(format), esc(text), '""', '"0"', esc(dateUtc), esc(timeUtc), '""'].join(','));
+  };
+
+  const plateKeys = Array.from(plateGroups.keys()).sort((a,b)=>String(a).localeCompare(String(b)));
+
+  for (const plateKey of plateKeys) {
+    const plateObj = this.carretas.plates.get(plateKey);
+    const plateText = plateObj?.jsonText || plateObj?.raw || plateKey;
+
+    // PLACA (uma vez)
+    addRow(plateObj?.tsScan || Date.now(), 'QR Code', plateText);
+
+    // Rotas desta placa: ordena por CLUSTER e routeId
+    const routesArr = plateGroups.get(plateKey) || [];
+    routesArr.sort((a,b) => {
+      const ca = String(a.cluster||'').localeCompare(String(b.cluster||''));
+      if (ca !== 0) return ca;
+      return String(a.routeId||'').localeCompare(String(b.routeId||''));
+    });
+
+    for (const r of routesArr) {
+      const ids = this.getIdsForExportByTimestamp(r);
+      if (!ids.length) continue;
+
+      const routeJson = this.carretas.routesJson?.get(r.routeQrKey);
+      const routeTs = this.carretas.routesTs?.get(r.routeQrKey);
+      const routeText = routeJson || r.routeQrRaw || r.routeQrKey;
+
+      // ROTA (uma vez)
+      addRow(routeTs || Date.now(), 'QR Code', routeText);
+
+      // IDS
+      for (const id of ids) {
+        const ts = r.timestamps?.get(id) || Date.now();
+        addRow(ts, 'Code 128', id);
+      }
     }
+  }
 
-    const routesSorted = Array.from(this.routes.values())
-      .sort((a, b) => {
-        // tenta manter a ordem aproximada de bipagem (routeQrScanTs), senão por cluster/routeId
-        const ta = Number(a.routeQrScanTs || a.plateScanTs || 0);
-        const tb = Number(b.routeQrScanTs || b.plateScanTs || 0);
-        if (ta && tb && ta !== tb) return ta - tb;
-        const ca = String(a.cluster || '').localeCompare(String(b.cluster || ''));
-        if (ca !== 0) return ca;
-        return String(a.routeId).localeCompare(String(b.routeId));
-      });
+  if (!rows.length) return alert('Nenhum ID para exportar.');
 
-    const lines = [this.buildScannerCsvHeader()];
-    for (const r of routesSorted) {
-      const seg = this.buildScannerCsvLinesForRoute(r);
-      for (const ln of seg) lines.push(ln);
-    }
+  const csv = [header, ...rows].join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
 
-    if (lines.length <= 1) {
-      alert('Nenhum dado para exportar.');
-      return;
-    }
-
-    const content = lines.join('\r\n');
-    const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-
-    const now = new Date();
-    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
-    link.download = `placa_rota_scanner_todas_${this.workDay || this.todayLocalISO()}_${stamp}.csv`;
-    link.click();
-  },
+  const now = new Date();
+  const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
+  link.download = `RECEBIMENTO_${this.workDay || this.todayLocalISO()}_PLACAS_ROTAS_${stamp}.csv`;
+  link.click();
+},
 
 
   exportMapaCarretasCsv() {
@@ -1938,7 +2253,10 @@ const processCarretaScan = (rawValue) => {
     }
     ConferenciaApp.vincularRouteQrNaPlaca(
       parsed.routeKey,
-      (parsed.route && parsed.route.raw) ? parsed.route.raw : raw,
+      {
+        raw: (parsed.route && parsed.route.raw) ? parsed.route.raw : raw,
+        jsonText: (parsed.route && parsed.route.jsonText) ? parsed.route.jsonText : ((parsed.route && parsed.route.obj) ? JSON.stringify(parsed.route.obj) : '')
+      },
       pk,
       parsed.routeIdCandidate || ''
     );
@@ -1962,6 +2280,19 @@ $(document).on('keydown', '#carreta-input', (e) => {
     $('#carreta-input').val('');
     processCarretaScan(raw);
   }
+});
+$(document).on('click', '#carreta-check-links', () => {
+  ConferenciaApp.checkLinksForCurrentPlate();
+});
+
+$(document).on('click', '#carreta-clear-bipagem-plate', () => {
+  const pk = ConferenciaApp.carretas.currentPlateKey;
+  if (!pk) return alert('Nenhuma placa ativa.');
+
+  const ok = confirm(`Tem certeza que deseja EXCLUIR a bipagem/vínculos da placa ${pk}?`);
+  if (!ok) return;
+
+  ConferenciaApp.clearBipagemForPlate(pk);
 });
 
 $(document).on('keypress', '#carreta-input', (e) => {
