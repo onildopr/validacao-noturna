@@ -157,15 +157,19 @@
     #acompanhamento-log .list-group-item {
       color: #212529 !important;
     }
-    /* Painel da carreta / placa */
+
+    /* Painel de CARRETAS/PLACAS: força contraste e remove qualquer aparência de "opaco" */
     #carreta-interface .card,
-    #carreta-interface .card-body {
-      background-color: #ffffff !important;
+    #carreta-interface .alert,
+    #carreta-interface .list-group-item {
       opacity: 1 !important;
+      background-color: rgba(255,255,255,0.98) !important;
       color: #212529 !important;
     }
-    #carreta-interface .card {
-      border-left: 5px solid #ff8c00;
+
+    #carreta-interface #carreta-current,
+    #carreta-interface #carreta-summary {
+      color: #212529 !important;
     }
   </style>
 </head>
@@ -401,28 +405,28 @@
                     <ul id="carreta-routes" class="list-group list-section"></ul>
                   </div>
 
-                  <div class="row mt-3">
-                    <div class="col-md-3">
+                  <div class="row mt-5">
+                    <div class="col-md-5">
                       <button id="carreta-clear-current" class="btn btn-outline-secondary btn-block">
                         Limpar placa ativa
                       </button>
                     </div>
 
-                    <div class="col-md-3 mt-2 mt-md-0">
+                    <div class="col-md-5 mt-2 mt-md-0">
                       <button id="carreta-check-links" class="btn btn-outline-primary btn-block">
-                        Vínculos placa/rotas
+                        Ver vínculos (placa/rotas)
                       </button>
                     </div>
 
-                    <div class="col-md-3 mt-2 mt-md-0">
+                    <div class="col-md-5 mt-2 mt-md-0">
                       <button id="carreta-clear-bipagem-plate" class="btn btn-outline-danger btn-block">
-                        Excluir bipagem
+                        Excluir bipagem desta placa
                       </button>
                     </div>
 
-                    <div class="col-md-3 mt-3 mt-md-0">
+                    <div class="col-md-5 mt-2 mt-md-0">
                       <button id="export-csv-mapa-carretas" class="btn btn-outline-info btn-block">
-                        Exportar placa x rotas
+                        Exportar(placaxrotas)
                       </button>
                     </div>
                   </div>
@@ -475,7 +479,28 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
 <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  // Evita erro "Identifier 'supabase' has already been declared" caso exista outro script/arquivo usando esse nome.
+  (function () {
+    const supabaseUrl = "https://joxqazqnbrwakavnwrmg.supabase.co";
+    const supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpveHFhenFuYnJ3YWthdm53cm1nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2OTU5MDQsImV4cCI6MjA4NTI3MTkwNH0.JRjtqL-snAi_PMVSiukNPBBgFEOtzrTnNcbwc_H_NbM";
+    // guarda em window.sbClient para ser reutilizado sem redeclarar
+    window.sbClient = window.sbClient || window.supabase.createClient(supabaseUrl, supabaseAnonKey);
+  })();
+</script>
 <!-- Seu JS -->
 <script src="conferencia.js" defer></script>
 </body>
 </html>
+  <style>
+    /* Só pra garantir o resumo e o log */
+    #acompanhamento-resumo {
+      color: #212529 !important;
+    }
+    #acompanhamento-log .list-group-item {
+      color: #212529 !important;
+    }
+  </style>
