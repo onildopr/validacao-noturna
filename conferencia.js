@@ -4,7 +4,6 @@ const STORAGE_KEY_PREFIX = 'conferencia.routes.daycache.v1'; // cache local por 
 const SYNC_INTERVAL_MS = 20000;
 
 const ConferenciaApp = {
-  
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
   currentRouteId: null,
   viaCsv: false,
@@ -33,24 +32,37 @@ const ConferenciaApp = {
     routesRaw: new Map(),     // routeKey -> rawText
     routesJson: new Map(),    // routeKey -> jsonText (para export)
     routesTs: new Map(),      // routeKey -> tsScan
-    
 
   },
-  normalizeCluster(value) {
-  return String(value || "")
-    .trim()
-    .toUpperCase()
-    .replace(/[^\w\-]+/g, "");
-  },
-  pad2(value) {
-  return String(value ?? "").padStart(2, "0");
+
+  // =======================
+  // Util data/strings
+  // =======================
+
+  // Normaliza texto de cluster/assignment para comparação (sem depender de acentos/lixo do leitor)
+  normalizeCluster(v) {
+    return String(v ?? '')
+      .trim()
+      .toUpperCase()
+      // remove acentos
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      // mantém letras/números/_/- e remove o resto (inclusive { } ^ espaços e caracteres estranhos)
+      .replace(/[^\w\-]+/g, '');
   },
 
-    todayLocalISO() {
+  pad2(n) { return String(n).padStart(2, '0'); },
+
+  todayLocalISO() {
     const d = new Date();
-    const tzOffset = d.getTimezoneOffset() * 60000;
-    return new Date(d - tzOffset).toISOString().slice(0, 10);
+    return `${d.getFullYear()}-${this.pad2(d.getMonth() + 1)}-${this.pad2(d.getDate())}`;
   },
+
+  monthKeyFromDay(dayISO) {
+    // "2026-01"
+    return String(dayISO || '').slice(0, 7);
+  },
+
   normalizeCaretKey(k) {
     const key = String(k || '').trim().toLowerCase();
 
@@ -999,13 +1011,12 @@ const ConferenciaApp = {
   // Leitura inteligente (Placa/QR Rota/ID)
   // =======================
   parseScanPayload(raw) {
-    const self = ConferenciaApp; // <- fixa o contexto
     const cleaned = String(raw || '').trim();
     if (!cleaned) return { kind: 'empty' };
 
     // 0) QR em formato “caret” (ex.: ^license_plate^Ç^SHW8J07^, ...)
 // Esse formato vem do leitor; transformamos em KV tolerante (aceita "âssignment", "asssignment", etc).
-const firstLine = cleaned.split(/\?/)[0].trim();
+const firstLine = cleaned.split(/\?\n/)[0].trim();
 if (firstLine.includes('^') && firstLine.includes('Ç')) {
   const kv = this.parseCaretKV(firstLine);
 
@@ -1038,8 +1049,7 @@ if (firstLine.includes('^') && firstLine.includes('Ç')) {
   // QR ROTA (container / assignment)
   if (kv.container_id || kv.assignment) {
     let assignment = kv.assignment ? String(kv.assignment).trim() : '';
-    assignment = this.normalizeCluster(assignment);
- // normaliza (remove lixo e deixa comparável ao cluster)
+    assignment = this.normalizeCluster(assignment); // normaliza (remove lixo e deixa comparável ao cluster)
 
     const obj = {
       container_id: kv.container_id ? Number(kv.container_id) : undefined,
@@ -1110,7 +1120,7 @@ if (firstLine.includes('^') && firstLine.includes('Ç')) {
     }
 
     // 2) tenta ID de envio (padrão do sistema atual)
-    const shipmentId = self.normalizarCodigo(cleaned);
+    const shipmentId = this.normalizarCodigo(cleaned);
     if (shipmentId) return { kind: 'shipment', shipmentId };
 
     // 3) fallback: placa em texto
