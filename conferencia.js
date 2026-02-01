@@ -2,6 +2,8 @@ const { jsPDF } = window.jspdf || {};
 
 const STORAGE_KEY_PREFIX = 'conferencia.routes.daycache.v1'; // cache local por dia
 const SYNC_INTERVAL_MS = 20000;
+const AUTO_SAVE_INTERVAL_MS = 120000; // 2 min
+
 
 const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
@@ -384,6 +386,43 @@ const ConferenciaApp = {
 
     this.markClean();
   },
+  async manualSaveToMonthFileQuiet() {
+  try {
+    // same as manual save, but sem alert()
+    const day = this.getWorkDayLocalISO();
+    if (!day) return false;
+
+    await this.ensureMonthMetaForDay(day);
+    const monthKey = this.monthKeyFromDay(day);
+
+    const payload = this.serializeAllToJson();
+    const monthObj = await this.loadMonthFile(monthKey);
+    monthObj.days = monthObj.days || {};
+    monthObj.days[day] = payload;
+
+    await this.writeMonthFile(monthKey, monthObj);
+    this.saveToStorage(day, payload);
+
+    this.setDirty(false);
+    this.setStatus(`Autosave: ${new Date().toLocaleTimeString()}`);
+    return true;
+  } catch (e) {
+    console.error("Autosave falhou:", e);
+    // não interromper o fluxo
+    return false;
+  }
+},
+
+startAutoSaveLoop() {
+  // evita múltiplos intervals
+  if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
+  this._autoSaveTimer = setInterval(async () => {
+    // só salva se houver handle e algo sujo
+    if (!this.monthFileHandles || !this.monthFileHandles.size) return;
+    if (!this.isDirty) return;
+    await this.manualSaveToMonthFileQuiet();
+  }, AUTO_SAVE_INTERVAL_MS);
+},
 
   // =======================
   // Modelo de rota
@@ -669,6 +708,7 @@ const ConferenciaApp = {
 
   // Carrega rotas do dia a partir do JSON mensal
   loadDayFromMonthData(dayISO) {
+    this.deserializeCarretas(this.monthData.days[dayISO].carretas);
     this.routes.clear();
     this.currentRouteId = null;
 
@@ -679,6 +719,7 @@ const ConferenciaApp = {
       const route = this.deserializeRoute(routeId, r);
       this.routes.set(String(routeId), route);
     }
+    this.monthData.days[dayISO].carretas = this.serializeCarretas();
   },
 
   // Grava rotas do dia no JSON mensal
@@ -1329,6 +1370,7 @@ this.saveToStorage(this.workDay);
     this.saveToStorage(this.workDay);
     this.markDirty('excluir bipagem placa');
     this.renderCarretaUI();
+      this.renderPatioGeral();
     this.renderAcompanhamento();
 
     alert(`Bipagem/vínculos removidos para a placa ${plateKey}.`);
@@ -1595,72 +1637,102 @@ getIdsForExportByTimestamp(r) {
     return '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
   },
 
-  buildScannerCsvRow(dt, format, text, metadata = '') {
+    buildScannerCsvRow(dt, format, text, metadata = '') {
     const d = (dt instanceof Date) ? dt : new Date(Number(dt || Date.now()));
     const pad2 = n => String(n).padStart(2, '0');
 
     const date = `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
     const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-    const dateUtc = d.toISOString().slice(0, 10);
-    const timeUtc = d.toISOString().split('T')[1].split('.')[0];
 
-    // Mantém o mesmo rótulo do exemplo do usuário (RO/AM UTC-4)
+    // UTC
+    const iso = d.toISOString();
+    const dateUtc = iso.slice(0, 10);
+    const timeUtc = iso.split('T')[1].split('.')[0];
+
     const tzLabel = 'Horário Padrão do Amazonas';
 
+    // IMPORTANT: o validador espera tudo entre aspas e separador vírgula
+    const esc = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+
     return [
-      this.csvEscape(date),
-      this.csvEscape(time),
-      this.csvEscape(tzLabel),
-      this.csvEscape(format || 'QR Code'),
-      this.csvEscape(text),
-      this.csvEscape(''),
-      this.csvEscape('0'),
-      this.csvEscape(dateUtc),
-      this.csvEscape(timeUtc),
-      this.csvEscape(metadata || '')
+      esc(date),
+      esc(time),
+      esc(tzLabel),
+      esc(format || 'QR Code'),
+      esc(text || ''),
+      esc(''),
+      esc('0'),
+      esc(dateUtc),
+      esc(timeUtc),
+      esc(metadata || '')
     ].join(',');
   },
 
   // Monta as linhas (scanner) de uma rota: PLACA -> QR ROTA -> IDs (por timestamp)
+    // Monta as linhas (scanner) de uma rota: PLACA -> QR ROTA -> IDs (por timestamp)
+  // Formato validado:
+  // - linha de PLACA: QR Code com JSON contendo "license_plate"
+  // - linha de ROTA: QR Code com JSON contendo container_id/facility_id/assignment quando houver
+  // - linhas de IDs: QR Code com JSON {"id":"<id>","t":"lm"}
   buildScannerCsvLinesForRoute(r) {
     const lines = [];
-    const ids = [
-      ...Array.from(r.conferidos || []),
-      ...Array.from(r.foraDeRota || []),
-      ...Array.from((r.duplicados || new Map()).keys())
-    ];
+    if (!r) return lines;
 
-    if (!ids.length && !r.plateRaw && !r.routeQrRaw && !r.plateLicense && !r.routeQrKey) return lines;
+    const ids = this.getIdsForExportByTimestamp(r);
 
-    // ordena IDs pelo timestamp
-    ids.sort((a, b) => {
-      const ta = r.timestamps?.get(a) ? Number(r.timestamps.get(a)) : 0;
-      const tb = r.timestamps?.get(b) ? Number(r.timestamps.get(b)) : 0;
-      return (ta - tb) || String(a).localeCompare(String(b));
-    });
-
-    // timestamps base (se não tiver, usa o primeiro ID ou agora)
     const firstIdTs = ids.length ? (r.timestamps?.get(ids[0]) || Date.now()) : Date.now();
     const plateTs = r.plateScanTs || firstIdTs;
     const routeTs = r.routeQrScanTs || (plateTs ? (Number(plateTs) + 1) : firstIdTs);
 
-    // texto PLACA (preferir JSON bruto)
-    const plateText = (r.plateRaw && String(r.plateRaw).trim())
-      ? String(r.plateRaw).trim()
-      : (r.plateLicense ? JSON.stringify({ license_plate: r.plateLicense }) : '');
+    // ===== PLACA (JSON deve conter license_plate) =====
+    let plateText = '';
+    if (r.plateKey) {
+      const p = this.carretas?.plates?.get(r.plateKey);
+      if (p && p.jsonText) {
+        plateText = String(p.jsonText);
+      } else {
+        // fallback mínimo (mas compatível com o validador)
+        plateText = JSON.stringify({
+          id: (p && p.id) ? Number(p.id) : undefined,
+          carrier_id: (p && p.carrier_id) ? Number(p.carrier_id) : undefined,
+          carrier_name: (p && p.carrier_name) ? String(p.carrier_name) : undefined,
+          license_plate: String((p && p.license_plate) || r.plateLicense || r.plateKey),
+          vehicle_type_description: (p && p.vehicle_type_description) ? String(p.vehicle_type_description) : undefined,
+          vehicle_type_id: (p && p.vehicle_type_id) ? Number(p.vehicle_type_id) : undefined,
+          tracking_provider_ids: []
+        }, (k, v) => (v === undefined ? undefined : v));
+        // remove undefined
+        plateText = plateText.replace(/,\s*"(?:id|carrier_id|carrier_name|vehicle_type_description|vehicle_type_id)"\s*:\s*null/g, '');
+      }
+    }
 
-    // texto ROTA (preferir JSON bruto)
-    const routeText = (r.routeQrRaw && String(r.routeQrRaw).trim())
-      ? String(r.routeQrRaw).trim()
-      : (r.routeQrKey ? JSON.stringify({ assignment: String(r.routeQrKey).replace(/^assignment:/, '') }) : '');
+    // ===== QR DA ROTA (JSON) =====
+    let routeText = '';
+    if (r.routeQrKey) {
+      // tenta pegar json salvo na estrutura carretas
+      const routeJson = this.carretas?.routesJson?.get(r.routeQrKey);
+      if (routeJson) {
+        routeText = String(routeJson);
+      } else if (r.routeQrRaw && String(r.routeQrRaw).trim().startsWith('{')) {
+        routeText = String(r.routeQrRaw).trim();
+      } else {
+        // fallback: monta JSON com assignment
+        routeText = JSON.stringify({
+          container_id: (r.container_id != null) ? Number(r.container_id) : undefined,
+          facility_id: (r.destinationFacilityId || ''),
+          assignment: String(r.routeQrKey).replace(/^assignment:/, '')
+        }, (k, v) => (v === undefined ? undefined : v));
+      }
+    }
 
     if (plateText) lines.push(this.buildScannerCsvRow(plateTs, 'QR Code', plateText, ''));
     if (routeText) lines.push(this.buildScannerCsvRow(routeTs, 'QR Code', routeText, ''));
 
-    // ids
+    // ===== IDs: QR Code + JSON com id =====
     for (const id of ids) {
       const ts = r.timestamps?.get(id) || Date.now();
-      lines.push(this.buildScannerCsvRow(ts, 'Code 128', String(id), ''));
+      const payload = JSON.stringify({ id: String(id), t: 'lm' });
+      lines.push(this.buildScannerCsvRow(ts, 'QR Code', payload, ''));
     }
 
     return lines;
@@ -1671,138 +1743,78 @@ getIdsForExportByTimestamp(r) {
   // - 1 arquivo "mapa" (placa -> rotas qrs)
   // =======================
   
-  exportRotaAtualCsvComPlacaERota() {
-  const r = this.current;
-  if (!r) return alert('Nenhuma rota selecionada.');
+    exportRotaAtualCsvComPlacaERota() {
+    const r = this.current;
+    if (!r) return alert('Nenhuma rota selecionada.');
 
-  if (!r.plateKey || !r.routeQrKey) {
-    return alert('Esta rota ainda não está vinculada a uma PLACA e a um QR de ROTA. Use "Bipar rotas da carreta" primeiro.');
-  }
+    if (!r.plateKey || !r.routeQrKey) {
+      return alert('Esta rota ainda não está vinculada a uma PLACA e a um QR de ROTA. Use a tela da CARRETA primeiro.');
+    }
 
-  const ids = this.getIdsForExportByTimestamp(r);
-  if (!ids.length) return alert('Nenhum ID para exportar.');
+    const lines = [];
+    lines.push(this.buildScannerCsvHeader());
 
-  const rows = [];
-  const tz = 'Horário Padrão do Amazonas';
-  const header = '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
+    const body = this.buildScannerCsvLinesForRoute(r);
+    if (!body.length) return alert('Nenhum registro para exportar.');
 
-  const addRow = (dt, format, text) => {
-    const d = dt instanceof Date ? dt : new Date(Number(dt || Date.now()));
-    const date = `${d.getFullYear()}-${this.pad2(d.getMonth()+1)}-${this.pad2(d.getDate())}`;
-    const time = `${this.pad2(d.getHours())}:${this.pad2(d.getMinutes())}:${this.pad2(d.getSeconds())}`;
-    const dateUtc = d.toISOString().slice(0,10);
-    const timeUtc = d.toISOString().split('T')[1].split('.')[0];
-    const esc = (v) => `"${String(v ?? '').replace(/"/g,'""')}"`;
-    rows.push([esc(date), esc(time), esc(tz), esc(format), esc(text), '""', '"0"', esc(dateUtc), esc(timeUtc), '""'].join(','));
-  };
+    lines.push(...body);
 
-  // PLACA (uma vez)
-  const plateObj = this.carretas.plates.get(r.plateKey);
-  const plateText = plateObj?.jsonText || plateObj?.raw || r.plateRaw || r.plateLicense || r.plateKey;
-  addRow(plateObj?.tsScan || Date.now(), 'QR Code', plateText);
+    const csv = lines.join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
 
-  // ROTA (uma vez)
-  const routeJson = this.carretas.routesJson?.get(r.routeQrKey);
-  const routeTs = this.carretas.routesTs?.get(r.routeQrKey);
-  const routeText = routeJson || r.routeQrRaw || r.routeQrKey;
-  addRow(routeTs || Date.now(), 'QR Code', routeText);
+    const cluster = (r.cluster || 'semCluster').replace(/[^\w\-]+/g, '_');
+    link.download = `RECEBIMENTO_${this.workDay || this.todayLocalISO()}_${cluster}_ROTA_${r.routeId}_PLACA.csv`;
+    link.click();
+  },
 
-  // IDS (Code 128)
-  for (const id of ids) {
-    const ts = r.timestamps?.get(id) || Date.now();
-    addRow(ts, 'Code 128', id);
-  }
+    exportTodasRotasCsvComPlacaERota() {
+    if (!this.routes || this.routes.size === 0) return alert('Não há rotas salvas para exportar.');
 
-  const csv = [header, ...rows].join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
+    // Agrupa por PLACA
+    const plateGroups = new Map(); // plateKey -> [routeObj]
+    for (const r of this.routes.values()) {
+      if (!r.plateKey || !r.routeQrKey) continue; // só rotas vinculadas
+      if (!plateGroups.has(r.plateKey)) plateGroups.set(r.plateKey, []);
+      plateGroups.get(r.plateKey).push(r);
+    }
 
-  const cluster = (r.cluster || 'semCluster').replace(/[^\w\-]+/g, '_');
-  link.download = `RECEBIMENTO_${this.workDay || this.todayLocalISO()}_${cluster}_ROTA_${r.routeId}_PLACA.csv`;
-  link.click();
-},
+    if (!plateGroups.size) {
+      return alert('Nenhuma rota está vinculada a PLACA/QR de rota. Use a tela da CARRETA primeiro.');
+    }
 
+    const lines = [];
+    lines.push(this.buildScannerCsvHeader());
 
-  
-  exportTodasRotasCsvComPlacaERota() {
-  if (!this.routes || this.routes.size === 0) return alert('Não há rotas salvas para exportar.');
+    const plateKeys = Array.from(plateGroups.keys()).sort((a,b)=>String(a).localeCompare(String(b)));
 
-  // Agrupa por PLACA e dentro por CLUSTER/ROTA (não por ordem de leitura)
-  const plateGroups = new Map(); // plateKey -> [routeObj]
-  for (const r of this.routes.values()) {
-    if (!r.plateKey || !r.routeQrKey) continue; // só rotas vinculadas
-    if (!plateGroups.has(r.plateKey)) plateGroups.set(r.plateKey, []);
-    plateGroups.get(r.plateKey).push(r);
-  }
+    for (const plateKey of plateKeys) {
+      const routesArr = plateGroups.get(plateKey) || [];
+      routesArr.sort((a,b) => {
+        const ca = String(a.cluster||'').localeCompare(String(b.cluster||''));
+        if (ca !== 0) return ca;
+        return String(a.routeId||'').localeCompare(String(b.routeId||''));
+      });
 
-  if (!plateGroups.size) {
-    return alert('Nenhuma rota está vinculada a PLACA/QR de rota. Use "Bipar rotas da carreta" primeiro.');
-  }
-
-  const tz = 'Horário Padrão do Amazonas';
-  const header = '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
-  const rows = [];
-
-  const addRow = (dt, format, text) => {
-    const d = dt instanceof Date ? dt : new Date(Number(dt || Date.now()));
-    const date = `${d.getFullYear()}-${this.pad2(d.getMonth()+1)}-${this.pad2(d.getDate())}`;
-    const time = `${this.pad2(d.getHours())}:${this.pad2(d.getMinutes())}:${this.pad2(d.getSeconds())}`;
-    const dateUtc = d.toISOString().slice(0,10);
-    const timeUtc = d.toISOString().split('T')[1].split('.')[0];
-    const esc = (v) => `"${String(v ?? '').replace(/"/g,'""')}"`;
-    rows.push([esc(date), esc(time), esc(tz), esc(format), esc(text), '""', '"0"', esc(dateUtc), esc(timeUtc), '""'].join(','));
-  };
-
-  const plateKeys = Array.from(plateGroups.keys()).sort((a,b)=>String(a).localeCompare(String(b)));
-
-  for (const plateKey of plateKeys) {
-    const plateObj = this.carretas.plates.get(plateKey);
-    const plateText = plateObj?.jsonText || plateObj?.raw || plateKey;
-
-    // PLACA (uma vez)
-    addRow(plateObj?.tsScan || Date.now(), 'QR Code', plateText);
-
-    // Rotas desta placa: ordena por CLUSTER e routeId
-    const routesArr = plateGroups.get(plateKey) || [];
-    routesArr.sort((a,b) => {
-      const ca = String(a.cluster||'').localeCompare(String(b.cluster||''));
-      if (ca !== 0) return ca;
-      return String(a.routeId||'').localeCompare(String(b.routeId||''));
-    });
-
-    for (const r of routesArr) {
-      const ids = this.getIdsForExportByTimestamp(r);
-      if (!ids.length) continue;
-
-      const routeJson = this.carretas.routesJson?.get(r.routeQrKey);
-      const routeTs = this.carretas.routesTs?.get(r.routeQrKey);
-      const routeText = routeJson || r.routeQrRaw || r.routeQrKey;
-
-      // ROTA (uma vez)
-      addRow(routeTs || Date.now(), 'QR Code', routeText);
-
-      // IDS
-      for (const id of ids) {
-        const ts = r.timestamps?.get(id) || Date.now();
-        addRow(ts, 'Code 128', id);
+      for (const r of routesArr) {
+        const body = this.buildScannerCsvLinesForRoute(r);
+        if (body.length) lines.push(...body);
       }
     }
-  }
 
-  if (!rows.length) return alert('Nenhum ID para exportar.');
+    if (lines.length <= 1) return alert('Nenhum registro para exportar.');
 
-  const csv = [header, ...rows].join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
+    const csv = lines.join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
 
-  const now = new Date();
-  const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
-  link.download = `RECEBIMENTO_${this.workDay || this.todayLocalISO()}_PLACAS_ROTAS_${stamp}.csv`;
-  link.click();
-},
-
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
+    link.download = `RECEBIMENTO_${this.workDay || this.todayLocalISO()}_PLACAS_ROTAS_${stamp}.csv`;
+    link.click();
+  },
 
   exportMapaCarretasCsv() {
     if (!this.carretas.plates || this.carretas.plates.size === 0) {
@@ -2240,6 +2252,10 @@ $(document).on('click', '#carreta-clear-current', () => {
   ConferenciaApp.renderCarretaUI();
   $('#carreta-input').val('').focus();
 });
+$(document).on('click', '#patio-refresh', function() {
+  ConferenciaApp.renderPatioGeral();
+});
+
 
 // leitura na tela de carretas (scanner costuma enviar ENTER; alguns enviam via keydown)
 const processCarretaScan = (rawValue) => {
