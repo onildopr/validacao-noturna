@@ -1386,6 +1386,7 @@ this.saveToStorage(this.workDay);
       $cur.html('<span class="text-muted">Nenhuma placa ativa</span>');
       $list.html('<li class="list-group-item text-muted">bipe uma placa para começar</li>');
       $sum.text('');
+      this.renderCarretaProgress();
       return;
     }
 
@@ -1407,6 +1408,93 @@ this.saveToStorage(this.workDay);
     );
 
     $sum.text(`${routesArr.length} rota(s) vinculada(s)`);
+      this.renderCarretaProgress();
+  },
+
+
+  renderCarretaProgress() {
+    // Atualiza o card "Acompanhamento da Placa" (esperadas no dia × bipadas na placa ativa)
+    const $label = $('#carreta-progress-label');
+    const $pct = $('#carreta-progress-percent');
+    const $bar = $('#carreta-progress-bar');
+    const $missing = $('#carreta-missing-list');
+    const $extra = $('#carreta-extra-list');
+
+    // Se o HTML não tiver esses elementos (caso futuro), não faz nada.
+    if (!$label.length || !$pct.length || !$bar.length) return;
+
+    const plateKey = this.carretas.currentPlateKey;
+
+    const setUi = (done, total) => {
+      const pctVal = total > 0 ? Math.round((done / total) * 100) : 0;
+      $label.text(`${done}/${total}`);
+      $pct.text(`${pctVal}%`);
+      $bar.css('width', `${pctVal}%`);
+      $bar.attr('aria-valuenow', String(pctVal));
+    };
+
+    // ✅ Rotas "esperadas" = rotas IMPORTADAS (routeId) no dia.
+    // Isso permite ver pendências mesmo que você ainda não tenha bipado QR de rota.
+    const expected = Array.from(this.routes.keys()).map(String);
+    expected.sort((a, b) => (Number(a) - Number(b)) || String(a).localeCompare(String(b)));
+
+    if (!plateKey) {
+      setUi(0, expected.length);
+      $missing.html('<li class="list-group-item text-muted">bipe uma placa para ver o acompanhamento</li>');
+      $extra.html('<li class="list-group-item text-muted">—</li>');
+      return;
+    }
+
+    const plate = this.carretas.plates.get(plateKey);
+
+    // Rotas importadas já VINCULADAS a essa placa (por cluster via QR, ou por ligação direta)
+    const linked = expected.filter(routeId => {
+      const r = this.routes.get(String(routeId));
+      return r && String(r.plateKey || '') === String(plateKey);
+    });
+
+    const missing = expected.filter(routeId => !linked.includes(routeId));
+
+    // "Extra" aqui vira: QRs de rota bipados nessa placa que NÃO batem com nenhuma rota importada.
+    const clustersImportados = new Set(
+      Array.from(this.routes.values()).map(r => this.normalizeCluster(r.cluster)).filter(Boolean)
+    );
+
+    const plateQrRoutes = plate ? Array.from(plate.routes || []) : [];
+    plateQrRoutes.sort((a, b) => String(a).localeCompare(String(b)));
+
+    const extra = plateQrRoutes.filter(rk => {
+      const m = String(rk).match(/^assignment:(.+)$/);
+      const cl = this.normalizeCluster(m?.[1] || '');
+      return cl && !clustersImportados.has(cl);
+    });
+
+    setUi(linked.length, expected.length);
+
+    const fmtExpected = (routeId) => {
+      const r = this.routes.get(String(routeId));
+      const cl = r && r.cluster ? String(r.cluster).trim() : '';
+      const fac = r && r.destinationFacilityName ? String(r.destinationFacilityName).trim() : '';
+      const parts = [`${routeId}`];
+      if (cl) parts.push(`CLUSTER ${cl}`);
+      if (fac) parts.push(fac);
+      return parts.join(' • ');
+    };
+
+    const fmtExtra = (rk) => {
+      const m = String(rk).match(/^assignment:(.+)$/);
+      return m ? m[1] : rk;
+    };
+
+    $missing.html(
+      missing.map(routeId => `<li class="list-group-item">${fmtExpected(routeId)}</li>`).join('') ||
+      '<li class="list-group-item text-muted">nada faltando 🎉</li>'
+    );
+
+    $extra.html(
+      extra.map(rk => `<li class="list-group-item">${fmtExtra(rk)}</li>`).join('') ||
+      '<li class="list-group-item text-muted">—</li>'
+    );
   },
 
 
@@ -2255,6 +2343,10 @@ $(document).on('click', '#carreta-clear-current', () => {
 $(document).on('click', '#patio-refresh', function() {
   ConferenciaApp.renderPatioGeral();
 });
+$(document).on('click', '#carreta-refresh-progress', () => {
+  ConferenciaApp.renderCarretaProgress();
+});
+
 
 
 // leitura na tela de carretas (scanner costuma enviar ENTER; alguns enviam via keydown)
