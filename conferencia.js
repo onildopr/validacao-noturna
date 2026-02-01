@@ -132,6 +132,89 @@ const ConferenciaApp = {
 
 
   // =======================
+  // Persistência Carretas (placa x rotas) no cache/arquivo mensal
+  // =======================
+  serializeCarretas() {
+    const plates = [];
+    for (const [plateKey, p] of (this.carretas.plates || new Map()).entries()) {
+      plates.push([
+        plateKey,
+        {
+          raw: p.raw || '',
+          jsonText: p.jsonText || '',
+          tsScan: Number(p.tsScan || 0),
+          license_plate: p.license_plate || plateKey,
+          carrier_name: p.carrier_name || '',
+          vehicle_type_description: p.vehicle_type_description || '',
+          tsFirst: Number(p.tsFirst || 0),
+          tsLast: Number(p.tsLast || 0),
+          routes: Array.from(p.routes || [])
+        }
+      ]);
+    }
+
+    return {
+      currentPlateKey: this.carretas.currentPlateKey || null,
+      plates,
+      routeToPlate: Array.from(this.carretas.routeToPlate || new Map()),
+      routesRaw: Array.from(this.carretas.routesRaw || new Map()),
+      routesJson: Array.from(this.carretas.routesJson || new Map()),
+      routesTs: Array.from(this.carretas.routesTs || new Map()),
+    };
+  },
+
+  deserializeCarretas(data) {
+    // Reseta estrutura
+    this.carretas.currentPlateKey = null;
+    this.carretas.plates = new Map();
+    this.carretas.routeToPlate = new Map();
+    this.carretas.routesRaw = new Map();
+    this.carretas.routesJson = new Map();
+    this.carretas.routesTs = new Map();
+
+    if (!data || typeof data !== 'object') return;
+
+    this.carretas.currentPlateKey = data.currentPlateKey || null;
+
+    // Plates
+    const platesArr = Array.isArray(data.plates) ? data.plates : [];
+    for (const entry of platesArr) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const [plateKey, p] = entry;
+      const key = String(plateKey || '').trim().toUpperCase();
+      if (!key) continue;
+
+      const routes = new Set(Array.isArray(p?.routes) ? p.routes : []);
+      this.carretas.plates.set(key, {
+        raw: p?.raw || '',
+        jsonText: p?.jsonText || '',
+        tsScan: Number(p?.tsScan || 0),
+        license_plate: String(p?.license_plate || key).toUpperCase(),
+        carrier_name: p?.carrier_name || '',
+        vehicle_type_description: p?.vehicle_type_description || '',
+        routes,
+        tsFirst: Number(p?.tsFirst || p?.tsScan || 0),
+        tsLast: Number(p?.tsLast || p?.tsScan || 0),
+      });
+    }
+
+    // Maps
+    const toMap = (arr) => new Map(Array.isArray(arr) ? arr : []);
+    this.carretas.routeToPlate = toMap(data.routeToPlate);
+    this.carretas.routesRaw = toMap(data.routesRaw);
+    this.carretas.routesJson = toMap(data.routesJson);
+    this.carretas.routesTs = toMap(data.routesTs);
+
+    // Consistência: se alguma rota estiver na placa mas não no routeToPlate, cria.
+    for (const [plateKey, p] of this.carretas.plates.entries()) {
+      for (const rk of Array.from(p.routes || [])) {
+        if (!this.carretas.routeToPlate.has(rk)) this.carretas.routeToPlate.set(rk, plateKey);
+      }
+    }
+  },
+
+
+  // =======================
   // Manual save / acompanhamento
   // =======================
   markDirty(reason = '') {
@@ -370,14 +453,11 @@ const ConferenciaApp = {
     }
     if (!this.workDay) return;
 
-    // fluxo seguro: lê -> merge -> escreve
+    // ✅ Lê o arquivo e sobrescreve o dia com o estado atual.
+    // (Sem merge) para não reintroduzir rotas já deletadas.
     await this.loadMonthFile();
     this.ensureMonthMetaForDay(this.workDay);
 
-    // traz o que está no arquivo para não perder nada
-    this.mergeCloudDayIntoLocal(this.workDay);
-
-    // grava o estado local consolidado no arquivo
     this.writeDayToMonthData(this.workDay);
     await this.writeMonthFile();
 
@@ -725,11 +805,16 @@ startAutoSaveLoop() {
   // Grava rotas do dia no JSON mensal
   writeDayToMonthData(dayISO) {
     this.ensureMonthMetaForDay(dayISO);
+
     const routesObj = {};
     for (const [routeId, r] of this.routes.entries()) {
       routesObj[String(routeId)] = this.serializeRoute(r);
     }
+
     this.monthData.days[dayISO].routes = routesObj;
+
+    // também persiste as carretas/placas do dia
+    this.monthData.days[dayISO].carretas = this.serializeCarretas();
   },
 
   // Merge: cloud(day) + local(day) => local(day) atualizado
@@ -822,15 +907,19 @@ startAutoSaveLoop() {
     if (!this.monthFileHandle) return;          // sem arquivo => offline
     if (!this.workDay) return;
 
-    // lê o arquivo, faz merge, escreve de volta
+    // ✅ Fonte da verdade do arquivo:
+    // - carrega o JSON mensal
+    // - sobrescreve o dia no arquivo com o estado atual em memória
+    // Isso garante que exclusões (rotas apagadas/limpar dia) sejam persistidas,
+    // sem serem "ressuscitadas" por um merge que só soma dados.
     await this.loadMonthFile();
-    this.mergeCloudDayIntoLocal(this.workDay);
+    this.ensureMonthMetaForDay(this.workDay);
 
-    // grava local -> cloud(day)
+    // grava local -> arquivo(day)
     this.writeDayToMonthData(this.workDay);
     await this.writeMonthFile();
 
-    // salva cache local
+    // espelha no cache local
     this.saveToStorage(this.workDay);
 
     // atualiza selects/UI
@@ -852,28 +941,27 @@ startAutoSaveLoop() {
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
 
-    // ✅ sempre começa pelo cache local do dia (não perde rotas)
-    this.loadFromStorage(dayISO);
-
-    // se houver arquivo mensal, apenas LÊ + MERGE (sem salvar automaticamente)
+    // ✅ Se houver arquivo mensal selecionado, ele é a "fonte da verdade" do dia.
+    // Isso evita re-hidratar o estado antigo vindo do localStorage quando você abre o JSON.
     if (this.monthFileHandle) {
       await this.loadMonthFile();
       this.ensureMonthMetaForDay(dayISO);
 
-      // cloud(day) -> local(day)
-      this.mergeCloudDayIntoLocal(dayISO);
+      // arquivo(do mês) -> memória (substitui o estado local do dia)
+      this.loadDayFromMonthData(dayISO);
 
-      // atualiza cache local consolidado
+      // atualiza o cache local APENAS como espelho do arquivo (não como fonte)
       this.saveToStorage(dayISO);
 
       this.renderRoutesSelects();
       this.refreshUIFromCurrent();
       this.renderAcompanhamento();
-      this.setStatus('dia carregado (merge local + arquivo)', 'success');
+      this.setStatus('dia carregado (arquivo do mês)', 'success');
       return;
     }
 
-    // sem arquivo => apenas cache local
+    // Sem arquivo => modo offline: usa somente o cache local do dia
+    this.loadFromStorage(dayISO);
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
     this.renderAcompanhamento();
@@ -1813,14 +1901,22 @@ getIdsForExportByTimestamp(r) {
       }
     }
 
-    if (plateText) lines.push(this.buildScannerCsvRow(plateTs, 'QR Code', plateText, ''));
+    if (plateText) lines.push(this.buildScannerCsvRow(plateTs, 'QR Code', plateText, '{"ec":"L"}'));
     if (routeText) lines.push(this.buildScannerCsvRow(routeTs, 'QR Code', routeText, ''));
 
     // ===== IDs: QR Code + JSON com id =====
     for (const id of ids) {
       const ts = r.timestamps?.get(id) || Date.now();
-      const payload = JSON.stringify({ id: String(id), t: 'lm' });
-      lines.push(this.buildScannerCsvRow(ts, 'QR Code', payload, ''));
+      const idStr = String(id);
+
+      // Se o ID for apenas numérico, exporta como Code 128 (igual ao app QR Code).
+      // Se não for (ou se você realmente precisar do JSON {id,t}), exporta como QR Code.
+      if (/^\d+$/.test(idStr)) {
+        lines.push(this.buildScannerCsvRow(ts, 'Code 128', idStr, ''));
+      } else {
+        const payload = JSON.stringify({ id: idStr, t: 'lm' });
+        lines.push(this.buildScannerCsvRow(ts, 'QR Code', payload, '{"ec":"L"}'));
+      }
     }
 
     return lines;
