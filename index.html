@@ -8,6 +8,35 @@
   <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
 
   <style>
+        /* Texto padrão da área principal */
+    main {
+      color: #f1f1f1;
+    }
+
+    /* Cards e listas sempre legíveis */
+    .card,
+    .list-group-item,
+    .alert {
+      color: #212529;
+    }
+
+    /* Painel da carreta / placa */
+    #carreta-interface,
+    #carreta-interface * {
+      color: #212529 !important;
+    }
+
+    #carreta-interface .list-group-item {
+      background-color: #ffffff !important;
+      opacity: 1 !important;
+    }
+
+    /* Títulos internos da carreta */
+    #carreta-current,
+    #carreta-summary {
+      color: #212529 !important;
+      font-weight: 600;
+    }
     /* ===============================
       FUNDO PRINCIPAL (marca d’água)
       =============================== */
@@ -22,6 +51,11 @@
       overflow: hidden;
       z-index: 0; /* cria contexto */
     }
+    #carreta-missing-list{
+      max-height: 150px;     /* ajuste como quiser */
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
 
     /* Logo como marca d’água */
     main::before {
@@ -32,7 +66,6 @@
       background-repeat: no-repeat;
       background-position: top-right;
       background-size: 360px auto;
-      opacity: 0.12;
       z-index: 0;
       pointer-events: none;
     }
@@ -203,6 +236,24 @@
             (nenhum)
           </div>
         </div>
+        <hr>
+<div id="patio-panel" class="d-none">
+
+        <h6 class="mt-2">Geral do Pátio</h6>
+        <div class="small text-muted mb-2">
+          Situação das placas × rotas (clusters) do dia
+        </div>
+
+        <div id="patio-summary" class="small mb-2"></div>
+
+        <div style="max-height: 260px; overflow:auto;">
+          <ul id="patio-list" class="list-group"></ul>
+        </div>
+
+        <button id="patio-refresh" class="btn btn-sm btn-outline-primary btn-block mt-2">
+          Atualizar Geral do Pátio
+        </button>
+</div>
 
         <div class="mt-2">
           <div class="small-muted">Status:</div>
@@ -235,17 +286,21 @@
 
       <hr>
 
-      <!-- Acompanhamento -->
+      <div id="acomp-panel" class="d-none">
+<!-- Acompanhamento -->
       <h6 class="mt-2">Acompanhamento</h6>
       <div id="acompanhamento-resumo" class="small mb-2"></div>
       <div style="max-height: 260px; overflow:auto;">
         <ul id="acompanhamento-log" class="list-group"></ul>
       </div>
 
+      
+</div>
+
       <hr>
 
       <div class="small-muted">
-        Dica: use o botão “Voltar” do sistema (sem reload) para não “perder” a conexão.
+        Desenvolvido por Onild Junior atendendo a uma demanda do operação ERD1 • Rodacoop • 2026
       </div>
     </aside>
 
@@ -383,10 +438,47 @@
 
             <!-- Interface manual -->
             <!-- Interface CARRETA -->
+             <!-- Acompanhamento de bipagem da placa -->
+
+
             <div id="carreta-interface" class="d-none">
-              <div class="text-center mb-3">
-                <h2>Bipar rotas da carreta</h2>
-                <div class="text-muted">1) Bipe a placa • 2) Bipe os QRs das rotas dessa placa • 3) Bipe outra placa e repita</div>
+                          <div class="card mt-2">
+              <div class="card-body p-2">
+                <div class="d-flex justify-content-between align-items-center">
+                  <div>
+                    <strong>Acompanhamento da Placa</strong>
+                    <div class="small text-muted">Rotas QR (assignment/cluster) esperadas no dia × bipadas nesta placa</div>
+                  </div>
+                  <button id="carreta-refresh-progress" class="btn btn-sm btn-outline-primary">Atualizar</button>
+                </div>
+
+                <div class="mt-2">
+                  <div class="d-flex justify-content-between">
+                    <small id="carreta-progress-label" class="text-muted">0/0</small>
+                    <small id="carreta-progress-percent" class="text-muted">0%</small>
+                  </div>
+                  <div class="progress" style="height: 10px;">
+                    <div id="carreta-progress-bar" class="progress-bar" role="progressbar" style="width:0%"></div>
+                  </div>
+                </div>
+
+                <div class="mt-2">
+                  <div class="font-weight-bold">Faltando bipar</div>
+                  <ul id="carreta-missing-list" class="list-group list-group-flush"></ul>
+                </div>
+
+                <div class="mt-2">
+                  <div class="font-weight-bold">Bipado a mais / não encontrado no dia</div>
+                  <ul id="carreta-extra-list" class="list-group list-group-flush"></ul>
+                </div>
+              </div>
+            </div>
+              <div class="mb-3 p-3 rounded text-center"
+                  style="background:#d8dbde; border:1px solid #facc15;">
+                <h2 style="color:#facc15; margin-bottom:6px;">🚚 Bipar rotas da carreta</h2>
+                <div style="color:#e5e7eb; font: size 20px; margin-bottom:6px;">
+                  1) Bipe a placa • 2) Bipe os QRs das rotas dessa placa • 3) Bipe outra placa e repita
+                </div>
               </div>
 
               <div class="card mb-3">
