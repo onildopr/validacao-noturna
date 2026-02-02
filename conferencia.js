@@ -2221,7 +2221,7 @@ $('#extract-btn').click(() => {
   // ✅ limpa o campo após importar
   $('#html-input').val('');
 
-  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
+  
 });
 
 // Carregar rota
@@ -2539,3 +2539,4 @@ $(document).on('click', '#export-csv-todas-rotas-placa', () => {
 $(document).on('click', '#export-csv-mapa-carretas', () => {
   ConferenciaApp.exportMapaCarretasCsv();
 });
+
