@@ -2,7 +2,7 @@ const { jsPDF } = window.jspdf || {};
 
 const STORAGE_KEY_PREFIX = 'conferencia.routes.daycache.v1'; // cache local por dia
 const SYNC_INTERVAL_MS = 20000;
-const AUTO_SAVE_INTERVAL_MS = 120000; // 2 min
+const AUTO_SAVE_INTERVAL_MS = 10000; // 2 min
 
 
 const ConferenciaApp = {
@@ -128,89 +128,6 @@ const ConferenciaApp = {
     $s.removeClass('text-muted text-success text-danger text-warning');
     $s.addClass(`text-${kind}`);
     $s.text(txt);
-  },
-
-
-  // =======================
-  // Persistência Carretas (placa x rotas) no cache/arquivo mensal
-  // =======================
-  serializeCarretas() {
-    const plates = [];
-    for (const [plateKey, p] of (this.carretas.plates || new Map()).entries()) {
-      plates.push([
-        plateKey,
-        {
-          raw: p.raw || '',
-          jsonText: p.jsonText || '',
-          tsScan: Number(p.tsScan || 0),
-          license_plate: p.license_plate || plateKey,
-          carrier_name: p.carrier_name || '',
-          vehicle_type_description: p.vehicle_type_description || '',
-          tsFirst: Number(p.tsFirst || 0),
-          tsLast: Number(p.tsLast || 0),
-          routes: Array.from(p.routes || [])
-        }
-      ]);
-    }
-
-    return {
-      currentPlateKey: this.carretas.currentPlateKey || null,
-      plates,
-      routeToPlate: Array.from(this.carretas.routeToPlate || new Map()),
-      routesRaw: Array.from(this.carretas.routesRaw || new Map()),
-      routesJson: Array.from(this.carretas.routesJson || new Map()),
-      routesTs: Array.from(this.carretas.routesTs || new Map()),
-    };
-  },
-
-  deserializeCarretas(data) {
-    // Reseta estrutura
-    this.carretas.currentPlateKey = null;
-    this.carretas.plates = new Map();
-    this.carretas.routeToPlate = new Map();
-    this.carretas.routesRaw = new Map();
-    this.carretas.routesJson = new Map();
-    this.carretas.routesTs = new Map();
-
-    if (!data || typeof data !== 'object') return;
-
-    this.carretas.currentPlateKey = data.currentPlateKey || null;
-
-    // Plates
-    const platesArr = Array.isArray(data.plates) ? data.plates : [];
-    for (const entry of platesArr) {
-      if (!Array.isArray(entry) || entry.length < 2) continue;
-      const [plateKey, p] = entry;
-      const key = String(plateKey || '').trim().toUpperCase();
-      if (!key) continue;
-
-      const routes = new Set(Array.isArray(p?.routes) ? p.routes : []);
-      this.carretas.plates.set(key, {
-        raw: p?.raw || '',
-        jsonText: p?.jsonText || '',
-        tsScan: Number(p?.tsScan || 0),
-        license_plate: String(p?.license_plate || key).toUpperCase(),
-        carrier_name: p?.carrier_name || '',
-        vehicle_type_description: p?.vehicle_type_description || '',
-        routes,
-        tsFirst: Number(p?.tsFirst || p?.tsScan || 0),
-        tsLast: Number(p?.tsLast || p?.tsScan || 0),
-      });
-    }
-
-    // Maps
-    const toMap = (arr) => new Map(Array.isArray(arr) ? arr : []);
-    this.carretas.routeToPlate = toMap(data.routeToPlate);
-    this.carretas.routesRaw = toMap(data.routesRaw);
-    this.carretas.routesJson = toMap(data.routesJson);
-    this.carretas.routesTs = toMap(data.routesTs);
-
-    // Consistência: se alguma rota estiver na placa mas não no routeToPlate, cria.
-    for (const [plateKey, p] of this.carretas.plates.entries()) {
-      for (const rk of Array.from(p.routes || [])) {
-        if (!this.carretas.routeToPlate.has(rk)) this.carretas.routeToPlate.set(rk, plateKey);
-      }
-    }
   },
 
 
@@ -453,11 +370,14 @@ const ConferenciaApp = {
     }
     if (!this.workDay) return;
 
-    // ✅ Lê o arquivo e sobrescreve o dia com o estado atual.
-    // (Sem merge) para não reintroduzir rotas já deletadas.
+    // fluxo seguro: lê -> merge -> escreve
     await this.loadMonthFile();
     this.ensureMonthMetaForDay(this.workDay);
 
+    // traz o que está no arquivo para não perder nada
+    this.mergeCloudDayIntoLocal(this.workDay);
+
+    // grava o estado local consolidado no arquivo
     this.writeDayToMonthData(this.workDay);
     await this.writeMonthFile();
 
@@ -467,42 +387,42 @@ const ConferenciaApp = {
     this.markClean();
   },
   async manualSaveToMonthFileQuiet() {
-  try {
-    // same as manual save, but sem alert()
-    const day = this.getWorkDayLocalISO();
-    if (!day) return false;
+    try {
+      if (!this.monthFileHandle) return false;
+      const day = this.workDay || this.todayLocalISO();
+      if (!day) return false;
 
-    await this.ensureMonthMetaForDay(day);
-    const monthKey = this.monthKeyFromDay(day);
+      // mesmo fluxo do manualSaveToMonthFile(), só que sem alert
+      await this.loadMonthFile();
+      this.ensureMonthMetaForDay(day);
 
-    const payload = this.serializeAllToJson();
-    const monthObj = await this.loadMonthFile(monthKey);
-    monthObj.days = monthObj.days || {};
-    monthObj.days[day] = payload;
+      this.mergeCloudDayIntoLocal(day);
+      this.writeDayToMonthData(day);
+      await this.writeMonthFile();
 
-    await this.writeMonthFile(monthKey, monthObj);
-    this.saveToStorage(day, payload);
+      this.saveToStorage(day);
 
-    this.setDirty(false);
-    this.setStatus(`Autosave: ${new Date().toLocaleTimeString()}`);
-    return true;
-  } catch (e) {
-    console.error("Autosave falhou:", e);
-    // não interromper o fluxo
-    return false;
-  }
-},
+      this.markClean();
+      this.setStatus(`Autosave: ${new Date().toLocaleTimeString()}`, 'success');
+      return true;
+    } catch (e) {
+      console.error("Autosave falhou:", e);
+      this.setStatus('autosave falhou (veja console)', 'danger');
+      return false;
+    }
+  },
 
-startAutoSaveLoop() {
-  // evita múltiplos intervals
-  if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
-  this._autoSaveTimer = setInterval(async () => {
-    // só salva se houver handle e algo sujo
-    if (!this.monthFileHandles || !this.monthFileHandles.size) return;
-    if (!this.isDirty) return;
-    await this.manualSaveToMonthFileQuiet();
-  }, AUTO_SAVE_INTERVAL_MS);
-},
+  startAutoSaveLoop() {
+    if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
+
+    this._autoSaveTimer = setInterval(async () => {
+      if (!this.monthFileHandle) return; // aqui é handle único
+      if (!this.dirty) return;           // aqui é dirty real do app
+      await this.manualSaveToMonthFileQuiet();
+    }, AUTO_SAVE_INTERVAL_MS);
+  },
+
+
 
   // =======================
   // Modelo de rota
@@ -692,6 +612,7 @@ startAutoSaveLoop() {
       });
 
       this.monthFileHandle = handle;
+      this.startAutoSaveLoop();
       $('#month-file-name').text(handle?.name || '(arquivo selecionado)');
       this.setStatus('arquivo selecionado', 'success');
 
@@ -805,16 +726,11 @@ startAutoSaveLoop() {
   // Grava rotas do dia no JSON mensal
   writeDayToMonthData(dayISO) {
     this.ensureMonthMetaForDay(dayISO);
-
     const routesObj = {};
     for (const [routeId, r] of this.routes.entries()) {
       routesObj[String(routeId)] = this.serializeRoute(r);
     }
-
     this.monthData.days[dayISO].routes = routesObj;
-
-    // também persiste as carretas/placas do dia
-    this.monthData.days[dayISO].carretas = this.serializeCarretas();
   },
 
   // Merge: cloud(day) + local(day) => local(day) atualizado
@@ -907,19 +823,15 @@ startAutoSaveLoop() {
     if (!this.monthFileHandle) return;          // sem arquivo => offline
     if (!this.workDay) return;
 
-    // ✅ Fonte da verdade do arquivo:
-    // - carrega o JSON mensal
-    // - sobrescreve o dia no arquivo com o estado atual em memória
-    // Isso garante que exclusões (rotas apagadas/limpar dia) sejam persistidas,
-    // sem serem "ressuscitadas" por um merge que só soma dados.
+    // lê o arquivo, faz merge, escreve de volta
     await this.loadMonthFile();
-    this.ensureMonthMetaForDay(this.workDay);
+    this.mergeCloudDayIntoLocal(this.workDay);
 
-    // grava local -> arquivo(day)
+    // grava local -> cloud(day)
     this.writeDayToMonthData(this.workDay);
     await this.writeMonthFile();
 
-    // espelha no cache local
+    // salva cache local
     this.saveToStorage(this.workDay);
 
     // atualiza selects/UI
@@ -941,27 +853,28 @@ startAutoSaveLoop() {
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
 
-    // ✅ Se houver arquivo mensal selecionado, ele é a "fonte da verdade" do dia.
-    // Isso evita re-hidratar o estado antigo vindo do localStorage quando você abre o JSON.
+    // ✅ sempre começa pelo cache local do dia (não perde rotas)
+    this.loadFromStorage(dayISO);
+
+    // se houver arquivo mensal, apenas LÊ + MERGE (sem salvar automaticamente)
     if (this.monthFileHandle) {
       await this.loadMonthFile();
       this.ensureMonthMetaForDay(dayISO);
 
-      // arquivo(do mês) -> memória (substitui o estado local do dia)
-      this.loadDayFromMonthData(dayISO);
+      // cloud(day) -> local(day)
+      this.mergeCloudDayIntoLocal(dayISO);
 
-      // atualiza o cache local APENAS como espelho do arquivo (não como fonte)
+      // atualiza cache local consolidado
       this.saveToStorage(dayISO);
 
       this.renderRoutesSelects();
       this.refreshUIFromCurrent();
       this.renderAcompanhamento();
-      this.setStatus('dia carregado (arquivo do mês)', 'success');
+      this.setStatus('dia carregado (merge local + arquivo)', 'success');
       return;
     }
 
-    // Sem arquivo => modo offline: usa somente o cache local do dia
-    this.loadFromStorage(dayISO);
+    // sem arquivo => apenas cache local
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
     this.renderAcompanhamento();
@@ -990,7 +903,7 @@ startAutoSaveLoop() {
     const $sel2 = $('#saved-routes-inapp');
 
     const routesSorted = Array.from(this.routes.values())
-      .sort((a, b) => a.routeId.localeCompare(b.routeId));
+      .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
 
     const makeLabel = (r) => {
       const parts = [];
@@ -999,19 +912,59 @@ startAutoSaveLoop() {
       return parts.join(' • ') || `(sem dados) • Rota ${r.routeId}`;
     };
 
+    // cache para filtro (somente o dropdown "in-app")
+    this._routesDropdownCache = routesSorted.map(r => ({
+      routeId: String(r.routeId),
+      label: makeLabel(r),
+      clusterKey: this.normalizeCluster(r.cluster || ''),
+      labelKey: this.normalizeCluster(makeLabel(r)),
+    }));
+
+    // Select da tela inicial (sem filtro)
     $sel1.html(
       ['<option value="">(Nenhuma selecionada)</option>']
-        .concat(routesSorted.map(r => `<option value="${r.routeId}">${makeLabel(r)}</option>`))
+        .concat(this._routesDropdownCache.map(x => `<option value="${x.routeId}">${x.label}</option>`))
         .join('')
     );
 
-    $sel2.html(routesSorted.map(r => `<option value="${r.routeId}">${makeLabel(r)}</option>`).join(''));
+    // Select "Trocar rota" (com filtro por cluster)
+    this.applyRouteDropdownFilter($('#route-search').val() || '');
 
     if (this.currentRouteId) {
       $sel1.val(this.currentRouteId);
-      $sel2.val(this.currentRouteId);
+      // o $sel2 é definido dentro do filtro (se estiver visível na lista filtrada)
     }
   },
+
+  applyRouteDropdownFilter(filterText) {
+    const $sel2 = $('#saved-routes-inapp');
+
+    // se ainda não carregou rotas, só zera
+    const list = Array.isArray(this._routesDropdownCache) ? this._routesDropdownCache : [];
+    const q = this.normalizeCluster(String(filterText || '').trim());
+
+    const filtered = !q
+      ? list
+      : list.filter(x =>
+          (x.clusterKey && x.clusterKey.includes(q)) ||
+          (x.labelKey && x.labelKey.includes(q)) ||
+          String(x.routeId).includes(String(filterText || '').trim())
+        );
+
+    const options = ['<option value="">(Selecione)</option>']
+      .concat(filtered.map(x => `<option value="${x.routeId}">${x.label}</option>`))
+      .join('');
+
+    $sel2.html(options);
+
+    // preserva seleção atual, se ainda estiver na lista filtrada
+    if (this.currentRouteId) {
+      const exists = filtered.some(x => x.routeId === String(this.currentRouteId));
+      if (exists) $sel2.val(String(this.currentRouteId));
+    }
+  },
+
+
 
   refreshUIFromCurrent() {
     const r = this.current;
@@ -1901,22 +1854,14 @@ getIdsForExportByTimestamp(r) {
       }
     }
 
-    if (plateText) lines.push(this.buildScannerCsvRow(plateTs, 'QR Code', plateText, '{"ec":"L"}'));
+    if (plateText) lines.push(this.buildScannerCsvRow(plateTs, 'QR Code', plateText, ''));
     if (routeText) lines.push(this.buildScannerCsvRow(routeTs, 'QR Code', routeText, ''));
 
     // ===== IDs: QR Code + JSON com id =====
     for (const id of ids) {
       const ts = r.timestamps?.get(id) || Date.now();
-      const idStr = String(id);
-
-      // Se o ID for apenas numérico, exporta como Code 128 (igual ao app QR Code).
-      // Se não for (ou se você realmente precisar do JSON {id,t}), exporta como QR Code.
-      if (/^\d+$/.test(idStr)) {
-        lines.push(this.buildScannerCsvRow(ts, 'Code 128', idStr, ''));
-      } else {
-        const payload = JSON.stringify({ id: idStr, t: 'lm' });
-        lines.push(this.buildScannerCsvRow(ts, 'QR Code', payload, '{"ec":"L"}'));
-      }
+      const payload = JSON.stringify({ id: String(id), t: 'lm' });
+      lines.push(this.buildScannerCsvRow(ts, 'QR Code', payload, ''));
     }
 
     return lines;
@@ -2172,6 +2117,11 @@ $(document).on('click', '#btn-pick-month-file', () => {
   ConferenciaApp.pickMonthFileHandle();
 });
 
+// Filtro de rotas (pesquisa por cluster)
+$(document).on('input', '#route-search', (e) => {
+  ConferenciaApp.applyRouteDropdownFilter(e.target.value);
+});
+
 // Troca de dia
 $(document).on('change', '#work-day', async (e) => {
   const day = e.target.value;
@@ -2221,7 +2171,7 @@ $('#extract-btn').click(() => {
   // ✅ limpa o campo após importar
   $('#html-input').val('');
 
-  
+  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
 // Carregar rota
@@ -2539,4 +2489,3 @@ $(document).on('click', '#export-csv-todas-rotas-placa', () => {
 $(document).on('click', '#export-csv-mapa-carretas', () => {
   ConferenciaApp.exportMapaCarretasCsv();
 });
-
