@@ -218,24 +218,25 @@
       <div class="mb-3">
         <div class="small-muted mb-1">Data (dia em uso)</div>
         <input type="date" id="work-day" class="form-control form-control-sm">
-        <div class="small-muted mt-1">
-          O cache local e o JSON do mês separam por dia.
-        </div>
+
       </div>
 
       <div class="mb-3">
-        <div class="small-muted mb-1">Arquivo mensal (Google Drive)</div>
-
-        <button id="btn-pick-month-file" class="btn btn-sm btn-primary btn-block">
-          Conectar / Selecionar JSON do mês
-        </button>
-
-        <div class="mt-2">
-          <div class="small-muted">Arquivo:</div>
-          <div id="month-file-name" class="badge badge-light" style="white-space: normal;">
-            (nenhum)
-          </div>
+        <div class="small-muted mb-1">Operação / Banco (Supabase)</div>
+      
+        <div class="d-flex align-items-center mb-2" style="gap:8px; flex-wrap:wrap;">
+          <span class="badge badge-info" id="op-badge">(sem operação)</span>
+          <button id="btn-change-op" class="btn btn-sm btn-warning">Trocar operação</button>
+          <button id="btn-admin-open" class="btn btn-sm btn-outline-warning">Admin</button>
         </div>
+
+        
+      </div>
+
+
+      <div class="mb-3">
+
+
         <hr>
 <div id="patio-panel" class="d-none">
 
@@ -255,11 +256,6 @@
         </button>
 </div>
 
-        <div class="mt-2">
-          <div class="small-muted">Status:</div>
-          <div id="sync-status" class="text-muted">offline (sem arquivo)</div>
-        </div>
-      </div>
 
       
 <div class="mt-2">
@@ -270,37 +266,23 @@
     Voltar ao acompanhamento
   </button>
 </div>
-
+        <h6 class="mt-2">Acompanhamento</h6>
+        <div id="acompanhamento-resumo" class="small mb-2"></div>
+        <div style="max-height: 260px; overflow:auto;">
+          <ul id="acompanhamento-log" class="list-group"></ul>  
+        </div>
 <div id="night-report" class="d-none mt-3"></div>
 
 <hr>
 
 
-      <!-- Salvamento manual -->
-      <button id="btn-save-month" class="btn btn-sm btn-success btn-block">
-        Salvar
-      </button>
-      <div class="mt-2">
-        <span id="dirty-flag" class="badge badge-warning d-none">pendente</span>
-      </div>
+      <hr>
 
       <hr>
 
-      <div id="acomp-panel" class="d-none">
-<!-- Acompanhamento -->
-      <h6 class="mt-2">Acompanhamento</h6>
-      <div id="acompanhamento-resumo" class="small mb-2"></div>
-      <div style="max-height: 260px; overflow:auto;">
-        <ul id="acompanhamento-log" class="list-group"></ul>
-      </div>
-
-      
-</div>
-
-      <hr>
 
       <div class="small-muted">
-        Desenvolvido por Onild Junior atendendo a uma demanda do operação ERD1 • Rodacoop • 2026
+        Desenvolvido por Onildo Junior atendendo a uma demanda do operação ERD1 • Rodacoop • 2026
       </div>
     </aside>
 
@@ -309,7 +291,47 @@
 
       <div class="container pt-2" id="html">
         <div class="row">
-          <div class="col-lg-10 col-xl-8 mx-auto">
+          <div class="col-lg-8">
+
+
+            <!-- Interface: Acompanhamento Geral -->
+            <div id="global-interface" class="d-none">
+              <div class="d-flex align-items-center justify-content-between mb-2">
+                <h4 class="mb-0">Acompanhamento geral • <span id="global-day-label"></span></h4>
+                <div>
+                  <button id="global-refresh" class="btn btn-outline-primary btn-sm">Atualizar</button>
+                  <button id="global-back" class="btn btn-secondary btn-sm">Voltar</button>
+                </div>
+              </div>
+
+              <div class="card mb-3">
+                <div class="card-body">
+                  <div class="table-responsive">
+                    <table class="table table-sm table-striped mb-0">
+                      <thead>
+                        <tr>
+                          <th>Operação</th>
+                          <th>Rotas</th>
+                          <th>Total IDs</th>
+                          <th>Conferidos</th>
+                          <th>Faltantes</th>
+                          <th>Fora rota</th>
+                          <th>Última atualização</th>
+                        </tr>
+                      </thead>
+                      <tbody id="global-ops-tbody"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card-body">
+                  <div class="small text-muted mb-2">Últimos eventos (por snapshot):</div>
+                  <ul id="global-log" class="list-group"></ul>
+                </div>
+              </div>
+            </div>
 
             <!-- Interface inicial -->
             <div id="initial-interface">
@@ -372,6 +394,9 @@
               <div class="alert alert-light border">
                 <div class="row align-items-center">
                   <div class="col-md-8">
+                    <div class="mb-2">
+                      <input id="route-search" class="form-control" placeholder="Pesquisar rota por CLUSTER (ex: J11_AM5)" autocomplete="off">
+                    </div>
                     <select id="saved-routes-inapp" class="form-control"></select>
                   </div>
                   <div class="col-md-4 mt-2 mt-md-0">
@@ -561,8 +586,106 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
 
-    </main>
+
+
+<!-- Modais -->
+<!-- Modal: Selecionar Operação -->
+<div class="modal fade" id="modal-operation" tabindex="-1" role="dialog" aria-labelledby="modalOperationTitle" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered" role="document">
+    <div class="modal-content" style="background:#1f1f1f; color:#f1f1f1;">
+      <div class="modal-header">
+        <h5 class="modal-title" id="modalOperationTitle">Selecione a operação</h5>
+      </div>
+      <div class="modal-body">
+        <p class="small text-muted">
+          Escolha a operação (ex.: ERD1). Os dados ficam separados por operação e por dia.
+        </p>
+        <select id="op-select" class="form-control"></select>
+
+        <div class="alert alert-warning mt-3 mb-0">
+          Se a lista estiver vazia, peça ao admin cadastrar as operações.
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-op-confirm" class="btn btn-success">Entrar</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Admin (cadastrar operações) -->
+<div class="modal fade" id="modal-admin" tabindex="-1" role="dialog" aria-labelledby="modalAdminTitle" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="modalAdminTitle">Admin • Operações</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Fechar">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="row">
+          <div class="col-md-6">
+            <h6>Login do Admin</h6>
+            <div class="form-group">
+              <label>Email</label>
+              <input id="admin-email" type="email" class="form-control" placeholder="admin@empresa.com">
+            </div>
+            <div class="form-group">
+              <label>Senha</label>
+              <input id="admin-pass" type="password" class="form-control" placeholder="••••••••">
+            </div>
+            <div class="d-flex" style="gap:8px; flex-wrap:wrap;">
+              <button id="btn-admin-login" class="btn btn-primary">Entrar</button>
+              <button id="btn-admin-logout" class="btn btn-outline-secondary">Sair</button>
+              <span id="admin-status" class="small text-muted align-self-center">Deslogado.</span>
+            </div>
+            <hr>
+            <div id="admin-panel" class="d-none">
+              <h6>Cadastrar / Atualizar operação</h6>
+              <div class="form-row">
+                <div class="form-group col-md-4">
+                  <label>Código</label>
+                  <input id="admin-op-code" class="form-control" placeholder="ERD1">
+                  <small class="text-muted">3 letras + 1 número</small>
+                </div>
+                <div class="form-group col-md-6">
+                  <label>Nome (opcional)</label>
+                  <input id="admin-op-name" class="form-control" placeholder="Expedição ERD1">
+                </div>
+                <div class="form-group col-md-2">
+                  <label>Ativa</label><br>
+                  <input id="admin-op-active" type="checkbox" checked>
+                </div>
+              </div>
+              <button id="btn-admin-save-op" class="btn btn-success">Salvar operação</button>
+            </div>
+          </div>
+
+          <div class="col-md-6">
+            <h6>Operações cadastradas</h6>
+            <div class="table-responsive" style="max-height:340px; overflow:auto;">
+              <table class="table table-sm table-striped">
+                <thead>
+                  <tr><th>Código</th><th>Nome</th><th>Ativa</th></tr>
+                </thead>
+                <tbody id="admin-ops-tbody"></tbody>
+              </table>
+            </div>
+            <div class="alert alert-info mt-2">
+              Para o app sincronizar, crie também a tabela <code>routes_state</code> no Supabase (se ainda não criou).
+              O SQL aparece no console quando faltar.
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Fechar</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -572,27 +695,35 @@
 <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+
+<!-- SCRIPTS: ORDEM IMPORTA -->
+<script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
+<script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
 <script>
-  // Evita erro "Identifier 'supabase' has already been declared" caso exista outro script/arquivo usando esse nome.
-  (function () {
-    const supabaseUrl = "https://joxqazqnbrwakavnwrmg.supabase.co";
-    const supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpveHFhenFuYnJ3YWthdm53cm1nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2OTU5MDQsImV4cCI6MjA4NTI3MTkwNH0.JRjtqL-snAi_PMVSiukNPBBgFEOtzrTnNcbwc_H_NbM";
-    // guarda em window.sbClient para ser reutilizado sem redeclarar
-    window.sbClient = window.sbClient || window.supabase.createClient(supabaseUrl, supabaseAnonKey);
-  })();
+(function () {
+  const supabaseUrl = "https://joxqazqnbrwakavnwrmg.supabase.co";
+  const supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpveHFhenFuYnJ3YWthdm53cm1nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2OTU5MDQsImV4cCI6MjA4NTI3MTkwNH0.JRjtqL-snAi_PMVSiukNPBBgFEOtzrTnNcbwc_H_NbM";
+  window.SB_URL = supabaseUrl;
+  window.SB_ANON = supabaseAnonKey;
+  if (!window.supabase) {
+    console.error("Supabase SDK não carregou. Verifique o script @supabase/supabase-js.");
+    return;
+  }
+  window.sbClient = window.sbClient || window.supabase.createClient(supabaseUrl, supabaseAnonKey);
+})();
 </script>
+
 <!-- Seu JS -->
 <script src="conferencia.js" defer></script>
 </body>
 </html>
-  <style>
-    /* Só pra garantir o resumo e o log */
-    #acompanhamento-resumo {
-      color: #212529 !important;
-    }
-    #acompanhamento-log .list-group-item {
-      color: #212529 !important;
-    }
-  </style>
+
+</body>
+</html>
