@@ -9,19 +9,14 @@ const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
   currentRouteId: null,
   viaCsv: false,
-
-  // Sync mensal/dia
+  operationCode: null, // ex: ERD1
+  deviceId: null,
+  cloudEnabled: true,
+  cloudDirty: false,
+  cloudSaving: false,
+  cloudLastSaveAt: 0,
+  cloudSaveTimer: null,
   workDay: null,               // YYYY-MM-DD
-  monthFileHandle: null,       // FileSystemFileHandle
-  monthData: null,             // JSON do mês carregado
-  lastCloudReadAt: 0,
-  lastCloudWriteAt: 0,
-  syncing: false,
-  pendingWrite: false,
-
-
-  // Manual save / acompanhamento
-  dirty: false,              // há alterações pendentes para salvar no arquivo mensal?
   lastEvents: [],            // log simples de bipagens (últimos eventos)
 
   // =======================
@@ -56,8 +51,14 @@ const ConferenciaApp = {
   pad2(n) { return String(n).padStart(2, '0'); },
 
   todayLocalISO() {
-    const d = new Date();
-    return `${d.getFullYear()}-${this.pad2(d.getMonth() + 1)}-${this.pad2(d.getDate())}`;
+    // Sempre calcula o "dia" no fuso de Rondônia, mesmo se o PC estiver com outro fuso
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Porto_Velho',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+    return fmt.format(new Date()); // YYYY-MM-DD
   },
 
   monthKeyFromDay(dayISO) {
@@ -120,8 +121,304 @@ const ConferenciaApp = {
   },
 
   storageKeyForDay(dayISO) {
-    return `${STORAGE_KEY_PREFIX}.${dayISO}`;
+    const op = this.getOperationCode() || 'NOOP';
+    return `${STORAGE_KEY_PREFIX}.${op}.${dayISO}`;
   },
+
+  // =======================
+  // Operação (ERD1, ERD2...) e Device
+  // =======================
+  getDeviceId() {
+    if (this.deviceId) return this.deviceId;
+    const k = 'conf_device_id.v1';
+    let v = localStorage.getItem(k);
+    if (!v) {
+      v = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      localStorage.setItem(k, v);
+    }
+    this.deviceId = v;
+    return v;
+  },
+
+  setOperationCode(code) {
+    const norm = String(code || '').trim().toUpperCase();
+    if (!norm) return;
+    localStorage.setItem('conf_operation_code.v1', norm);
+    this.operationCode = norm;
+    // Atualiza badge no topo, se existir
+    const $badge = $('#op-badge');
+    if ($badge.length) $badge.text(norm);
+  },
+
+  getOperationCode() {
+    if (this.operationCode) return this.operationCode;
+    const v = localStorage.getItem('conf_operation_code.v1');
+    this.operationCode = v ? String(v).toUpperCase() : null;
+    return this.operationCode;
+  },
+
+  // =======================
+  // Supabase (snapshot por operação+dia)
+  // Tabela esperada: routes_state(operation_code text, day date, data jsonb, updated_at timestamptz, device_id text)
+  // =======================
+  getSb() {
+    // tenta usar client já criado no HTML; se não existir, tenta criar com config global (SB_URL/SB_ANON)
+    if (window.sbClient) return window.sbClient;
+    if (window.supabase && window.SB_URL && window.SB_ANON) {
+      try {
+        window.sbClient = window.supabase.createClient(window.SB_URL, window.SB_ANON);
+        return window.sbClient;
+      } catch (e) {
+        console.warn('Falha ao criar Supabase client automaticamente:', e);
+      }
+    }
+    return null;
+  },
+
+  buildDaySnapshotObject() {
+    const obj = {};
+    for (const [routeId, r] of this.routes.entries()) {
+      obj[routeId] = this.serializeRoute(r);
+    }
+    return obj;
+  },
+
+  async supaLoadDaySnapshot(operationCode, dayISO) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
+    const { data, error } = await sb
+      .from('routes_state')
+      .select('data,updated_at,device_id')
+      .eq('operation_code', operationCode)
+      .eq('day', dayISO)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return null;
+    return data;
+  },
+
+  async supaSaveDaySnapshot(operationCode, dayISO, snapshotObj) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
+    const payload = {
+      operation_code: operationCode,
+      day: dayISO,
+      data: snapshotObj,
+      updated_at: new Date().toISOString(),
+      device_id: this.getDeviceId()
+    };
+    const { error } = await sb
+      .from('routes_state')
+      .upsert(payload, { onConflict: 'operation_code,day' });
+    if (error) throw error;
+  },
+
+  markCloudDirty() {
+    this.cloudDirty = true;
+    // Debounce: não salva a cada bipagem
+    if (this.cloudSaveTimer) clearTimeout(this.cloudSaveTimer);
+    this.cloudSaveTimer = setTimeout(() => {
+      this.flushCloudSave().catch(e => {
+        console.warn('Falha ao salvar no Supabase (vai tentar de novo depois):', e);
+        this.setStatus('Falha ao salvar no banco (Supabase). Mantido no cache local.', 'warning');
+      });
+    }, 1200);
+  },
+
+  async flushCloudSave() {
+    if (!this.cloudEnabled) return;
+    if (this.cloudSaving) return;
+    if (!this.cloudDirty) return;
+
+    const op = this.getOperationCode();
+    const day = this.workDay || this.todayLocalISO();
+    if (!op || !day) return;
+
+    this.cloudSaving = true;
+    try {
+      const snapshot = this.buildDaySnapshotObject();
+      await this.supaSaveDaySnapshot(op, day, snapshot);
+      this.cloudDirty = false;
+      this.cloudLastSaveAt = Date.now();
+      this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
+    } finally {
+      this.cloudSaving = false;
+    }
+  },
+
+  mergeSnapshotIntoLocal(snapshotObj) {
+    // snapshotObj: { [routeId]: serializedRoute }
+    if (!snapshotObj || typeof snapshotObj !== 'object') return;
+
+    for (const [routeId, ser] of Object.entries(snapshotObj)) {
+      const id = String(routeId);
+      const existing = this.routes.get(id);
+
+      if (!existing) {
+        const r = this.deserializeRoute(id, ser);
+        // garante faltantes
+        if (!r.faltantes.size && r.ids.size) {
+          r.faltantes = new Set(r.ids);
+          for (const c of r.conferidos) r.faltantes.delete(c);
+        }
+        this.routes.set(id, r);
+        continue;
+      }
+
+      // merge: união dos conjuntos e mapas, priorizando timestamps mais recentes
+      const tmp = this.deserializeRoute(id, ser);
+
+      tmp.ids.forEach(v => existing.ids.add(v));
+      tmp.conferidos.forEach(v => existing.conferidos.add(v));
+      tmp.foraDeRota.forEach(v => existing.foraDeRota.add(v));
+      tmp.faltantes.forEach(v => existing.faltantes.add(v));
+
+      for (const [k, v] of tmp.timestamps.entries()) {
+        const cur = existing.timestamps.get(k);
+        if (!cur || String(v) > String(cur)) existing.timestamps.set(k, v);
+      }
+      for (const [k, v] of tmp.duplicados.entries()) {
+        const cur = existing.duplicados.get(k);
+        if (!cur) existing.duplicados.set(k, v);
+        else existing.duplicados.set(k, Array.from(new Set([].concat(cur, v))));
+      }
+
+      // recomputa faltantes
+      if (existing.ids.size) {
+        existing.faltantes = new Set(existing.ids);
+        for (const c of existing.conferidos) existing.faltantes.delete(c);
+      }
+    }
+  },
+
+  async syncFromSupabaseForDay(dayISO) {
+    const op = this.getOperationCode();
+    if (!op) return;
+
+    try {
+      const row = await this.supaLoadDaySnapshot(op, dayISO);
+      if (!row || !row.data) return;
+
+      // Mescla do banco -> local
+      this.mergeSnapshotIntoLocal(row.data);
+
+      // Persistir merge local
+      this.saveToStorage(dayISO);
+
+      this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
+    } catch (e) {
+      // Se a tabela não existir, orientar com SQL
+      if (e && (e.code === '42P01' || /routes_state/i.test(String(e.message || '')))) {
+        this.setStatus('Tabela routes_state não existe no Supabase. Crie a tabela para sincronizar.', 'danger');
+        console.warn('Crie no Supabase:', this.getRoutesStateCreateSQL());
+        return;
+      }
+      console.warn('Falha ao sincronizar do Supabase:', e);
+    }
+  },
+
+  getRoutesStateCreateSQL() {
+    return `create table if not exists public.routes_state (
+  operation_code text not null references public.operations(code) on delete restrict,
+  day date not null,
+  data jsonb not null,
+  updated_at timestamptz not null default now(),
+  device_id text,
+  primary key (operation_code, day)
+);
+
+alter table public.routes_state enable row level security;
+
+create policy "routes_state_select_all"
+  on public.routes_state for select
+  using (true);
+
+create policy "routes_state_upsert_all"
+  on public.routes_state for insert
+  with check (true);
+
+create policy "routes_state_update_all"
+  on public.routes_state for update
+  using (true)
+  with check (true);`;
+  },
+
+  async ensureOperationSelected() {
+    // Carrega lista de operações ativas e força seleção se não houver
+    const sb = this.getSb();
+    if (!sb) return;
+
+    const { data, error } = await sb.from('operations').select('code,name,active').eq('active', true).order('code', { ascending: true });
+    if (error) {
+      console.warn('Falha ao carregar operações:', error);
+      return;
+    }
+
+    // Preenche select
+    const $sel = $('#op-select');
+    if ($sel.length) {
+      $sel.empty();
+      (data || []).forEach(op => {
+        const label = op.name ? `${op.code} — ${op.name}` : op.code;
+        $sel.append(`<option value="${op.code}">${label}</option>`);
+      });
+    }
+
+    const current = this.getOperationCode();
+    const exists = (data || []).some(o => o.code === current);
+
+    if (!current || !exists) {
+      // abre modal
+      $('#modal-operation').modal({ backdrop: 'static', keyboard: false });
+    } else {
+      this.setOperationCode(current);
+    }
+  },
+
+// =======================
+// Admin (cadastrar operações) - requer login apenas para o admin
+// =======================
+async adminSignIn(email, password) {
+  const sb = this.getSb();
+  if (!sb) throw new Error('Supabase client não encontrado.');
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) throw error;
+  return data;
+},
+
+async adminSignOut() {
+  const sb = this.getSb();
+  if (!sb) throw new Error('Supabase client não encontrado.');
+  const { error } = await sb.auth.signOut();
+  if (error) throw error;
+},
+
+async adminUpsertOperation(code, name, active = true) {
+  const sb = this.getSb();
+  if (!sb) throw new Error('Supabase client não encontrado.');
+  const op = {
+    code: String(code || '').trim().toUpperCase(),
+    name: String(name || '').trim() || null,
+    active: !!active
+  };
+  if (!/^[A-Z]{3}\d$/.test(op.code)) {
+    throw new Error('Código inválido. Use 3 letras e 1 número (ex.: ERD1).');
+  }
+  const { error } = await sb.from('operations').upsert(op, { onConflict: 'code' });
+  if (error) throw error;
+},
+
+async adminLoadOperations(includeInactive = true) {
+  const sb = this.getSb();
+  if (!sb) throw new Error('Supabase client não encontrado.');
+  let q = sb.from('operations').select('code,name,active,created_at').order('code', { ascending: true });
+  if (!includeInactive) q = q.eq('active', true);
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+},
+
+
 
   setStatus(txt, kind='muted') {
     const $s = $('#sync-status');
@@ -132,10 +429,11 @@ const ConferenciaApp = {
 
 
   // =======================
-  // Manual save / acompanhamento
   // =======================
   markDirty(reason = '') {
     this.dirty = true;
+    // Supabase: marca para salvar snapshot
+    this.markCloudDirty();
     const msg = reason ? `pendente salvar (${reason})` : 'pendente salvar';
     this.setStatus(msg, 'warning');
     $('#dirty-flag').removeClass('d-none');
@@ -144,7 +442,7 @@ const ConferenciaApp = {
   markClean() {
     this.dirty = false;
     $('#dirty-flag').addClass('d-none');
-    this.setStatus('salvo no arquivo do mês', 'success');
+    this.setStatus('sincronizado', 'success');
   },
 
   pushEvent(evt) {
@@ -363,67 +661,6 @@ const ConferenciaApp = {
     $('#night-report-close').addClass('d-none');
   },
 
-  async manualSaveToMonthFile() {
-    if (!this.monthFileHandle) {
-      alert('Selecione o arquivo mensal primeiro.');
-      return;
-    }
-    if (!this.workDay) return;
-
-    // fluxo seguro: lê -> merge -> escreve
-    await this.loadMonthFile();
-    this.ensureMonthMetaForDay(this.workDay);
-
-    // traz o que está no arquivo para não perder nada
-    this.mergeCloudDayIntoLocal(this.workDay);
-
-    // grava o estado local consolidado no arquivo
-    this.writeDayToMonthData(this.workDay);
-    await this.writeMonthFile();
-
-    // cache local
-    this.saveToStorage(this.workDay);
-
-    this.markClean();
-  },
-  async manualSaveToMonthFileQuiet() {
-    try {
-      if (!this.monthFileHandle) return false;
-      const day = this.workDay || this.todayLocalISO();
-      if (!day) return false;
-
-      // mesmo fluxo do manualSaveToMonthFile(), só que sem alert
-      await this.loadMonthFile();
-      this.ensureMonthMetaForDay(day);
-
-      this.mergeCloudDayIntoLocal(day);
-      this.writeDayToMonthData(day);
-      await this.writeMonthFile();
-
-      this.saveToStorage(day);
-
-      this.markClean();
-      this.setStatus(`Autosave: ${new Date().toLocaleTimeString()}`, 'success');
-      return true;
-    } catch (e) {
-      console.error("Autosave falhou:", e);
-      this.setStatus('autosave falhou (veja console)', 'danger');
-      return false;
-    }
-  },
-
-  startAutoSaveLoop() {
-    if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
-
-    this._autoSaveTimer = setInterval(async () => {
-      if (!this.monthFileHandle) return; // aqui é handle único
-      if (!this.dirty) return;           // aqui é dirty real do app
-      await this.manualSaveToMonthFileQuiet();
-    }, AUTO_SAVE_INTERVAL_MS);
-  },
-
-
-
   // =======================
   // Modelo de rota
   // =======================
@@ -527,6 +764,7 @@ const ConferenciaApp = {
         obj[routeId] = this.serializeRoute(r);
       }
       localStorage.setItem(key, JSON.stringify(obj));
+      this.markCloudDirty();
     } catch (e) {
       console.warn('Falha ao salvar storage:', e);
     }
@@ -594,208 +832,6 @@ const ConferenciaApp = {
     return route;
   },
 
-  // =======================
-  // Cloud file (Drive) - JSON mensal
-  // =======================
-  async pickMonthFileHandle() {
-    if (!window.showOpenFilePicker) {
-      alert('Seu navegador não suporta File System Access API. Use Chrome atualizado.');
-      return;
-    }
-    try {
-      const [handle] = await window.showOpenFilePicker({
-        types: [{
-          description: 'Arquivo JSON de conferência do mês',
-          accept: { 'application/json': ['.json'] }
-        }],
-        multiple: false
-      });
-
-      this.monthFileHandle = handle;
-      this.startAutoSaveLoop();
-      $('#month-file-name').text(handle?.name || '(arquivo selecionado)');
-      this.setStatus('arquivo selecionado', 'success');
-
-      // Carrega o mês e aplica o dia atual
-      await this.loadMonthFile();
-      await this.applyWorkDay(this.workDay || this.todayLocalISO());
-    } catch (e) {
-      // Usuário cancelou o seletor de arquivo (não é erro)
-      if (e && (e.name === 'AbortError' || e.code === 20)) {
-        this.setStatus('seleção cancelada', 'muted');
-        return;
-      }
-      console.warn(e);
-      this.setStatus('erro na seleção do arquivo', 'danger');
-    }
-  },
-
-  async loadMonthFile() {
-    if (!this.monthFileHandle) return;
-
-    this.setStatus('lendo arquivo...', 'warning');
-    try {
-      const file = await this.monthFileHandle.getFile();
-      const text = await file.text();
-
-      let json;
-      if (!text.trim()) {
-        // arquivo vazio => inicializa
-        json = null;
-      } else {
-        json = JSON.parse(text);
-      }
-
-      if (!json || typeof json !== 'object') {
-        json = { version: 1, month: this.monthKeyFromDay(this.workDay || this.todayLocalISO()), days: {} };
-      }
-
-      if (!json.days || typeof json.days !== 'object') json.days = {};
-      if (!json.version) json.version = 1;
-
-      this.monthData = json;
-      this.lastCloudReadAt = Date.now();
-      this.setStatus('arquivo carregado', 'success');
-    } catch (e) {
-      console.error('Erro ao ler JSON mensal:', e);
-      this.setStatus('erro ao ler arquivo', 'danger');
-    }
-  },
-
-  async writeMonthFile() {
-    if (!this.monthFileHandle || !this.monthData) return;
-
-    // evita escrita concorrente
-    if (this.syncing) {
-      this.pendingWrite = true;
-      return;
-    }
-
-    this.syncing = true;
-    this.setStatus('salvando...', 'warning');
-
-    try {
-      const writable = await this.monthFileHandle.createWritable();
-      const out = JSON.stringify(this.monthData, null, 2);
-      await writable.write(out);
-      await writable.close();
-      this.lastCloudWriteAt = Date.now();
-      this.setStatus('sincronizado', 'success');
-    } catch (e) {
-      console.error('Erro ao salvar JSON mensal:', e);
-      this.setStatus('erro ao salvar', 'danger');
-    } finally {
-      this.syncing = false;
-      if (this.pendingWrite) {
-        this.pendingWrite = false;
-        // roda mais uma vez
-        setTimeout(() => this.writeMonthFile(), 50);
-      }
-    }
-  },
-
-  ensureMonthMetaForDay(dayISO) {
-    if (!this.monthData) {
-      this.monthData = { version: 1, month: this.monthKeyFromDay(dayISO), days: {} };
-    }
-    const mk = this.monthKeyFromDay(dayISO);
-    this.monthData.month = this.monthData.month || mk;
-    if (!this.monthData.days) this.monthData.days = {};
-    if (!this.monthData.days[dayISO]) {
-      this.monthData.days[dayISO] = { routes: {} };
-    }
-    if (!this.monthData.days[dayISO].routes) this.monthData.days[dayISO].routes = {};
-  },
-
-  // Carrega rotas do dia a partir do JSON mensal
-  loadDayFromMonthData(dayISO) {
-    this.deserializeCarretas(this.monthData.days[dayISO].carretas);
-    this.routes.clear();
-    this.currentRouteId = null;
-
-    if (!this.monthData || !this.monthData.days || !this.monthData.days[dayISO]) return;
-
-    const routesObj = this.monthData.days[dayISO].routes || {};
-    for (const [routeId, r] of Object.entries(routesObj)) {
-      const route = this.deserializeRoute(routeId, r);
-      this.routes.set(String(routeId), route);
-    }
-    this.monthData.days[dayISO].carretas = this.serializeCarretas();
-  },
-
-  // Grava rotas do dia no JSON mensal
-  writeDayToMonthData(dayISO) {
-    this.ensureMonthMetaForDay(dayISO);
-    const routesObj = {};
-    for (const [routeId, r] of this.routes.entries()) {
-      routesObj[String(routeId)] = this.serializeRoute(r);
-    }
-    this.monthData.days[dayISO].routes = routesObj;
-  },
-
-  // Merge: cloud(day) + local(day) => local(day) atualizado
-  mergeCloudDayIntoLocal(dayISO) {
-    if (!this.monthData?.days?.[dayISO]?.routes) return;
-
-    const cloudRoutes = this.monthData.days[dayISO].routes;
-    const allRouteIds = new Set([
-      ...Object.keys(cloudRoutes),
-      ...Array.from(this.routes.keys())
-    ]);
-
-    for (const rid of allRouteIds) {
-      const local = this.routes.get(String(rid));
-      const cloud = cloudRoutes[String(rid)];
-
-      if (!local && cloud) {
-        this.routes.set(String(rid), this.deserializeRoute(rid, cloud));
-        continue;
-      }
-      if (local && !cloud) continue;
-      if (!local || !cloud) continue;
-
-      // Merge campos básicos
-      local.cluster = local.cluster || cloud.cluster || '';
-      local.destinationFacilityId = local.destinationFacilityId || cloud.destinationFacilityId || '';
-      local.destinationFacilityName = local.destinationFacilityName || cloud.destinationFacilityName || '';
-      local.totalInicial = Math.max(Number(local.totalInicial || 0), Number(cloud.totalInicial || 0));
-
-      // Merge Sets
-      const cloudIds = new Set(cloud.ids || []);
-      const cloudFalt = new Set(cloud.faltantes || []);
-      const cloudConf = new Set(cloud.conferidos || []);
-      const cloudFora = new Set(cloud.foraDeRota || []);
-
-      for (const id of cloudIds) local.ids.add(id);
-      for (const id of cloudFalt) local.faltantes.add(id);
-      for (const id of cloudConf) local.conferidos.add(id);
-      for (const id of cloudFora) local.foraDeRota.add(id);
-
-      // Merge Maps (timestamps = maior, duplicados = maior)
-      const cloudTs = cloud.timestamps || {};
-      for (const [id, ts] of Object.entries(cloudTs)) {
-        const cur = local.timestamps.get(id) || 0;
-        const val = Number(ts || 0);
-        if (val > cur) local.timestamps.set(id, val);
-      }
-
-      const cloudDup = cloud.duplicados || {};
-      for (const [id, cnt] of Object.entries(cloudDup)) {
-        const cur = Number(local.duplicados.get(id) || 0);
-        const val = Number(cnt || 0);
-        if (val > cur) local.duplicados.set(id, val);
-      }
-
-      // Recalcula faltantes coerentes
-      for (const id of local.conferidos) {
-        local.faltantes.delete(id);
-      }
-    }
-
-    // Regra global: se um ID está conferido na rota correta, remove "fora de rota" das outras
-    this.globalCleanupForaDeRotaForConferidos();
-  },
-
   globalCleanupForaDeRotaForConferidos() {
     // mapa: id -> rota onde está conferido (pode existir mais de uma, mas tratamos como "válido" em qualquer)
     const conferidosIds = new Set();
@@ -819,70 +855,154 @@ const ConferenciaApp = {
     }
   },
 
-  async syncTick() {
-    if (!this.monthFileHandle) return;          // sem arquivo => offline
-    if (!this.workDay) return;
-
-    // lê o arquivo, faz merge, escreve de volta
-    await this.loadMonthFile();
-    this.mergeCloudDayIntoLocal(this.workDay);
-
-    // grava local -> cloud(day)
-    this.writeDayToMonthData(this.workDay);
-    await this.writeMonthFile();
-
-    // salva cache local
-    this.saveToStorage(this.workDay);
-
-    // atualiza selects/UI
-    this.renderRoutesSelects();
-    this.refreshUIFromCurrent();
-  },
-
-  startSyncLoop() {
-    setInterval(() => {
-      // não trava UI: roda e ignora erro
-      this.syncTick().catch((e) => console.warn('syncTick error', e));
-    }, SYNC_INTERVAL_MS);
-  },
-
   // =======================
   // Troca de dia
   // =======================
-  async applyWorkDay(dayISO) {
-    this.workDay = dayISO;
-    $('#work-day').val(dayISO);
+  
+async applyWorkDay(dayISO) {
+  this.workDay = dayISO;
+  $('#work-day').val(dayISO);
 
-    // ✅ sempre começa pelo cache local do dia (não perde rotas)
-    this.loadFromStorage(dayISO);
+  // garante operação selecionada (modal se necessário)
+  await this.ensureOperationSelected();
 
-    // se houver arquivo mensal, apenas LÊ + MERGE (sem salvar automaticamente)
-    if (this.monthFileHandle) {
-      await this.loadMonthFile();
-      this.ensureMonthMetaForDay(dayISO);
+  const op = this.getOperationCode();
+  if (op) $('#op-badge').text(op);
 
-      // cloud(day) -> local(day)
-      this.mergeCloudDayIntoLocal(dayISO);
+  // 1) sempre começa pelo cache local do dia
+  this.loadFromStorage(dayISO);
 
-      // atualiza cache local consolidado
-      this.saveToStorage(dayISO);
+  // 2) tenta sincronizar do banco (Supabase) e mesclar no local
+  if (op) {
+    await this.syncFromSupabaseForDay(dayISO);
+  }
 
-      this.renderRoutesSelects();
-      this.refreshUIFromCurrent();
-      this.renderAcompanhamento();
-      this.setStatus('dia carregado (merge local + arquivo)', 'success');
-      return;
-    }
+  // 3) render
+  this.renderRoutesSelects();
+  this.refreshUIFromCurrent();
+  this.renderAcompanhamento();
 
-    // sem arquivo => apenas cache local
-    this.renderRoutesSelects();
-    this.refreshUIFromCurrent();
-    this.renderAcompanhamento();
-    this.setStatus('offline (sem arquivo)', 'muted');
+  if (op) this.setStatus(`dia carregado • ${op} • ${dayISO}`, 'success');
+  else this.setStatus('dia carregado (sem operação)', 'warning');
+},
+
+
+
+  
+  resetForOperationChange() {
+    // limpa estado e força voltar para a tela inicial
+    this.routes.clear();
+    this.currentRouteId = null;
+    this.viaCsv = false;
+
+    // limpa selects/listas visuais mais comuns
+    try {
+      $('#saved-routes').html('<option value="">(Nenhuma selecionada)</option>');
+      $('#saved-routes-inapp').empty();
+      $('#carreta-routes').empty();
+      $('#fora-rota-list').empty();
+      $('#route-title').text('');
+      $('#cluster-title').text('');
+      $('#destination-facility-title').text('');
+      $('#destination-facility-name').text('');
+      $('#extracted-total').text('0');
+      $('#verified-total').text('0');
+    } catch {}
+
+    // alterna interfaces
+    $('#global-interface').addClass('d-none');
+    $('#carreta-interface').addClass('d-none');
+    $('#manual-interface').addClass('d-none');
+    $('#initial-interface').removeClass('d-none');
   },
 
+  computeSnapshotStats(snapshotObj) {
+    // snapshotObj: { routeId: serializedRoute, ... }
+    const routes = snapshotObj && typeof snapshotObj === 'object' ? Object.values(snapshotObj) : [];
+    let routesCount = 0, totalIds = 0, conferidos = 0, faltantes = 0, fora = 0;
 
-  // =======================
+    for (const r of routes) {
+      if (!r || typeof r !== 'object') continue;
+      routesCount += 1;
+      const idsArr = Array.isArray(r.ids) ? r.ids : [];
+      const confArr = Array.isArray(r.conferidos) ? r.conferidos : [];
+      const faltArr = Array.isArray(r.faltantes) ? r.faltantes : [];
+      const foraArr = Array.isArray(r.foraDeRota) ? r.foraDeRota : [];
+      totalIds += idsArr.length;
+      conferidos += confArr.length;
+      faltantes += faltArr.length;
+      fora += foraArr.length;
+    }
+    return { routesCount, totalIds, conferidos, faltantes, fora };
+  },
+
+  async loadGlobalProgress(dayISO) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
+
+    // lista operações ativas
+    const { data: ops, error: e1 } = await sb
+      .from('operations')
+      .select('code,name,active')
+      .eq('active', true)
+      .order('code', { ascending: true });
+    if (e1) throw e1;
+
+    // para cada operação, pega snapshot do dia (se existir)
+    const tasks = (ops || []).map(async (o) => {
+      const code = String(o.code || '').toUpperCase();
+      const row = await this.supaLoadDaySnapshot(code, dayISO).catch(() => null);
+      const stats = this.computeSnapshotStats(row && row.data ? row.data : {});
+      return {
+        code,
+        name: o.name || '',
+        stats,
+        updated_at: row ? row.updated_at : null,
+        device_id: row ? row.device_id : null
+      };
+    });
+
+    return Promise.all(tasks);
+  },
+
+  renderGlobalProgress(items, dayISO) {
+    $('#global-day-label').text(dayISO);
+    const $tb = $('#global-ops-tbody');
+    const $log = $('#global-log');
+    $tb.empty();
+    $log.empty();
+
+    const sorted = (items || []).slice().sort((a,b)=> (a.code||'').localeCompare(b.code||''));
+
+    for (const it of sorted) {
+      const u = it.updated_at ? new Date(it.updated_at).toLocaleString('pt-BR') : '-';
+      $tb.append(`
+        <tr>
+          <td><strong>${it.code}</strong>${it.name ? ` <span class="text-muted small">(${this.escapeHtml(it.name)})</span>` : ''}</td>
+          <td>${it.stats.routesCount}</td>
+          <td>${it.stats.totalIds}</td>
+          <td>${it.stats.conferidos}</td>
+          <td>${it.stats.faltantes}</td>
+          <td>${it.stats.fora}</td>
+          <td>${u}</td>
+        </tr>
+      `);
+
+      // log simplificado
+      $log.append(`
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+          <span><strong>${it.code}</strong> • ${it.stats.conferidos}/${it.stats.totalIds} conferidos • ${it.stats.faltantes} faltantes</span>
+          <span class="badge badge-light">${u}</span>
+        </li>
+      `);
+    }
+
+    if (!sorted.length) {
+      $tb.append('<tr><td colspan="7" class="text-muted">Nenhuma operação ativa encontrada.</td></tr>');
+    }
+  },
+
+// =======================
   // UI / Rotas
   // =======================
   setCurrentRoute(routeId) {
@@ -1049,8 +1169,6 @@ const ConferenciaApp = {
 
     // cache local (rápido)
     this.saveToStorage(this.workDay);
-
-    // ✅ não salva automaticamente no arquivo mensal — fica pendente para "Salvar no arquivo do mês"
     this.markDirty('excluir rota');
 
     this.renderRoutesSelects();
@@ -1064,8 +1182,6 @@ const ConferenciaApp = {
 
     // remove cache do dia
     localStorage.removeItem(this.storageKeyForDay(this.workDay));
-
-    // ✅ não salva automaticamente no arquivo mensal — fica pendente para "Salvar no arquivo do mês"
     this.markDirty('limpar dia');
 
     this.renderRoutesSelects();
@@ -2103,19 +2219,38 @@ getIdsForExportByTimestamp(r) {
 // =======================
 // Eventos / Boot
 // =======================
+
 $(document).ready(async () => {
-  // set day default
   const today = ConferenciaApp.todayLocalISO();
   $('#work-day').val(today);
-  await ConferenciaApp.applyWorkDay(today);
 
-  // ConferenciaApp.startSyncLoop(); // autosync desativado (salvamento manual)
+  // força seleção de operação ao entrar
+  await ConferenciaApp.ensureOperationSelected();
+
+  // se já tiver operação, carrega o dia
+  if (ConferenciaApp.getOperationCode()) {
+    await ConferenciaApp.applyWorkDay(today);
+  }
 });
 
-// Selecionar arquivo mensal (Drive)
-$(document).on('click', '#btn-pick-month-file', () => {
-  ConferenciaApp.pickMonthFileHandle();
+// Confirmar operação escolhida
+$(document).on('click', '#btn-op-confirm', async () => {
+  const code = String($('#op-select').val() || '').trim().toUpperCase();
+  if (!code) return;
+  ConferenciaApp.setOperationCode(code);
+  ConferenciaApp.resetForOperationChange();
+  $('#modal-operation').modal('hide');
+
+  const day = $('#work-day').val() || ConferenciaApp.todayLocalISO();
+  await ConferenciaApp.applyWorkDay(day);
 });
+
+// Trocar operação
+$(document).on('click', '#btn-change-op', async () => {
+  await ConferenciaApp.ensureOperationSelected();
+  $('#modal-operation').modal('show');
+});
+
 
 // Filtro de rotas (pesquisa por cluster)
 $(document).on('input', '#route-search', (e) => {
@@ -2171,7 +2306,7 @@ $('#extract-btn').click(() => {
   // ✅ limpa o campo após importar
   $('#html-input').val('');
 
-  
+  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
 // Carregar rota
@@ -2349,18 +2484,6 @@ $('#back-btn').click(() => {
 });
 
 
-
-// Salvar manual no arquivo do mês
-$(document).on('click', '#btn-save-month', async () => {
-  try {
-    await ConferenciaApp.manualSaveToMonthFile();
-  } catch (e) {
-    console.error(e);
-    alert('Falha ao salvar no arquivo do mês.');
-  }
-});
-
-
 // =======================
 // Carretas: abrir/voltar + leitura
 // =======================
@@ -2488,5 +2611,106 @@ $(document).on('click', '#export-csv-todas-rotas-placa', () => {
 });
 $(document).on('click', '#export-csv-mapa-carretas', () => {
   ConferenciaApp.exportMapaCarretasCsv();
+});
+
+
+// =======================
+// Admin UI handlers
+// =======================
+$(document).on('click', '#btn-admin-open', async () => {
+  $('#modal-admin').modal('show');
+});
+
+async function refreshAdminOps() {
+  try {
+    const ops = await ConferenciaApp.adminLoadOperations(true);
+    const $tbody = $('#admin-ops-tbody');
+    if (!$tbody.length) return;
+    $tbody.empty();
+    ops.forEach(o => {
+      const act = o.active ? 'SIM' : 'NÃO';
+      const name = o.name || '';
+      $tbody.append(`<tr><td>${o.code}</td><td>${name}</td><td>${act}</td></tr>`);
+    });
+  } catch (e) {
+    console.warn(e);
+  }
+}
+
+$(document).on('click', '#btn-admin-login', async () => {
+  const email = $('#admin-email').val();
+  const pass = $('#admin-pass').val();
+  try {
+    await ConferenciaApp.adminSignIn(email, pass);
+    $('#admin-status').text('Logado.');
+    $('#admin-panel').removeClass('d-none');
+    await refreshAdminOps();
+  } catch (e) {
+    console.error(e);
+    alert('Falha no login do admin: ' + (e.message || e));
+  }
+});
+
+$(document).on('click', '#btn-admin-logout', async () => {
+  try {
+    await ConferenciaApp.adminSignOut();
+    $('#admin-status').text('Deslogado.');
+    $('#admin-panel').addClass('d-none');
+  } catch (e) {
+    console.error(e);
+  }
+});
+
+$(document).on('click', '#btn-admin-save-op', async () => {
+  const code = $('#admin-op-code').val();
+  const name = $('#admin-op-name').val();
+  const active = $('#admin-op-active').is(':checked');
+  try {
+    await ConferenciaApp.adminUpsertOperation(code, name, active);
+    await refreshAdminOps();
+    alert('Operação salva.');
+  } catch (e) {
+    console.error(e);
+    alert('Erro ao salvar operação: ' + (e.message || e));
+  }
+});
+
+
+
+
+// Abrir acompanhamento geral (todas operações)
+$(document).on('click', '#btn-global-acomp', async () => {
+  try {
+    const day = $('#work-day').val() || ConferenciaApp.todayLocalISO();
+    // troca telas
+    $('#initial-interface').addClass('d-none');
+    $('#carreta-interface').addClass('d-none');
+    $('#manual-interface').addClass('d-none');
+    $('#global-interface').removeClass('d-none');
+
+    ConferenciaApp.setStatus(`Carregando acompanhamento geral • ${day}`, 'info');
+    const items = await ConferenciaApp.loadGlobalProgress(day);
+    ConferenciaApp.renderGlobalProgress(items, day);
+    ConferenciaApp.setStatus(`Acompanhamento geral carregado • ${day}`, 'success');
+  } catch (e) {
+    console.warn(e);
+    ConferenciaApp.setStatus('Falha ao carregar acompanhamento geral (ver console).', 'danger');
+  }
+});
+
+$(document).on('click', '#global-refresh', async () => {
+  try {
+    const day = $('#work-day').val() || ConferenciaApp.todayLocalISO();
+    const items = await ConferenciaApp.loadGlobalProgress(day);
+    ConferenciaApp.renderGlobalProgress(items, day);
+  } catch (e) {
+    console.warn(e);
+    ConferenciaApp.setStatus('Falha ao atualizar acompanhamento geral.', 'danger');
+  }
+});
+
+$(document).on('click', '#global-back', () => {
+  $('#global-interface').addClass('d-none');
+  $('#initial-interface').removeClass('d-none');
 });
 
