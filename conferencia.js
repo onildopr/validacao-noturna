@@ -10,6 +10,7 @@ const ConferenciaApp = {
   currentRouteId: null,
   viaCsv: false,
   operationCode: null, // ex: ERD1
+  adminEnabled: false, // true quando admin estiver logado
   deviceId: null,
   cloudEnabled: true,
   cloudDirty: false,
@@ -174,6 +175,34 @@ const ConferenciaApp = {
     }
     return null;
   },
+  async isAdmin() {
+    try {
+      const sb = this.getSb();
+      if (!sb) return false;
+      const { data, error } = await sb.auth.getUser();
+      if (error) return false;
+      return !!data?.user; // admin = usuário autenticado
+    } catch { return false; }
+  },
+
+  setAdminEnabled(flag) {
+    this.adminEnabled = !!flag;
+    try {
+      const disabled = !this.adminEnabled;
+      $('#btn-delete-route').prop('disabled', disabled);
+      $('#btn-clear-routes').prop('disabled', disabled);
+    } catch {}
+  },
+
+  requireAdminSync(actionLabel = 'esta ação') {
+    if (!this.adminEnabled) {
+      this.setStatus(`Acesso negado: somente o admin pode executar ${actionLabel}.`, 'danger');
+      alert('Acesso negado: somente o admin pode executar esta ação.');
+      return false;
+    }
+    return true;
+  },
+
 
   buildDaySnapshotObject() {
     const obj = {};
@@ -383,15 +412,18 @@ async adminSignIn(email, password) {
   if (!sb) throw new Error('Supabase client não encontrado.');
   const { data, error } = await sb.auth.signInWithPassword({ email, password });
   if (error) throw error;
-  return data;
+    this.setAdminEnabled(true);
+    return data;
 },
 
-async adminSignOut() {
-  const sb = this.getSb();
-  if (!sb) throw new Error('Supabase client não encontrado.');
-  const { error } = await sb.auth.signOut();
-  if (error) throw error;
-},
+  async adminSignOut() {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado.');
+    const { error } = await sb.auth.signOut();
+    if (error) throw error;
+    this.setAdminEnabled(false);
+  },
+
 
 async adminUpsertOperation(code, name, active = true) {
   const sb = this.getSb();
@@ -661,6 +693,8 @@ async adminLoadOperations(includeInactive = true) {
     $('#night-report-close').addClass('d-none');
   },
 
+
+
   // =======================
   // Modelo de rota
   // =======================
@@ -703,7 +737,9 @@ async adminLoadOperations(includeInactive = true) {
   // =======================
   loadFromStorage(dayISO) {
     try {
-      const key = this.storageKeyForDay(dayISO);
+      
+      // sempre limpa estado do dia anterior, mesmo se não houver cache
+const key = this.storageKeyForDay(dayISO);
       const raw = localStorage.getItem(key);
       if (!raw) return;
 
@@ -870,6 +906,9 @@ async applyWorkDay(dayISO) {
   if (op) $('#op-badge').text(op);
 
   // 1) sempre começa pelo cache local do dia
+  // limpa estado antes de carregar novo dia
+  this.routes.clear();
+  this.currentRouteId = null;
   this.loadFromStorage(dayISO);
 
   // 2) tenta sincronizar do banco (Supabase) e mesclar no local
@@ -1161,8 +1200,8 @@ async applyWorkDay(dayISO) {
     $('#verified-total').text(r.conferidos.size);
     this.atualizarProgresso();
   },
-
   deleteRoute(routeId) {
+    if (!this.requireAdminSync("excluir rota")) return;
     if (!routeId) return;
     this.routes.delete(String(routeId));
     if (this.currentRouteId === String(routeId)) this.currentRouteId = null;
@@ -1175,8 +1214,8 @@ async applyWorkDay(dayISO) {
     this.refreshUIFromCurrent();
     this.renderAcompanhamento();
   },
-
   clearAllRoutes() {
+    if (!this.requireAdminSync("limpar rotas do dia")) return;
     this.routes.clear();
     this.currentRouteId = null;
 
@@ -2227,6 +2266,18 @@ $(document).ready(async () => {
   // força seleção de operação ao entrar
   await ConferenciaApp.ensureOperationSelected();
 
+  // detecta se admin já está logado (persistência do supabase)
+  try {
+    const sb = ConferenciaApp.getSb();
+    if (sb) {
+      const { data } = await sb.auth.getUser();
+      ConferenciaApp.setAdminEnabled(!!data?.user);
+      sb.auth.onAuthStateChange((_event, session) => {
+        ConferenciaApp.setAdminEnabled(!!session?.user);
+      });
+    }
+  } catch {}
+
   // se já tiver operação, carrega o dia
   if (ConferenciaApp.getOperationCode()) {
     await ConferenciaApp.applyWorkDay(today);
@@ -2306,6 +2357,7 @@ $('#extract-btn').click(() => {
   // ✅ limpa o campo após importar
   $('#html-input').val('');
 
+  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
 // Carregar rota
@@ -2712,5 +2764,4 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
-
 
