@@ -1,7 +1,7 @@
 const { jsPDF } = window.jspdf || {};
 
-const SYNC_INTERVAL_MS = 20000;
-const AUTO_SAVE_INTERVAL_MS = 10000; // 2 min
+const SYNC_INTERVAL_MS = 2000;
+const AUTO_SAVE_INTERVAL_MS = 1000; // 2 min
 
 
 const ConferenciaApp = {
@@ -2762,6 +2762,7 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
+
 
 
 
