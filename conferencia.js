@@ -591,7 +591,7 @@ async adminLoadOperations(includeInactive = true) {
     const textoClusters = Array.from(mapa.entries())
       .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
       .map(([cluster, v]) => {
-        return `CLUSTER ${cluster}: ${v.precisaRevalidar ? 'REVALIDAR' : 'CONTAR'}`;
+        return `ROTA ${cluster}: ${v.precisaRevalidar ? 'REVALIDAR' : 'CONTAR'}`;
       })
       .join('\n');
 
@@ -2836,5 +2836,6 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
+
 
 
