@@ -234,33 +234,44 @@ const ConferenciaApp = {
     }, 1200);
   },
 
-  async flushCloudSave() {
-    if (!this.cloudEnabled) return;
-    if (this.cloudSaving) return;
-    if (!this.cloudDirty) return;
-
-    const op = this.getOperationCode();
-    const day = this.workDay || this.todayLocalISO();
-    if (!op || !day) return;
-
-    this.cloudSaving = true;
+  async flushCloudSave(dayISO) {
     try {
-      const snapshot = this.buildDaySnapshotObject();
-      const nowIso = new Date().toISOString();
-      await this.supaSaveDaySnapshot(op, day, snapshot);
-      this.cloudDirty = false;
-      this.cloudLastSaveAt = Date.now();
-      // após confirmar gravação, consideramos que exclusões locais já foram propagadas
-      try {
-        this.localMeta.lastRemoteUpdatedAt = nowIso;
-        this.localMeta.deletedRoutes = {};
-        this.saveToStorage(day, { markCloudDirty: false });
-      } catch (_) {}
-      this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
-    } finally {
-      this.cloudSaving = false;
+      if (!window.sbClient) return;
+
+      const operationCode = this.currentOperationCode;
+      if (!operationCode || !dayISO) return;
+
+      // ⚠️ GARANTE QUE O SNAPSHOT NUNCA É NULL
+      const snapshotObj = {
+        routes: this.routes || {},
+        currentRouteId: this.currentRouteId || null,
+        updatedAtLocal: new Date().toISOString()
+      };
+
+      const payload = {
+        operation_code: operationCode,
+        day: dayISO,
+        snapshot: snapshotObj, // 🔥 AGORA SALVA EM SNAPSHOT
+        updated_at: new Date().toISOString()
+      };
+
+      const { error } = await sbClient
+        .from('routes_state')
+        .upsert(payload, {
+          onConflict: 'operation_code,day'
+        });
+
+      if (error) {
+        console.error("Erro ao salvar no Supabase:", error);
+      } else {
+        console.log("✔ Snapshot salvo no Supabase");
+      }
+
+    } catch (err) {
+      console.error("Falha no flushCloudSave:", err);
     }
   },
+
 
   mergeSnapshotIntoLocal(snapshotObj) {
     // snapshotObj: { [routeId]: serializedRoute }
@@ -309,99 +320,44 @@ const ConferenciaApp = {
 
   
   async syncFromSupabaseForDay(dayISO) {
-    const op = this.getOperationCode();
-    if (!op) return;
-
     try {
-      const row = await this.supaLoadDaySnapshot(op, dayISO);
-      if (!row || !row.snapshot) return;
+      if (!window.sbClient) return;
 
-      const remoteUpdatedAt = row.updated_at ? String(row.updated_at) : null;
-      const remoteTs = remoteUpdatedAt ? Date.parse(remoteUpdatedAt) : 0;
+      const operationCode = this.currentOperationCode;
+      if (!operationCode || !dayISO) return;
 
-      // 1) monta mapa remoto (baseline)
-      const merged = new Map();
-      for (const [routeId, ser] of Object.entries(row.snapshot || {})) {
-        const r = this.deserializeRoute(routeId, ser);
-        merged.set(String(routeId), r);
-      }
+      const { data, error } = await sbClient
+        .from('routes_state')
+        .select('snapshot, updated_at')
+        .eq('operation_code', operationCode)
+        .eq('day', dayISO)
+        .single();
 
-      // 2) aplica estado local atual (offline) por cima com regras:
-      //    - se rota existe em ambos: faz merge (união de conjuntos/timestamps)
-      //    - se rota só existe localmente: só mantém se ela foi criada depois do último snapshot remoto
-      const lastRemoteTs = this.localMeta?.lastRemoteUpdatedAt ? Date.parse(this.localMeta.lastRemoteUpdatedAt) : 0;
-
-      for (const [routeId, localRoute] of this.routes.entries()) {
-        const id = String(routeId);
-        const remoteRoute = merged.get(id);
-
-        if (remoteRoute) {
-          // merge por união (não perde bipagens offline)
-          localRoute.ids.forEach(v => remoteRoute.ids.add(v));
-          localRoute.conferidos.forEach(v => remoteRoute.conferidos.add(v));
-          localRoute.foraDeRota.forEach(v => remoteRoute.foraDeRota.add(v));
-          localRoute.faltantes.forEach(v => remoteRoute.faltantes.add(v));
-
-          for (const [k, v] of localRoute.timestamps.entries()) {
-            const cur = remoteRoute.timestamps.get(k);
-            if (!cur || String(v) > String(cur)) remoteRoute.timestamps.set(k, v);
-          }
-          for (const [k, v] of localRoute.duplicados.entries()) {
-            const cur = remoteRoute.duplicados.get(k);
-            if (!cur) remoteRoute.duplicados.set(k, v);
-            else remoteRoute.duplicados.set(k, Math.max(Number(cur || 0), Number(v || 0)));
-          }
-
-          // campos básicos: mantém o que for "mais informativo"
-          if (!remoteRoute.cluster && localRoute.cluster) remoteRoute.cluster = localRoute.cluster;
-          if (!remoteRoute.destinationFacilityId && localRoute.destinationFacilityId) remoteRoute.destinationFacilityId = localRoute.destinationFacilityId;
-          if (!remoteRoute.destinationFacilityName && localRoute.destinationFacilityName) remoteRoute.destinationFacilityName = localRoute.destinationFacilityName;
-          if (!remoteRoute.totalInicial && localRoute.totalInicial) remoteRoute.totalInicial = localRoute.totalInicial;
-
-          // createdAt: preserva o mais antigo (primeiro contato)
-          remoteRoute.createdAt = Math.min(Number(remoteRoute.createdAt || Date.now()), Number(localRoute.createdAt || Date.now()));
-
-          // recomputa faltantes
-          if (remoteRoute.ids.size) {
-            remoteRoute.faltantes = new Set(remoteRoute.ids);
-            for (const c of remoteRoute.conferidos) remoteRoute.faltantes.delete(c);
-          }
-        } else {
-          const createdAt = Number(localRoute.createdAt || 0);
-          // só mantém rotas locais que "nasceram" após o último snapshot remoto conhecido
-          if (!lastRemoteTs || (createdAt && createdAt > lastRemoteTs)) {
-            merged.set(id, localRoute);
-          }
-        }
-      }
-
-      // 3) aplica tombstones locais (exclusões feitas offline depois do último remoto)
-      const tomb = (this.localMeta && this.localMeta.deletedRoutes) ? this.localMeta.deletedRoutes : {};
-      for (const [rid, ts] of Object.entries(tomb || {})) {
-        const t = Number(ts || 0);
-        // se a exclusão foi feita depois do último snapshot remoto que a gente conhecia, respeita
-        if (!lastRemoteTs || t > lastRemoteTs) {
-          merged.delete(String(rid));
-        }
-      }
-
-      // 4) substitui estado local pelo merged
-      this.routes = merged;
-
-      // atualiza meta remoto e salva cache
-      this.localMeta.lastRemoteUpdatedAt = remoteUpdatedAt || this.localMeta.lastRemoteUpdatedAt || null;
-      this.saveToStorage(dayISO, { markCloudDirty: false });
-
-      this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
-    } catch (e) {
-      if (e && (e.code === '42P01' || /routes_state/i.test(String(e.message || '')))) {
-        this.setStatus('Tabela routes_state não existe no Supabase. Crie a tabela para sincronizar.', 'danger');
-        console.warn('Crie no Supabase:', this.getRoutesStateCreateSQL());
+      if (error) {
+        console.error("Erro ao sincronizar:", error);
         return;
       }
-      console.warn('Falha ao sincronizar do Supabase:', e);
+
+      if (!data || !data.snapshot) {
+        console.warn("Snapshot vazio no banco.");
+        return;
+      }
+
+      console.log("✔ Snapshot recebido do banco");
+
+      // 🔥 APLICA DIRETAMENTE O SNAPSHOT
+      this.routes = data.snapshot.routes || {};
+      this.currentRouteId = data.snapshot.currentRouteId || null;
+
+      this.renderRoutesSelects();
+      this.refreshUIFromCurrent();
+      this.renderAcompanhamento();
+
+    } catch (err) {
+      console.error("Falha ao sincronizar do Supabase:", err);
     }
-  },
+  }
+,
 
 
   getRoutesStateCreateSQL() {
