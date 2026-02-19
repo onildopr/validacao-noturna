@@ -236,42 +236,42 @@ const ConferenciaApp = {
 
   async flushCloudSave(dayISO) {
     try {
-      if (!window.sbClient) return;
+      const sb = this.getSb();
+      if (!sb) return;
 
-      const operationCode = this.currentOperationCode;
-      if (!operationCode || !dayISO) return;
+      const operationCode = this.getOperationCode?.();
+      const day = dayISO || this.workDay;
+      if (!operationCode || !day) return;
+
+      // ✅ NÃO muda o banco: usa a coluna `data` (jsonb) como snapshot do dia
+      // Mantém o sistema interno usando Map/Set e salva serializado (JSON puro).
+      const snapshotObj = this.buildDaySnapshotObject(); // { [routeId]: serializedRoute }
 
       const payload = {
         operation_code: operationCode,
-        day: dayISO,
-
-        // 🔥 snapshot agora é somente o mapa de rotas
-        snapshot: this.routes || {},
-
-        // 🔥 meta separado para informações auxiliares
-        meta: {
-          currentRouteId: this.currentRouteId || null
-        },
-
-        updated_at: new Date().toISOString()
+        day: day,
+        data: snapshotObj,
+        updated_at: new Date().toISOString(),
+        device_id: this.getDeviceId()
       };
 
-      const { error } = await sbClient
+      const { error } = await sb
         .from('routes_state')
-        .upsert(payload, {
-          onConflict: 'operation_code,day'
-        });
+        .upsert(payload, { onConflict: 'operation_code,day' });
 
       if (error) {
         console.error("Erro ao salvar no Supabase:", error);
       } else {
-        console.log("✔ Snapshot salvo no Supabase");
+        // marca cache local com timestamp remoto (ajuda a evitar reload atoa)
+        this.localMeta = this.localMeta || {};
+        this.localMeta.lastRemoteUpdatedAt = payload.updated_at;
+        console.log("✔ Snapshot salvo no Supabase (data)");
+        this.markClean();
       }
 
     } catch (err) {
       console.error("Falha no flushCloudSave:", err);
     }
-
   },
 
 
@@ -320,49 +320,56 @@ const ConferenciaApp = {
     }
   },
 
-  
   async syncFromSupabaseForDay(dayISO) {
     try {
-      if (!window.sbClient) return;
+      const sb = this.getSb();
+      if (!sb) return;
 
-      const operationCode = this.currentOperationCode;
-      if (!operationCode || !dayISO) return;
+      const operationCode = this.getOperationCode?.();
+      const day = dayISO || this.workDay;
+      if (!operationCode || !day) return;
 
-      const { data, error } = await sbClient
+      const { data, error } = await sb
         .from('routes_state')
-        .select('snapshot, meta, updated_at')
+        .select('data, updated_at, device_id')
         .eq('operation_code', operationCode)
-        .eq('day', dayISO)
-        .single();
+        .eq('day', day)
+        .maybeSingle();
 
       if (error) {
         console.error("Erro ao sincronizar:", error);
         return;
       }
-
       if (!data) return;
 
-      // ✅ Evita re-render desnecessário
-      if (this._lastCloudUpdatedAt && data.updated_at === this._lastCloudUpdatedAt) {
+      // ✅ evita trabalho se nada mudou
+      if (this._lastCloudUpdatedAt && data.updated_at === this._lastCloudUpdatedAt) return;
+      this._lastCloudUpdatedAt = data.updated_at;
+
+      const snapshotObj = (data.data && typeof data.data === 'object') ? data.data : null;
+      if (!snapshotObj) {
+        console.warn("Snapshot vazio no banco (data).");
         return;
       }
 
-      this._lastCloudUpdatedAt = data.updated_at;
+      // ✅ aplica SUBSTITUINDO o estado do dia (não reintroduz rotas deletadas por merges)
+      this.routes.clear();
+      this.currentRouteId = null;
 
-      // 🔥 Aplica rotas
-      if (data.snapshot) {
-        this.routes = data.snapshot;
+      for (const [routeId, ser] of Object.entries(snapshotObj)) {
+        const r = this.deserializeRoute(routeId, ser);
+        this.routes.set(String(routeId), r);
       }
-
-      // 🔥 Aplica meta (rota atual)
-      this.currentRouteId = data.meta?.currentRouteId || null;
 
       console.log("✔ Snapshot aplicado do banco:", data.updated_at);
 
-      // Atualiza UI
       this.renderRoutesSelects();
       this.refreshUIFromCurrent();
       this.renderAcompanhamento();
+
+      // atualiza meta local
+      this.localMeta = this.localMeta || {};
+      this.localMeta.lastRemoteUpdatedAt = data.updated_at;
 
     } catch (err) {
       console.error("Falha ao sincronizar do Supabase:", err);
@@ -420,12 +427,31 @@ create policy "routes_state_update_all"
     const current = this.getOperationCode();
     const exists = (data || []).some(o => o.code === current);
 
+    // se não tem operação salva, escolhe a primeira automaticamente
+    const firstCode = (data && data.length) ? data[0].code : null;
+
     if (!current || !exists) {
-      // abre modal
+      if (firstCode) {
+        // define um padrão para não ficar undefined
+        this.setOperationCode(firstCode);
+        if (typeof this.currentOperationCode !== 'undefined') {
+          this.currentOperationCode = firstCode;
+        }
+        // já seleciona no dropdown
+        $('#op-select').val(firstCode);
+      }
+
+      // abre modal mesmo assim (pra pessoa confirmar/trocar)
       $('#modal-operation').modal({ backdrop: 'static', keyboard: false });
+
     } else {
       this.setOperationCode(current);
+      if (typeof this.currentOperationCode !== 'undefined') {
+        this.currentOperationCode = current;
+      }
+      $('#op-select').val(current);
     }
+
   },
 
 // =======================
@@ -979,9 +1005,9 @@ async applyWorkDay(dayISO) {
   this._pollTimer = setInterval(async () => {
     try {
       // só sincroniza se tiver operação e dia definidos
-      if (!this.currentOperationCode || !this.workDay) return;
-
-      // puxa do Supabase e aplica se mudou
+      const _op = this.getOperationCode?.();
+      if (!_op || !this.workDay) return;
+// puxa do Supabase e aplica se mudou
       await this.syncFromSupabaseForDay(this.workDay);
     } catch (e) {
       console.warn("poll sync falhou:", e);
@@ -1019,6 +1045,7 @@ async applyWorkDay(dayISO) {
     $('#initial-interface').removeClass('d-none');
   },
 
+  
   computeSnapshotStats(snapshotObj) {
     // snapshotObj: { routeId: serializedRoute, ... }
     const routes = snapshotObj && typeof snapshotObj === 'object' ? Object.values(snapshotObj) : [];
@@ -2752,6 +2779,19 @@ async function refreshAdminOps() {
     console.warn(e);
   }
 }
+
+$('#op-select').on('change', async () => {
+  const code = $('#op-select').val();
+  this.setOperationCode(code);
+  if (typeof this.currentOperationCode !== 'undefined') {
+    this.currentOperationCode = code;
+  }
+
+  // aplica dia atual/selecionado e já puxa do banco
+  const day = this.workDay || this.todayLocalISO();
+  await this.applyWorkDay(day);
+});
+
 
 $(document).on('click', '#btn-admin-login', async () => {
   const email = $('#admin-email').val();
