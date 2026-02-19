@@ -322,43 +322,51 @@ const ConferenciaApp = {
   async syncFromSupabaseForDay(dayISO) {
     try {
       if (!window.sbClient) return;
-
+  
       const operationCode = this.currentOperationCode;
       if (!operationCode || !dayISO) return;
-
+  
       const { data, error } = await sbClient
         .from('routes_state')
         .select('snapshot, updated_at')
         .eq('operation_code', operationCode)
         .eq('day', dayISO)
         .single();
-
+  
       if (error) {
         console.error("Erro ao sincronizar:", error);
         return;
       }
-
+  
+      // Evita re-render à toa (se não mudou no banco)
+      if (this._lastCloudUpdatedAt && data?.updated_at === this._lastCloudUpdatedAt) return;
+      this._lastCloudUpdatedAt = data?.updated_at || null;
+  
       if (!data || !data.snapshot) {
         console.warn("Snapshot vazio no banco.");
         return;
       }
-
-      console.log("✔ Snapshot recebido do banco");
-
-      // 🔥 APLICA DIRETAMENTE O SNAPSHOT
-      this.routes = data.snapshot.routes || {};
-      this.currentRouteId = data.snapshot.currentRouteId || null;
-
+  
+      console.log("✔ Snapshot recebido do banco", data.updated_at);
+  
+      // ✅ Seu snapshot é o mapa de rotas DIRETO (routeId -> objeto)
+      this.routes = data.snapshot;   // <<< AQUI é a correção principal
+  
+      // Mantém rota atual se ainda existir; senão limpa
+      if (this.currentRouteId && !this.routes[this.currentRouteId]) {
+        this.currentRouteId = null;
+      }
+  
+      // Atualiza UI
       this.renderRoutesSelects();
       this.refreshUIFromCurrent();
       this.renderAcompanhamento();
-
+  
     } catch (err) {
       console.error("Falha ao sincronizar do Supabase:", err);
-      if (this._lastCloudUpdatedAt === data.updated_at) return;
-      this._lastCloudUpdatedAt = data.updated_at;
     }
   }
+
 ,
 
 
@@ -2821,3 +2829,4 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
+
