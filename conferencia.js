@@ -355,6 +355,8 @@ const ConferenciaApp = {
 
     } catch (err) {
       console.error("Falha ao sincronizar do Supabase:", err);
+      if (this._lastCloudUpdatedAt === data.updated_at) return;
+      this._lastCloudUpdatedAt = data.updated_at;
     }
   }
 ,
@@ -963,6 +965,20 @@ async applyWorkDay(dayISO) {
 
   if (op) this.setStatus(`dia carregado • ${op} • ${dayISO}`, 'success');
   else this.setStatus('dia carregado (sem operação)', 'warning');
+
+  if (this._pollTimer) clearInterval(this._pollTimer);
+
+  this._pollTimer = setInterval(async () => {
+    try {
+      // só sincroniza se tiver operação e dia definidos
+      if (!this.currentOperationCode || !this.workDay) return;
+
+      // puxa do Supabase e aplica se mudou
+      await this.syncFromSupabaseForDay(this.workDay);
+    } catch (e) {
+      console.warn("poll sync falhou:", e);
+    }
+  }, 2000);
 },
 
 
