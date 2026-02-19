@@ -241,28 +241,37 @@ const ConferenciaApp = {
       const operationCode = this.currentOperationCode;
       if (!operationCode || !dayISO) return;
 
-      // ✅ Snapshot = mapa direto de rotas (routeId -> objeto)
-      const snapshotObj = this.routes || {};
-
       const payload = {
         operation_code: operationCode,
         day: dayISO,
-        snapshot: snapshotObj,
+
+        // 🔥 snapshot agora é somente o mapa de rotas
+        snapshot: this.routes || {},
+
+        // 🔥 meta separado para informações auxiliares
+        meta: {
+          currentRouteId: this.currentRouteId || null
+        },
+
         updated_at: new Date().toISOString()
       };
 
       const { error } = await sbClient
         .from('routes_state')
-        .upsert(payload, { onConflict: 'operation_code,day' });
+        .upsert(payload, {
+          onConflict: 'operation_code,day'
+        });
 
       if (error) {
         console.error("Erro ao salvar no Supabase:", error);
       } else {
-        console.log("✔ Snapshot salvo no Supabase", operationCode, dayISO);
+        console.log("✔ Snapshot salvo no Supabase");
       }
+
     } catch (err) {
       console.error("Falha no flushCloudSave:", err);
     }
+
   },
 
 
@@ -321,7 +330,7 @@ const ConferenciaApp = {
 
       const { data, error } = await sbClient
         .from('routes_state')
-        .select('snapshot, updated_at')
+        .select('snapshot, meta, updated_at')
         .eq('operation_code', operationCode)
         .eq('day', dayISO)
         .single();
@@ -331,24 +340,24 @@ const ConferenciaApp = {
         return;
       }
 
-      // Evita re-render à toa (se não mudou no banco)
-      if (this._lastCloudUpdatedAt && data?.updated_at === this._lastCloudUpdatedAt) return;
-      this._lastCloudUpdatedAt = data?.updated_at || null;
+      if (!data) return;
 
-      if (!data || !data.snapshot) {
-        console.warn("Snapshot vazio no banco.");
+      // ✅ Evita re-render desnecessário
+      if (this._lastCloudUpdatedAt && data.updated_at === this._lastCloudUpdatedAt) {
         return;
       }
 
-      console.log("✔ Snapshot recebido do banco", data.updated_at);
+      this._lastCloudUpdatedAt = data.updated_at;
 
-      // ✅ Seu snapshot é o mapa de rotas DIRETO (routeId -> objeto)
-      this.routes = data.snapshot;   // <<< AQUI é a correção principal
-
-      // Mantém rota atual se ainda existir; senão limpa
-      if (this.currentRouteId && !this.routes[this.currentRouteId]) {
-        this.currentRouteId = null;
+      // 🔥 Aplica rotas
+      if (data.snapshot) {
+        this.routes = data.snapshot;
       }
+
+      // 🔥 Aplica meta (rota atual)
+      this.currentRouteId = data.meta?.currentRouteId || null;
+
+      console.log("✔ Snapshot aplicado do banco:", data.updated_at);
 
       // Atualiza UI
       this.renderRoutesSelects();
@@ -358,9 +367,7 @@ const ConferenciaApp = {
     } catch (err) {
       console.error("Falha ao sincronizar do Supabase:", err);
     }
-  }
-
-,
+  },
 
 
   getRoutesStateCreateSQL() {
