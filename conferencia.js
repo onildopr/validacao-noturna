@@ -17,6 +17,11 @@ const ConferenciaApp = {
   cloudSaving: false,
   cloudLastSaveAt: 0,
   cloudSaveTimer: null,
+  // Realtime (Supabase) para sincronizar entre computadores
+  rtChannel: null,
+  rtOp: null,
+  rtDay: null,
+  rtEnabled: true,
   workDay: null,               // YYYY-MM-DD
   lastEvents: [],            // log simples de bipagens (últimos eventos)
 
@@ -401,6 +406,108 @@ const ConferenciaApp = {
     }
   },
 
+  // =======================
+  // Supabase Realtime (sincronização instantânea entre PCs)
+  // Requer: tabela public.routes_state adicionada ao publication supabase_realtime
+  // =======================
+  stopRealtime() {
+    try {
+      const sb = this.getSb();
+      if (sb && this.rtChannel) {
+        sb.removeChannel(this.rtChannel);
+      }
+    } catch (e) {
+      console.warn('Falha ao parar realtime:', e);
+    }
+    this.rtChannel = null;
+    this.rtOp = null;
+    this.rtDay = null;
+  },
+
+  async startRealtimeForDay(dayISO) {
+    if (!this.rtEnabled) return;
+    const sb = this.getSb();
+    const op = this.getOperationCode();
+    if (!sb || !op || !dayISO) return;
+
+    // evita duplicar subscribe
+    if (this.rtChannel && this.rtOp === op && this.rtDay === dayISO) return;
+
+    // troca de dia/op -> unsubscribe do canal anterior
+    if (this.rtChannel) this.stopRealtime();
+
+    this.rtOp = op;
+    this.rtDay = dayISO;
+
+    try {
+      const filter = `operation_code=eq.${op},day=eq.${dayISO}`;
+      const channelName = `routes_state:${op}:${dayISO}`;
+
+      this.rtChannel = sb
+        .channel(channelName)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'routes_state', filter },
+          (payload) => {
+            try {
+              // Ignore alterações geradas por este mesmo device (opcional)
+              const newRow = payload && payload.new ? payload.new : null;
+              if (newRow && newRow.device_id && String(newRow.device_id) === String(this.getDeviceId())) {
+                return;
+              }
+
+              // DELETE (raro aqui) -> limpa estado
+              if (payload && payload.eventType === 'DELETE') {
+                this.routes.clear();
+                this.currentRouteId = null;
+                this.saveToStorage(dayISO, { markCloudDirty: false });
+                this.renderRoutesSelects();
+                this.refreshUIFromCurrent();
+                this.renderAcompanhamento();
+                this.setStatus(`Atualizado (delete) • ${op} • ${dayISO}`, 'info');
+                return;
+              }
+
+              if (!newRow || !newRow.data) return;
+
+              // evita aplicar snapshot antigo
+              const remoteUpdatedAt = newRow.updated_at ? String(newRow.updated_at) : null;
+              const localUpdatedAt = this.localMeta?.lastRemoteUpdatedAt ? String(this.localMeta.lastRemoteUpdatedAt) : null;
+              if (remoteUpdatedAt && localUpdatedAt && Date.parse(remoteUpdatedAt) <= Date.parse(localUpdatedAt)) {
+                return;
+              }
+
+              // aplica snapshot remoto na memória atual
+              this.mergeSnapshotIntoLocal(newRow.data);
+
+              // aplica tombstones locais (se existirem) por cima
+              const tomb = (this.localMeta && this.localMeta.deletedRoutes) ? this.localMeta.deletedRoutes : {};
+              for (const rid of Object.keys(tomb || {})) {
+                this.routes.delete(String(rid));
+              }
+
+              this.localMeta.lastRemoteUpdatedAt = remoteUpdatedAt || this.localMeta.lastRemoteUpdatedAt || null;
+              this.saveToStorage(dayISO, { markCloudDirty: false });
+
+              // atualiza UI
+              this.renderRoutesSelects();
+              this.refreshUIFromCurrent();
+              this.renderAcompanhamento();
+              this.setStatus(`Atualizado em tempo real • ${op} • ${dayISO}`, 'info');
+            } catch (e) {
+              console.warn('Erro ao processar evento realtime:', e);
+            }
+          }
+        )
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            this.setStatus(`Realtime ativo • ${op} • ${dayISO}`, 'success');
+          }
+        });
+    } catch (e) {
+      console.warn('Falha ao iniciar realtime:', e);
+    }
+  },
 
   getRoutesStateCreateSQL() {
     return `create table if not exists public.routes_state (
@@ -591,7 +698,7 @@ async adminLoadOperations(includeInactive = true) {
     const textoClusters = Array.from(mapa.entries())
       .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
       .map(([cluster, v]) => {
-        return `ROTA ${cluster}: ${v.precisaRevalidar ? 'REVALIDAR' : 'CONTAR'}`;
+        return `CLUSTER ${cluster}: ${v.precisaRevalidar ? 'REVALIDAR' : 'CONTAR'}`;
       })
       .join('\n');
 
@@ -1011,6 +1118,8 @@ async applyWorkDay(dayISO) {
 
   
   resetForOperationChange() {
+    // encerra realtime do dia/op anterior
+    this.stopRealtime();
     // limpa estado e força voltar para a tela inicial
     this.routes.clear();
     this.currentRouteId = null;
@@ -1844,6 +1953,17 @@ this.saveToStorage(this.workDay);
 
     const correctRouteId = this.findCorrectRouteForId(codigo);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
+    if (isCorrectHere) {
+      // 1) se por algum motivo ele ficou "fora de rota" aqui, destrava
+      r.foraDeRota.delete(codigo);
+
+      // 2) remove o código de todas as outras rotas (inclusive da rota errada)
+      this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
+
+      // 3) opcional: se duplicados por rota forem um Map/Set, limpe também
+      if (r.duplicados?.has?.(codigo)) r.duplicados.delete(codigo);
+    }
+
 
     if (isCorrectHere) {
       this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
@@ -2836,6 +2956,3 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
-
-
-
