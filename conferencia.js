@@ -353,12 +353,20 @@ const ConferenciaApp = {
       }
 
       // ✅ aplica SUBSTITUINDO o estado do dia (não reintroduz rotas deletadas por merges)
+      const prevRouteId = this.currentRouteId;
       this.routes.clear();
-      this.currentRouteId = null;
+      // não zera de cara: vamos tentar preservar se ainda existir após aplicar o snapshot
+      this.currentRouteId = prevRouteId || null;
 
       for (const [routeId, ser] of Object.entries(snapshotObj)) {
         const r = this.deserializeRoute(routeId, ser);
         this.routes.set(String(routeId), r);
+      }
+
+
+      // ✅ preserva rota selecionada se ainda existir
+      if (this.currentRouteId && !this.routes.has(String(this.currentRouteId))) {
+        this.currentRouteId = null;
       }
 
       console.log("✔ Snapshot aplicado do banco:", data.updated_at);
@@ -1152,6 +1160,10 @@ async applyWorkDay(dayISO) {
     const $sel1 = $('#saved-routes');
     const $sel2 = $('#saved-routes-inapp');
 
+
+    // ✅ preserva seleção anterior (evita “desselecionar” a cada sync)
+    const prevSelected = this.currentRouteId || $sel1.val() || $sel2.val() || null;
+
     const routesSorted = Array.from(this.routes.values())
       .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
 
@@ -1180,9 +1192,16 @@ async applyWorkDay(dayISO) {
     // Select "Trocar rota" (com filtro por cluster)
     this.applyRouteDropdownFilter($('#route-search').val() || '');
 
-    if (this.currentRouteId) {
+    // ✅ restaura seleção (preferindo o que estava selecionado antes do re-render)
+    const candidate = prevSelected ? String(prevSelected) : (this.currentRouteId ? String(this.currentRouteId) : '');
+    if (candidate && this.routes && this.routes.has(candidate)) {
+      this.currentRouteId = candidate;
+      $sel1.val(candidate);
+      // $sel2 é definido dentro do filtro (se estiver visível na lista filtrada)
+      this.applyRouteDropdownFilter($('#route-search').val() || '');
+    } else if (this.currentRouteId) {
+      // fallback para comportamento antigo
       $sel1.val(this.currentRouteId);
-      // o $sel2 é definido dentro do filtro (se estiver visível na lista filtrada)
     }
   },
 
