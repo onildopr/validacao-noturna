@@ -1,8 +1,12 @@
 const { jsPDF } = window.jspdf || {};
 
+// Fallback defensivo (evita erro se algum cache antigo/concatenação remover o prefixo)
+window.STORAGE_KEY_PREFIX = window.STORAGE_KEY_PREFIX || 'conferencia.v2';
 const SYNC_INTERVAL_MS = 1000;
 const AUTO_SAVE_INTERVAL_MS = 1000; // 2 min
 
+// Prefixo para chaves do localStorage (cache por operação e dia)
+const STORAGE_KEY_PREFIX = window.STORAGE_KEY_PREFIX;
 
 const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
@@ -17,6 +21,12 @@ const ConferenciaApp = {
   cloudSaveTimer: null,
   workDay: null,               // YYYY-MM-DD
   lastEvents: [],            // log simples de bipagens (últimos eventos)
+
+  // Meta persistida localmente (híbrido offline/online)
+  localMeta: {
+    lastRemoteUpdatedAt: null,
+    deletedRoutes: {},
+  },
 
   // =======================
   // Carretas (Placa -> Rotas QR)
@@ -158,7 +168,7 @@ const ConferenciaApp = {
 
   // =======================
   // Supabase (snapshot por operação+dia)
-  // Tabela esperada: routes_state(operation_code text, day date, data jsonb, updated_at timestamptz, device_id text)
+  // Tabela esperada: routes_state(operation_code text, day date, snapshot jsonb, updated_at timestamptz)
   // =======================
   getSb() {
     // tenta usar client já criado no HTML; se não existir, tenta criar com config global (SB_URL/SB_ANON)
@@ -174,75 +184,6 @@ const ConferenciaApp = {
     return null;
   },
 
-
-
-stopRealtime() {
-  const sb = this.getSb();
-  if (!sb) return;
-  try {
-    if (this.realtimeChannel) {
-      sb.removeChannel(this.realtimeChannel);
-    }
-  } catch (e) {
-    console.warn('Falha ao remover canal realtime:', e);
-  }
-  this.realtimeChannel = null;
-  this.realtimeKey = null;
-},
-
-startRealtimeForDay(operationCode, dayISO) {
-  const sb = this.getSb();
-  if (!sb) return;
-  const key = `${operationCode}::${dayISO}`;
-  if (this.realtimeKey === key && this.realtimeChannel) return;
-
-  // troca de dia/op: remove canal anterior
-  this.stopRealtime();
-
-  const filter = `operation_code=eq.${operationCode},day=eq.${dayISO}`;
-  const channelName = `routes_state:${key}`;
-
-  const ch = sb
-    .channel(channelName)
-    .on(
-      'postgres_changes',
-      { event: '*', schema: 'public', table: 'routes_state', filter },
-      (payload) => {
-        try {
-          const row = payload?.new;
-          if (!row) return;
-          if (row.operation_code !== operationCode) return;
-          // row.day pode vir como 'YYYY-MM-DD'
-          if (String(row.day) !== String(dayISO)) return;
-          if (!row.snapshot) return;
-
-          // aplica no local sem marcar como dirty (apenas refletindo o banco)
-          this.mergeSnapshotIntoLocal(row.snapshot);
-          this.saveToStorage(dayISO);
-
-          // Atualiza UI
-          this.renderRoutesSelects();
-          this.refreshUIFromCurrent();
-          this.renderAcompanhamento();
-
-          this.setStatus(`Atualizado em tempo real • ${operationCode} • ${dayISO}`, 'info');
-        } catch (e) {
-          console.warn('Erro ao aplicar evento realtime:', e, payload);
-        }
-      }
-    )
-    .subscribe((status) => {
-      // status pode ser: SUBSCRIBED | TIMED_OUT | CLOSED | CHANNEL_ERROR
-      if (status === 'SUBSCRIBED') {
-        this.setStatus(`Realtime ativo • ${operationCode} • ${dayISO}`, 'success');
-      } else if (status === 'CHANNEL_ERROR') {
-        this.setStatus(`Realtime com erro • ver console`, 'warning');
-      }
-    });
-
-  this.realtimeChannel = ch;
-  this.realtimeKey = key;
-},
   buildDaySnapshotObject() {
     const obj = {};
     for (const [routeId, r] of this.routes.entries()) {
@@ -256,7 +197,7 @@ startRealtimeForDay(operationCode, dayISO) {
     if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
     const { data, error } = await sb
       .from('routes_state')
-      .select('snapshot,updated_at')
+      .select('data,updated_at,device_id')
       .eq('operation_code', operationCode)
       .eq('day', dayISO)
       .maybeSingle();
@@ -271,8 +212,10 @@ startRealtimeForDay(operationCode, dayISO) {
     const payload = {
       operation_code: operationCode,
       day: dayISO,
-      snapshot: snapshotObj,
-      updated_at: new Date().toISOString(),};
+      data: snapshotObj,
+      updated_at: new Date().toISOString(),
+      device_id: this.getDeviceId()
+    };
     const { error } = await sb
       .from('routes_state')
       .upsert(payload, { onConflict: 'operation_code,day' });
@@ -303,9 +246,16 @@ startRealtimeForDay(operationCode, dayISO) {
     this.cloudSaving = true;
     try {
       const snapshot = this.buildDaySnapshotObject();
+      const nowIso = new Date().toISOString();
       await this.supaSaveDaySnapshot(op, day, snapshot);
       this.cloudDirty = false;
       this.cloudLastSaveAt = Date.now();
+      // após confirmar gravação, consideramos que exclusões locais já foram propagadas
+      try {
+        this.localMeta.lastRemoteUpdatedAt = nowIso;
+        this.localMeta.deletedRoutes = {};
+        this.saveToStorage(day, { markCloudDirty: false });
+      } catch (_) {}
       this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
     } finally {
       this.cloudSaving = false;
@@ -357,6 +307,7 @@ startRealtimeForDay(operationCode, dayISO) {
     }
   },
 
+  
   async syncFromSupabaseForDay(dayISO) {
     const op = this.getOperationCode();
     if (!op) return;
@@ -365,15 +316,84 @@ startRealtimeForDay(operationCode, dayISO) {
       const row = await this.supaLoadDaySnapshot(op, dayISO);
       if (!row || !row.snapshot) return;
 
-      // Mescla do banco -> local
-      this.mergeSnapshotIntoLocal(row.snapshot);
+      const remoteUpdatedAt = row.updated_at ? String(row.updated_at) : null;
+      const remoteTs = remoteUpdatedAt ? Date.parse(remoteUpdatedAt) : 0;
 
-      // Persistir merge local
-      this.saveToStorage(dayISO);
+      // 1) monta mapa remoto (baseline)
+      const merged = new Map();
+      for (const [routeId, ser] of Object.entries(row.snapshot || {})) {
+        const r = this.deserializeRoute(routeId, ser);
+        merged.set(String(routeId), r);
+      }
+
+      // 2) aplica estado local atual (offline) por cima com regras:
+      //    - se rota existe em ambos: faz merge (união de conjuntos/timestamps)
+      //    - se rota só existe localmente: só mantém se ela foi criada depois do último snapshot remoto
+      const lastRemoteTs = this.localMeta?.lastRemoteUpdatedAt ? Date.parse(this.localMeta.lastRemoteUpdatedAt) : 0;
+
+      for (const [routeId, localRoute] of this.routes.entries()) {
+        const id = String(routeId);
+        const remoteRoute = merged.get(id);
+
+        if (remoteRoute) {
+          // merge por união (não perde bipagens offline)
+          localRoute.ids.forEach(v => remoteRoute.ids.add(v));
+          localRoute.conferidos.forEach(v => remoteRoute.conferidos.add(v));
+          localRoute.foraDeRota.forEach(v => remoteRoute.foraDeRota.add(v));
+          localRoute.faltantes.forEach(v => remoteRoute.faltantes.add(v));
+
+          for (const [k, v] of localRoute.timestamps.entries()) {
+            const cur = remoteRoute.timestamps.get(k);
+            if (!cur || String(v) > String(cur)) remoteRoute.timestamps.set(k, v);
+          }
+          for (const [k, v] of localRoute.duplicados.entries()) {
+            const cur = remoteRoute.duplicados.get(k);
+            if (!cur) remoteRoute.duplicados.set(k, v);
+            else remoteRoute.duplicados.set(k, Math.max(Number(cur || 0), Number(v || 0)));
+          }
+
+          // campos básicos: mantém o que for "mais informativo"
+          if (!remoteRoute.cluster && localRoute.cluster) remoteRoute.cluster = localRoute.cluster;
+          if (!remoteRoute.destinationFacilityId && localRoute.destinationFacilityId) remoteRoute.destinationFacilityId = localRoute.destinationFacilityId;
+          if (!remoteRoute.destinationFacilityName && localRoute.destinationFacilityName) remoteRoute.destinationFacilityName = localRoute.destinationFacilityName;
+          if (!remoteRoute.totalInicial && localRoute.totalInicial) remoteRoute.totalInicial = localRoute.totalInicial;
+
+          // createdAt: preserva o mais antigo (primeiro contato)
+          remoteRoute.createdAt = Math.min(Number(remoteRoute.createdAt || Date.now()), Number(localRoute.createdAt || Date.now()));
+
+          // recomputa faltantes
+          if (remoteRoute.ids.size) {
+            remoteRoute.faltantes = new Set(remoteRoute.ids);
+            for (const c of remoteRoute.conferidos) remoteRoute.faltantes.delete(c);
+          }
+        } else {
+          const createdAt = Number(localRoute.createdAt || 0);
+          // só mantém rotas locais que "nasceram" após o último snapshot remoto conhecido
+          if (!lastRemoteTs || (createdAt && createdAt > lastRemoteTs)) {
+            merged.set(id, localRoute);
+          }
+        }
+      }
+
+      // 3) aplica tombstones locais (exclusões feitas offline depois do último remoto)
+      const tomb = (this.localMeta && this.localMeta.deletedRoutes) ? this.localMeta.deletedRoutes : {};
+      for (const [rid, ts] of Object.entries(tomb || {})) {
+        const t = Number(ts || 0);
+        // se a exclusão foi feita depois do último snapshot remoto que a gente conhecia, respeita
+        if (!lastRemoteTs || t > lastRemoteTs) {
+          merged.delete(String(rid));
+        }
+      }
+
+      // 4) substitui estado local pelo merged
+      this.routes = merged;
+
+      // atualiza meta remoto e salva cache
+      this.localMeta.lastRemoteUpdatedAt = remoteUpdatedAt || this.localMeta.lastRemoteUpdatedAt || null;
+      this.saveToStorage(dayISO, { markCloudDirty: false });
 
       this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
     } catch (e) {
-      // Se a tabela não existir, orientar com SQL
       if (e && (e.code === '42P01' || /routes_state/i.test(String(e.message || '')))) {
         this.setStatus('Tabela routes_state não existe no Supabase. Crie a tabela para sincronizar.', 'danger');
         console.warn('Crie no Supabase:', this.getRoutesStateCreateSQL());
@@ -383,13 +403,14 @@ startRealtimeForDay(operationCode, dayISO) {
     }
   },
 
+
   getRoutesStateCreateSQL() {
     return `create table if not exists public.routes_state (
   operation_code text not null references public.operations(code) on delete restrict,
   day date not null,
   snapshot jsonb not null,
   updated_at timestamptz not null default now(),
-  
+
   primary key (operation_code, day)
 );
 
@@ -763,6 +784,7 @@ async adminLoadOperations(includeInactive = true) {
   makeEmptyRoute(routeId) {
     return {
       routeId: String(routeId),
+      createdAt: Date.now(), // usado para decidir se uma rota é 'nova' localmente (offline)
       cluster: '',
       destinationFacilityId: '',
       destinationFacilityName: '',
@@ -797,54 +819,43 @@ async adminLoadOperations(includeInactive = true) {
   // =======================
   // Persistência local (cache por dia)
   // =======================
+
+  // =======================
+  // Persistência local (cache por dia) — MODO HÍBRIDO
+  // - Salva snapshot (para funcionar offline)
+  // - Guarda meta (último snapshot remoto + tombstones de exclusão)
+  // =======================
   loadFromStorage(dayISO) {
     try {
       const key = this.storageKeyForDay(dayISO);
       const raw = localStorage.getItem(key);
-      if (!raw) return;
+      if (!raw) {
+        // não existe cache para esse dia -> mantém estado vazio
+        return;
+      }
 
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== 'object') return;
 
+      // Compatibilidade:
+      // - formato antigo: { [routeId]: serializedRoute }
+      // - formato novo: { meta: {...}, data: { [routeId]: serializedRoute } }
+      const meta = parsed.meta && typeof parsed.meta === 'object' ? parsed.meta : {};
+      const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+
+      this.localMeta = {
+        lastRemoteUpdatedAt: meta.lastRemoteUpdatedAt || this.localMeta.lastRemoteUpdatedAt || null,
+        deletedRoutes: meta.deletedRoutes && typeof meta.deletedRoutes === 'object'
+          ? meta.deletedRoutes
+          : (this.localMeta.deletedRoutes || {}),
+      };
+
+      // Carrega SUBSTITUINDO o estado local (evita ressuscitar rotas antigas via merges)
       this.routes.clear();
       this.currentRouteId = null;
 
-      for (const [routeId, r] of Object.entries(parsed)) {
-        const route = this.makeEmptyRoute(routeId);
-
-        route.cluster = r.cluster || '';
-        route.destinationFacilityId = r.destinationFacilityId || '';
-        route.destinationFacilityName = r.destinationFacilityName || '';
-        route.totalInicial = Number(r.totalInicial || 0);
-
-        route.plateKey = r.plateKey || '';
-        route.plateRaw = r.plateRaw || '';
-        route.plateLicense = r.plateLicense || '';
-        route.routeQrKey = r.routeQrKey || '';
-        route.routeQrRaw = r.routeQrRaw || '';
-
-    route.plateScanTs = Number(r.plateScanTs || 0);
-    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
-
-    
-    route.plateScanTs = Number(r.plateScanTs || 0);
-    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
-
-    
-
-        (r.ids || []).forEach(id => route.ids.add(id));
-        (r.conferidos || []).forEach(id => route.conferidos.add(id));
-        (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
-        route.faltantes = new Set(r.faltantes || []);
-
-        route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [k, v]));
-        route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, v]));
-
-        if (!route.faltantes.size && route.ids.size) {
-          route.faltantes = new Set(route.ids);
-          for (const c of route.conferidos) route.faltantes.delete(c);
-        }
-
+      for (const [routeId, ser] of Object.entries(data)) {
+        const route = this.deserializeRoute(routeId, ser);
         this.routes.set(String(routeId), route);
       }
     } catch (e) {
@@ -852,15 +863,24 @@ async adminLoadOperations(includeInactive = true) {
     }
   },
 
-  saveToStorage(dayISO) {
+  saveToStorage(dayISO, opts = { markCloudDirty: true }) {
     try {
       const key = this.storageKeyForDay(dayISO);
-      const obj = {};
+      const data = {};
       for (const [routeId, r] of this.routes.entries()) {
-        obj[routeId] = this.serializeRoute(r);
+        data[routeId] = this.serializeRoute(r);
       }
-      localStorage.setItem(key, JSON.stringify(obj));
-      this.markCloudDirty();
+
+      const payload = {
+        meta: {
+          lastRemoteUpdatedAt: this.localMeta?.lastRemoteUpdatedAt || null,
+          deletedRoutes: this.localMeta?.deletedRoutes || {},
+        },
+        data
+      };
+
+      localStorage.setItem(key, JSON.stringify(payload));
+      if (opts && opts.markCloudDirty) this.markCloudDirty();
     } catch (e) {
       console.warn('Falha ao salvar storage:', e);
     }
@@ -873,6 +893,7 @@ async adminLoadOperations(includeInactive = true) {
       destinationFacilityId: r.destinationFacilityId,
       destinationFacilityName: r.destinationFacilityName,
       totalInicial: r.totalInicial,
+      createdAt: Number(r.createdAt || 0),
 
       plateKey: r.plateKey || '',
       plateRaw: r.plateRaw || '',
@@ -900,6 +921,7 @@ async adminLoadOperations(includeInactive = true) {
     route.destinationFacilityId = r.destinationFacilityId || '';
     route.destinationFacilityName = r.destinationFacilityName || '';
     route.totalInicial = Number(r.totalInicial || 0);
+    route.createdAt = Number(r.createdAt || route.createdAt || 0) || Date.now();
 
     route.plateKey = r.plateKey || '';
     route.plateRaw = r.plateRaw || '';
@@ -959,19 +981,16 @@ async applyWorkDay(dayISO) {
   this.workDay = dayISO;
   $('#work-day').val(dayISO);
 
-  // evita que um dia herde dados do outro
-  this.routes.clear();
-  this.currentRouteId = null;
-  this.viaCsv = false;
-
   // garante operação selecionada (modal se necessário)
   await this.ensureOperationSelected();
 
   const op = this.getOperationCode();
   if (op) $('#op-badge').text(op);
 
-  // liga realtime para o dia/op atual (atualiza outros PCs sem F5)
-  if (op) this.startRealtimeForDay(op, dayISO);
+  // 0) reseta estado do dia (evita "todos os dias iguais" quando não há cache local)
+  this.routes.clear();
+  this.currentRouteId = null;
+  this.localMeta = { lastRemoteUpdatedAt: null, deletedRoutes: {} };
 
   // 1) sempre começa pelo cache local do dia
   this.loadFromStorage(dayISO);
@@ -994,7 +1013,6 @@ async applyWorkDay(dayISO) {
 
   
   resetForOperationChange() {
-    this.stopRealtime();
     // limpa estado e força voltar para a tela inicial
     this.routes.clear();
     this.currentRouteId = null;
@@ -1269,7 +1287,10 @@ async applyWorkDay(dayISO) {
 
   deleteRoute(routeId) {
     if (!routeId) return;
-    this.routes.delete(String(routeId));
+    const rid = String(routeId);
+    // tombstone (para não ressuscitar ao voltar do offline)
+    try { this.localMeta.deletedRoutes[rid] = Date.now(); } catch (_) {}
+    this.routes.delete(rid);
     if (this.currentRouteId === String(routeId)) this.currentRouteId = null;
 
     // cache local (rápido)
@@ -1825,6 +1846,17 @@ this.saveToStorage(this.workDay);
 
     const correctRouteId = this.findCorrectRouteForId(codigo);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
+    if (isCorrectHere) {
+      // 1) se por algum motivo ele ficou "fora de rota" aqui, destrava
+      r.foraDeRota.delete(codigo);
+
+      // 2) remove o código de todas as outras rotas (inclusive da rota errada)
+      this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
+
+      // 3) opcional: se duplicados por rota forem um Map/Set, limpe também
+      if (r.duplicados?.has?.(codigo)) r.duplicados.delete(codigo);
+    }
+
 
     if (isCorrectHere) {
       this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
@@ -2411,7 +2443,6 @@ $('#extract-btn').click(() => {
   // ✅ limpa o campo após importar
   $('#html-input').val('');
 
-  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
 // Carregar rota
@@ -2818,4 +2849,3 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
-
