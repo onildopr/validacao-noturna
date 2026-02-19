@@ -6,16 +6,215 @@
   <title>Conferência de Rota</title>
 
   <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
-  <link rel="stylesheet" href="https://onildopr.github.io/rodacoop.ui/css/rodacoop.css">
 
-<body class="rk-scope">
+  <style>
+    
+        /* Texto padrão da área principal */
+    main {
+      color: #f1f1f1;
+    }
 
+    /* Cards e listas sempre legíveis */
+    .card,
+    .list-group-item,
+    .alert {
+      color: #212529;
+    }
+
+    /* Painel da carreta / placa */
+    #carreta-interface,
+    #carreta-interface * {
+      color: #212529 !important;
+    }
+
+    #carreta-interface .list-group-item {
+      background-color: #ffffff !important;
+      opacity: 1 !important;
+    }
+
+    /* Títulos internos da carreta */
+    #carreta-current,
+    #carreta-summary {
+      color: #212529 !important;
+      font-weight: 600;
+    }
+    /* ===============================
+      FUNDO PRINCIPAL (marca d’água)
+      =============================== */
+    main {
+      position: relative;
+      min-height: 100vh;
+      background: radial-gradient(
+        circle at top,
+        #000000 0%,
+        #000000 70%
+      );
+      overflow: hidden;
+      z-index: 0; /* cria contexto */
+    }
+    #carreta-missing-list{
+      max-height: 150px;     /* ajuste como quiser */
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    /* Logo como marca d’água */
+    main::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image: url("./logorodacoop.png");
+      background-repeat: no-repeat;
+      background-position: top-right;
+      background-size: 360px auto;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    /* Conteúdo acima do fundo */
+    main > * {
+      position: relative;
+      z-index: 2;
+    }
+
+
+    /* Conteúdo acima do fundo */
+    main > * {
+      position: relative;
+      z-index: 1;
+    }
+
+    /* ===============================
+      SIDEBAR
+      =============================== */
+    .sidebar {
+      background: linear-gradient(
+        180deg,
+        #fff6eb 0%,
+        #fbe2c6 100%
+      );
+      border-right: 4px solid #ff8c00;
+    }
+
+    /* ===============================
+      CARDS / ALERTS
+      =============================== */
+    .card,
+    .alert {
+      background-color: rgba(255,255,255,0.96);
+      border-left: 4px solid #ff8c00;
+    }
+
+    /* ===============================
+      BOTÕES (laranja institucional)
+      =============================== */
+    .btn-primary,
+    .btn-success {
+      background-color: #ff8c00;
+      border-color: #ff8c00;
+      color: #fff;
+    }
+
+    .btn-primary:hover,
+    .btn-success:hover {
+      background-color: #e67600;
+      border-color: #e67600;
+    }
+
+    /* Botões outline */
+    .btn-outline-primary,
+    .btn-outline-success,
+    .btn-outline-info {
+      color: #ff8c00;
+      border-color: #ff8c00;
+    }
+
+    .btn-outline-primary:hover,
+    .btn-outline-success:hover,
+    .btn-outline-info:hover {
+      background-color: #ff8c00;
+      color: #fff;
+    }
+
+    /* ===============================
+      PROGRESS BAR
+      =============================== */
+    .progress-bar {
+      background-color: #ff8c00;
+    }
+
+    /* ===============================
+      TÍTULOS / DESTAQUES
+      =============================== */
+    h2, h3, h4, h5 {
+      color: #ff8c00;
+    }
+
+    /* ===============================
+      BADGES
+      =============================== */
+    .badge-success {
+      background-color: #ff8c00;
+    }
+
+
+
+
+    .d-none { display: none !important; }
+    .list-section { max-height: 400px; overflow-y: auto; }
+
+    /* Layout com sidebar */
+    .app-shell { min-height: 100vh; }
+    .sidebar {
+      border-right: 1px solid #e9ecef;
+      background: #fafafa;
+      min-height: 100vh;
+      padding: 16px;
+      position: sticky;
+      top: 0;
+    }
+    .sidebar .small-muted { font-size: 12px; color: #6c757d; }
+    .sidebar .badge { font-size: 12px; }
+    body {
+  color: #f1f1f1; /* texto claro */
+    }
+    /* Sidebar é clara → texto precisa ser escuro */
+    .sidebar,
+    .sidebar * {
+      color: #212529 !important;
+    }
+
+    /* Só pra garantir o resumo e o log */
+    #acompanhamento-resumo {
+      color: #212529 !important;
+    }
+    #acompanhamento-log .list-group-item {
+      color: #212529 !important;
+    }
+
+    /* Painel de CARRETAS/PLACAS: força contraste e remove qualquer aparência de "opaco" */
+    #carreta-interface .card,
+    #carreta-interface .alert,
+    #carreta-interface .list-group-item {
+      opacity: 1 !important;
+      background-color: rgba(255,255,255,0.98) !important;
+      color: #212529 !important;
+    }
+
+    #carreta-interface #carreta-current,
+    #carreta-interface #carreta-summary {
+      color: #212529 !important;
+    }
+  </style>
+</head>
+
+<body>
 <div class="container-fluid app-shell">
   <div class="row no-gutters">
 
     <!-- SIDEBAR ESQUERDA -->
-    <aside class="col-12 col-md-3 col-lg-2 sidebar" style="min-height: 100vh;">
-      <h5 class="mb-3 brand text-center brand-title">Painel</h5>
+    <aside class="col-12 col-md-3 col-lg-2 sidebar">
+      <h5 class="mb-3">Painel</h5>
 
       <div class="mb-3">
         <div class="small-muted mb-1">Data (dia em uso)</div>
@@ -95,7 +294,7 @@
     </aside>
 
     <!-- ÁREA PRINCIPAL -->
-    <main class="col-12 col-md-9 col-lg-10 p-3" class="rk-main">
+    <main class="col-12 col-md-9 col-lg-10 p-3">
 
       <div class="container pt-2" id="html">
         <div class="row">
@@ -144,7 +343,7 @@
             <!-- Interface inicial -->
             <div id="initial-interface">
               <div class="text-center mb-3">
-                <h2 class="brand-title">Conferência de Rota</h2>
+                <h2>Conferência de Rota</h2>
               </div>
 
               <!-- Rotas salvas -->
@@ -225,7 +424,7 @@
               <input type="text" id="barcode-input" class="form-control"
                 placeholder="Leia ou digite o código de barras" autofocus>
 
-              <div class="row text-center mt-4 ">
+              <div class="row text-center mt-4">
                 <div class="col-md-3">
                   <h5>Conferidos</h5>
                   <ul id="conferidos-list" class="list-group list-section"></ul>
@@ -496,46 +695,42 @@
     </div>
   </div>
 </div>
-<a href="https://onildopr.github.io/rodacoop.ui/" class="rk-back-btn">
-  ← Painel Operacional
-</a>
 
-<!-- SCRIPTS: ORDEM IMPORTA -->
-<script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
-<script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-
-
-<!-- SCRIPTS: ORDEM IMPORTA -->
+<!-- SCRIPTS (uma vez só) -->
 <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
 <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
+<!-- Supabase (uma vez só) -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
-(function () {
+(function(){
   const supabaseUrl = "https://joxqazqnbrwakavnwrmg.supabase.co";
   const supabaseAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpveHFhenFuYnJ3YWthdm53cm1nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2OTU5MDQsImV4cCI6MjA4NTI3MTkwNH0.JRjtqL-snAi_PMVSiukNPBBgFEOtzrTnNcbwc_H_NbM";
   window.SB_URL = supabaseUrl;
   window.SB_ANON = supabaseAnonKey;
   if (!window.supabase) {
-    console.error("Supabase SDK não carregou. Verifique o script @supabase/supabase-js.");
+    console.error("Supabase SDK não carregou.");
     return;
   }
-  window.sbClient = window.sbClient || window.supabase.createClient(supabaseUrl, supabaseAnonKey);
+  // Cria 1 único client e força headers para evitar "Invalid API key" por override/caches
+  window.sbClient = window.supabase.createClient(supabaseUrl, supabaseAnonKey, {
+    auth: { persistSession: false },
+    global: {
+      headers: {
+        apikey: supabaseAnonKey,
+        Authorization: `Bearer ${supabaseAnonKey}`,
+      },
+    },
+  });
+  console.log("sbClient pronto:", !!window.sbClient);
 })();
-
 </script>
 
-<!-- Seu JS -->
-<script src="conferencia.js" defer></script>
-</body>
-</html>
-
+<!-- Seu JS (cache-bust recomendado) -->
+<script src="conferencia.js"></script>
 </body>
 </html>
