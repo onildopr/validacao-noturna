@@ -1,12 +1,8 @@
 const { jsPDF } = window.jspdf || {};
 
-// Fallback defensivo (evita erro se algum cache antigo/concatenação remover o prefixo)
-window.STORAGE_KEY_PREFIX = window.STORAGE_KEY_PREFIX || 'conferencia.v2';
 const SYNC_INTERVAL_MS = 1000;
 const AUTO_SAVE_INTERVAL_MS = 1000; // 2 min
 
-// Prefixo para chaves do localStorage (cache por operação e dia)
-const STORAGE_KEY_PREFIX = window.STORAGE_KEY_PREFIX;
 
 const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
@@ -19,14 +15,10 @@ const ConferenciaApp = {
   cloudSaving: false,
   cloudLastSaveAt: 0,
   cloudSaveTimer: null,
+  lastLocalMutationAt: 0,
+  cloudPullGraceMs: 2000,
   workDay: null,               // YYYY-MM-DD
   lastEvents: [],            // log simples de bipagens (últimos eventos)
-
-  // Meta persistida localmente (híbrido offline/online)
-  localMeta: {
-    lastRemoteUpdatedAt: null,
-    deletedRoutes: {},
-  },
 
   // =======================
   // Carretas (Placa -> Rotas QR)
@@ -168,7 +160,7 @@ const ConferenciaApp = {
 
   // =======================
   // Supabase (snapshot por operação+dia)
-  // Tabela esperada: routes_state(operation_code text, day date, snapshot jsonb, updated_at timestamptz)
+  // Tabela esperada: routes_state(operation_code text, day date, data jsonb, updated_at timestamptz, device_id text)
   // =======================
   getSb() {
     // tenta usar client já criado no HTML; se não existir, tenta criar com config global (SB_URL/SB_ANON)
@@ -224,6 +216,7 @@ const ConferenciaApp = {
 
   markCloudDirty() {
     this.cloudDirty = true;
+    this.lastLocalMutationAt = Date.now();
     // Debounce: não salva a cada bipagem
     if (this.cloudSaveTimer) clearTimeout(this.cloudSaveTimer);
     this.cloudSaveTimer = setTimeout(() => {
@@ -234,46 +227,32 @@ const ConferenciaApp = {
     }, 1200);
   },
 
-  async flushCloudSave(dayISO) {
+  async flushCloudSave() {
+    if (!this.cloudEnabled) return;
+    if (this.cloudSaving) return;
+    if (!this.cloudDirty) return;
+
+    const op = this.getOperationCode();
+    const day = this.workDay || this.todayLocalISO();
+    if (!op || !day) return;
+
+    this.cloudSaving = true;
     try {
-      const sb = this.getSb();
-      if (!sb) return;
-
-      const operationCode = this.getOperationCode?.();
-      const day = dayISO || this.workDay;
-      if (!operationCode || !day) return;
-
-      // ✅ NÃO muda o banco: usa a coluna `data` (jsonb) como snapshot do dia
-      // Mantém o sistema interno usando Map/Set e salva serializado (JSON puro).
-      const snapshotObj = this.buildDaySnapshotObject(); // { [routeId]: serializedRoute }
-
-      const payload = {
-        operation_code: operationCode,
-        day: day,
-        data: snapshotObj,
-        updated_at: new Date().toISOString(),
-        device_id: this.getDeviceId()
-      };
-
-      const { error } = await sb
-        .from('routes_state')
-        .upsert(payload, { onConflict: 'operation_code,day' });
-
-      if (error) {
-        console.error("Erro ao salvar no Supabase:", error);
-      } else {
-        // marca cache local com timestamp remoto (ajuda a evitar reload atoa)
-        this.localMeta = this.localMeta || {};
-        this.localMeta.lastRemoteUpdatedAt = payload.updated_at;
-        console.log("✔ Snapshot salvo no Supabase (data)");
-        this.markClean();
-      }
-
-    } catch (err) {
-      console.error("Falha no flushCloudSave:", err);
+      // IMPORTANTíssimo: evita perder bipagens em cenários multi-PC (last-write-wins).
+      // 1) puxa o snapshot atual do banco
+      const row = await this.supaLoadDaySnapshot(op, day).catch(() => null);
+      // 2) mescla banco -> local (união de conjuntos)
+      if (row && row.data) this.mergeSnapshotIntoLocal(row.data);
+      // 3) salva o snapshot mesclado
+      const snapshot = this.buildDaySnapshotObject();
+      await this.supaSaveDaySnapshot(op, day, snapshot);
+      this.cloudDirty = false;
+      this.cloudLastSaveAt = Date.now();
+      this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
+    } finally {
+      this.cloudSaving = false;
     }
   },
-
 
   mergeSnapshotIntoLocal(snapshotObj) {
     // snapshotObj: { [routeId]: serializedRoute }
@@ -321,77 +300,42 @@ const ConferenciaApp = {
   },
 
   async syncFromSupabaseForDay(dayISO) {
+    const op = this.getOperationCode();
+    if (!op) return;
+    // Evita sobrescrever estado local durante bipagens rápidas / antes do flush
+    const now = Date.now();
+    if (this.cloudDirty) return;
+    if (this.lastLocalMutationAt && (now - this.lastLocalMutationAt) < (this.cloudPullGraceMs || 2000)) return;
+
     try {
-      const sb = this.getSb();
-      if (!sb) return;
+      const row = await this.supaLoadDaySnapshot(op, dayISO);
+      if (!row || !row.data) return;
 
-      const operationCode = this.getOperationCode?.();
-      const day = dayISO || this.workDay;
-      if (!operationCode || !day) return;
+      // Mescla do banco -> local
+      this.mergeSnapshotIntoLocal(row.data);
 
-      const { data, error } = await sb
-        .from('routes_state')
-        .select('data, updated_at, device_id')
-        .eq('operation_code', operationCode)
-        .eq('day', day)
-        .maybeSingle();
+      // Persistir merge local
+      this.saveToStorage(dayISO);
 
-      if (error) {
-        console.error("Erro ao sincronizar:", error);
+      this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
+    } catch (e) {
+      // Se a tabela não existir, orientar com SQL
+      if (e && (e.code === '42P01' || /routes_state/i.test(String(e.message || '')))) {
+        this.setStatus('Tabela routes_state não existe no Supabase. Crie a tabela para sincronizar.', 'danger');
+        console.warn('Crie no Supabase:', this.getRoutesStateCreateSQL());
         return;
       }
-      if (!data) return;
-
-      // ✅ evita trabalho se nada mudou
-      if (this._lastCloudUpdatedAt && data.updated_at === this._lastCloudUpdatedAt) return;
-      this._lastCloudUpdatedAt = data.updated_at;
-
-      const snapshotObj = (data.data && typeof data.data === 'object') ? data.data : null;
-      if (!snapshotObj) {
-        console.warn("Snapshot vazio no banco (data).");
-        return;
-      }
-
-      // ✅ aplica SUBSTITUINDO o estado do dia (não reintroduz rotas deletadas por merges)
-      const prevRouteId = this.currentRouteId;
-      this.routes.clear();
-      // não zera de cara: vamos tentar preservar se ainda existir após aplicar o snapshot
-      this.currentRouteId = prevRouteId || null;
-
-      for (const [routeId, ser] of Object.entries(snapshotObj)) {
-        const r = this.deserializeRoute(routeId, ser);
-        this.routes.set(String(routeId), r);
-      }
-
-
-      // ✅ preserva rota selecionada se ainda existir
-      if (this.currentRouteId && !this.routes.has(String(this.currentRouteId))) {
-        this.currentRouteId = null;
-      }
-
-      console.log("✔ Snapshot aplicado do banco:", data.updated_at);
-
-      this.renderRoutesSelects();
-      this.refreshUIFromCurrent();
-      this.renderAcompanhamento();
-
-      // atualiza meta local
-      this.localMeta = this.localMeta || {};
-      this.localMeta.lastRemoteUpdatedAt = data.updated_at;
-
-    } catch (err) {
-      console.error("Falha ao sincronizar do Supabase:", err);
+      console.warn('Falha ao sincronizar do Supabase:', e);
     }
   },
-
 
   getRoutesStateCreateSQL() {
     return `create table if not exists public.routes_state (
   operation_code text not null references public.operations(code) on delete restrict,
   day date not null,
-  snapshot jsonb not null,
+  data jsonb not null,
   updated_at timestamptz not null default now(),
-
+  device_id text,
   primary key (operation_code, day)
 );
 
@@ -435,31 +379,12 @@ create policy "routes_state_update_all"
     const current = this.getOperationCode();
     const exists = (data || []).some(o => o.code === current);
 
-    // se não tem operação salva, escolhe a primeira automaticamente
-    const firstCode = (data && data.length) ? data[0].code : null;
-
     if (!current || !exists) {
-      if (firstCode) {
-        // define um padrão para não ficar undefined
-        this.setOperationCode(firstCode);
-        if (typeof this.currentOperationCode !== 'undefined') {
-          this.currentOperationCode = firstCode;
-        }
-        // já seleciona no dropdown
-        $('#op-select').val(firstCode);
-      }
-
-      // abre modal mesmo assim (pra pessoa confirmar/trocar)
+      // abre modal
       $('#modal-operation').modal({ backdrop: 'static', keyboard: false });
-
     } else {
       this.setOperationCode(current);
-      if (typeof this.currentOperationCode !== 'undefined') {
-        this.currentOperationCode = current;
-      }
-      $('#op-select').val(current);
     }
-
   },
 
 // =======================
@@ -532,11 +457,157 @@ async adminLoadOperations(includeInactive = true) {
     this.setStatus('sincronizado', 'success');
   },
 
+  // =======================
+  // Busca/Auditoria no banco (scan_events)
+  // =======================
+
+  // Retorna o Map de rotas, mesmo se algum trecho tiver setado objeto por engano
+  getRoutesMap() {
+    if (this.routes instanceof Map) return this.routes;
+    const m = new Map();
+    const obj = this.routes || {};
+    Object.keys(obj).forEach(k => m.set(String(k), obj[k]));
+    this.routes = m;
+    return m;
+  },
+
+  // Metadados da rota para salvar/buscar
+  getRouteMeta(routeId) {
+    const rid = routeId != null ? String(routeId) : '';
+    const routesMap = this.getRoutesMap();
+    const r = routesMap.get(rid);
+    if (!r) return { routeId: rid || null, cluster: null, xpt: null };
+    return {
+      routeId: String(r.routeId || rid || '') || null,
+      cluster: r.cluster ? String(r.cluster) : null,
+      xpt: (r.destinationFacilityId != null && r.destinationFacilityId !== '') ? String(r.destinationFacilityId) : null
+    };
+  },
+
+  // Normaliza/gera infos que queremos salvar no banco
+  enrichEventForCloud(evt) {
+    const e = Object.assign({}, evt || {});
+    const meta = this.getRouteMeta(e.currentRouteId);
+    e._meta = meta;
+    return e;
+  },
+
+  // Grava cada bipagem no Supabase (audit trail)
+  // Requer tabela public.scan_events
+  async logScanEventToCloud(evt) {
+    try {
+      const sb = this.getSb();
+      if (!sb) return;
+
+      const op = this.getOperationCode();
+      const dayISO = this.workDay || this.todayLocalISO();
+      if (!op || !dayISO) return;
+
+      const e = this.enrichEventForCloud(evt);
+      const code = this.normalizarCodigo(e.code);
+      if (!code) return;
+
+      // só aceita número
+      if (!/^\d+$/.test(String(code))) return;
+
+      const payload = {
+        operation_code: String(op),
+        day: String(dayISO),
+        package_id: String(code), // no Postgres vira bigint
+        scanned_at: new Date(Number(e.ts || Date.now())).toISOString(),
+        result: String(e.type || '').toLowerCase() || null,
+        route_id: e._meta?.routeId || null,
+        cluster: e._meta?.cluster || null,
+        xpt: e._meta?.xpt || null
+      };
+
+      const { error } = await sb.from('scan_events').insert(payload);
+      if (error) console.warn('Falha ao gravar scan_events:', error);
+    } catch (err) {
+      console.warn('Falha ao gravar scan_events (catch):', err);
+    }
+  },
+
+  // Converte "123; 456, 789\n" -> ['123','456','789'] (dedup)
+  parseIdsList(raw) {
+    const txt = String(raw || '');
+    const parts = txt.split(/[;,\s\n\r\t]+/g).map(s => this.normalizarCodigo(s)).filter(Boolean);
+    const onlyNums = parts.map(p => String(p).replace(/\D+/g, '')).filter(Boolean);
+    return Array.from(new Set(onlyNums));
+  },
+
+  // Busca no banco por lista de IDs
+  async searchScanEventsByIds(idsRaw, opts = {}) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado.');
+
+    const ids = Array.isArray(idsRaw) ? idsRaw.map(String) : this.parseIdsList(idsRaw);
+    if (!ids.length) return [];
+
+    const op = (opts.operation_code || this.getOperationCode() || '').trim().toUpperCase();
+    const dayFrom = opts.day_from ? String(opts.day_from) : null;
+    const dayTo = opts.day_to ? String(opts.day_to) : null;
+
+    const BATCH = 200;
+    const out = [];
+
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const batch = ids.slice(i, i + BATCH);
+
+      let q = sb.from('scan_events')
+        .select('package_id,operation_code,day,scanned_at,route_id,cluster,xpt,result')
+        .in('package_id', batch)
+        .order('scanned_at', { ascending: false });
+
+      if (op) q = q.eq('operation_code', op);
+      if (dayFrom) q = q.gte('day', dayFrom);
+      if (dayTo) q = q.lte('day', dayTo);
+
+      const { data, error } = await q;
+      if (error) throw error;
+      (data || []).forEach(r => out.push(r));
+    }
+
+    out.sort((a, b) => String(b.scanned_at).localeCompare(String(a.scanned_at)));
+    return out;
+  },
+
+  // Render opcional: se existir um <tbody id="db-search-results">, preenche
+  renderDbSearchResults(rows) {
+    const $tb = $('#db-search-results');
+    const $wrap = $('#db-search-results-wrap');
+    if (!$tb.length) return;
+
+    $tb.empty();
+    (rows || []).forEach(r => {
+      const dt = r.scanned_at ? new Date(r.scanned_at) : null;
+      const day = r.day || (dt ? dt.toISOString().slice(0,10) : '');
+      const hhmm = dt ? String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0') : '';
+      $tb.append(`
+        <tr>
+          <td>${r.package_id ?? ''}</td>
+          <td>${r.operation_code ?? ''}</td>
+          <td>${day}</td>
+          <td>${hhmm}</td>
+          <td>${r.route_id ?? ''}</td>
+          <td>${r.cluster ?? ''}</td>
+          <td>${r.xpt ?? ''}</td>
+          <td>${r.result ?? ''}</td>
+        </tr>
+      `);
+    });
+
+    if ($wrap.length) $wrap.removeClass('d-none');
+  },
+
   pushEvent(evt) {
     // evt: {ts, type: 'ok'|'fora'|'dup', code, currentRouteId, correctRouteId}
-    this.lastEvents.unshift(evt);
+    const e = this.enrichEventForCloud(evt);
+    this.lastEvents.unshift(e);
     if (this.lastEvents.length > 80) this.lastEvents.length = 80;
     this.renderAcompanhamento();
+    // grava no banco (não bloqueia a UI)
+    this.logScanEventToCloud(e);
   },
 
   renderAcompanhamento() {
@@ -784,7 +855,6 @@ async adminLoadOperations(includeInactive = true) {
   makeEmptyRoute(routeId) {
     return {
       routeId: String(routeId),
-      createdAt: Date.now(), // usado para decidir se uma rota é 'nova' localmente (offline)
       cluster: '',
       destinationFacilityId: '',
       destinationFacilityName: '',
@@ -819,43 +889,54 @@ async adminLoadOperations(includeInactive = true) {
   // =======================
   // Persistência local (cache por dia)
   // =======================
-
-  // =======================
-  // Persistência local (cache por dia) — MODO HÍBRIDO
-  // - Salva snapshot (para funcionar offline)
-  // - Guarda meta (último snapshot remoto + tombstones de exclusão)
-  // =======================
   loadFromStorage(dayISO) {
     try {
       const key = this.storageKeyForDay(dayISO);
       const raw = localStorage.getItem(key);
-      if (!raw) {
-        // não existe cache para esse dia -> mantém estado vazio
-        return;
-      }
+      if (!raw) return;
 
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== 'object') return;
 
-      // Compatibilidade:
-      // - formato antigo: { [routeId]: serializedRoute }
-      // - formato novo: { meta: {...}, data: { [routeId]: serializedRoute } }
-      const meta = parsed.meta && typeof parsed.meta === 'object' ? parsed.meta : {};
-      const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
-
-      this.localMeta = {
-        lastRemoteUpdatedAt: meta.lastRemoteUpdatedAt || this.localMeta.lastRemoteUpdatedAt || null,
-        deletedRoutes: meta.deletedRoutes && typeof meta.deletedRoutes === 'object'
-          ? meta.deletedRoutes
-          : (this.localMeta.deletedRoutes || {}),
-      };
-
-      // Carrega SUBSTITUINDO o estado local (evita ressuscitar rotas antigas via merges)
       this.routes.clear();
       this.currentRouteId = null;
 
-      for (const [routeId, ser] of Object.entries(data)) {
-        const route = this.deserializeRoute(routeId, ser);
+      for (const [routeId, r] of Object.entries(parsed)) {
+        const route = this.makeEmptyRoute(routeId);
+
+        route.cluster = r.cluster || '';
+        route.destinationFacilityId = r.destinationFacilityId || '';
+        route.destinationFacilityName = r.destinationFacilityName || '';
+        route.totalInicial = Number(r.totalInicial || 0);
+
+        route.plateKey = r.plateKey || '';
+        route.plateRaw = r.plateRaw || '';
+        route.plateLicense = r.plateLicense || '';
+        route.routeQrKey = r.routeQrKey || '';
+        route.routeQrRaw = r.routeQrRaw || '';
+
+    route.plateScanTs = Number(r.plateScanTs || 0);
+    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
+
+    
+    route.plateScanTs = Number(r.plateScanTs || 0);
+    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
+
+    
+
+        (r.ids || []).forEach(id => route.ids.add(id));
+        (r.conferidos || []).forEach(id => route.conferidos.add(id));
+        (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
+        route.faltantes = new Set(r.faltantes || []);
+
+        route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [k, v]));
+        route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, v]));
+
+        if (!route.faltantes.size && route.ids.size) {
+          route.faltantes = new Set(route.ids);
+          for (const c of route.conferidos) route.faltantes.delete(c);
+        }
+
         this.routes.set(String(routeId), route);
       }
     } catch (e) {
@@ -863,24 +944,15 @@ async adminLoadOperations(includeInactive = true) {
     }
   },
 
-  saveToStorage(dayISO, opts = { markCloudDirty: true }) {
+  saveToStorage(dayISO) {
     try {
       const key = this.storageKeyForDay(dayISO);
-      const data = {};
+      const obj = {};
       for (const [routeId, r] of this.routes.entries()) {
-        data[routeId] = this.serializeRoute(r);
+        obj[routeId] = this.serializeRoute(r);
       }
-
-      const payload = {
-        meta: {
-          lastRemoteUpdatedAt: this.localMeta?.lastRemoteUpdatedAt || null,
-          deletedRoutes: this.localMeta?.deletedRoutes || {},
-        },
-        data
-      };
-
-      localStorage.setItem(key, JSON.stringify(payload));
-      if (opts && opts.markCloudDirty) this.markCloudDirty();
+      localStorage.setItem(key, JSON.stringify(obj));
+      this.markCloudDirty();
     } catch (e) {
       console.warn('Falha ao salvar storage:', e);
     }
@@ -893,7 +965,6 @@ async adminLoadOperations(includeInactive = true) {
       destinationFacilityId: r.destinationFacilityId,
       destinationFacilityName: r.destinationFacilityName,
       totalInicial: r.totalInicial,
-      createdAt: Number(r.createdAt || 0),
 
       plateKey: r.plateKey || '',
       plateRaw: r.plateRaw || '',
@@ -921,7 +992,6 @@ async adminLoadOperations(includeInactive = true) {
     route.destinationFacilityId = r.destinationFacilityId || '';
     route.destinationFacilityName = r.destinationFacilityName || '';
     route.totalInicial = Number(r.totalInicial || 0);
-    route.createdAt = Number(r.createdAt || route.createdAt || 0) || Date.now();
 
     route.plateKey = r.plateKey || '';
     route.plateRaw = r.plateRaw || '';
@@ -987,11 +1057,6 @@ async applyWorkDay(dayISO) {
   const op = this.getOperationCode();
   if (op) $('#op-badge').text(op);
 
-  // 0) reseta estado do dia (evita "todos os dias iguais" quando não há cache local)
-  this.routes.clear();
-  this.currentRouteId = null;
-  this.localMeta = { lastRemoteUpdatedAt: null, deletedRoutes: {} };
-
   // 1) sempre começa pelo cache local do dia
   this.loadFromStorage(dayISO);
 
@@ -1007,20 +1072,6 @@ async applyWorkDay(dayISO) {
 
   if (op) this.setStatus(`dia carregado • ${op} • ${dayISO}`, 'success');
   else this.setStatus('dia carregado (sem operação)', 'warning');
-
-  if (this._pollTimer) clearInterval(this._pollTimer);
-
-  this._pollTimer = setInterval(async () => {
-    try {
-      // só sincroniza se tiver operação e dia definidos
-      const _op = this.getOperationCode?.();
-      if (!_op || !this.workDay) return;
-// puxa do Supabase e aplica se mudou
-      await this.syncFromSupabaseForDay(this.workDay);
-    } catch (e) {
-      console.warn("poll sync falhou:", e);
-    }
-  }, 2000);
 },
 
 
@@ -1053,7 +1104,6 @@ async applyWorkDay(dayISO) {
     $('#initial-interface').removeClass('d-none');
   },
 
-  
   computeSnapshotStats(snapshotObj) {
     // snapshotObj: { routeId: serializedRoute, ... }
     const routes = snapshotObj && typeof snapshotObj === 'object' ? Object.values(snapshotObj) : [];
@@ -1090,7 +1140,7 @@ async applyWorkDay(dayISO) {
     const tasks = (ops || []).map(async (o) => {
       const code = String(o.code || '').toUpperCase();
       const row = await this.supaLoadDaySnapshot(code, dayISO).catch(() => null);
-      const stats = this.computeSnapshotStats(row && row.snapshot ? row.snapshot : {});
+      const stats = this.computeSnapshotStats(row && row.data ? row.data : {});
       return {
         code,
         name: o.name || '',
@@ -1160,10 +1210,6 @@ async applyWorkDay(dayISO) {
     const $sel1 = $('#saved-routes');
     const $sel2 = $('#saved-routes-inapp');
 
-
-    // ✅ preserva seleção anterior (evita “desselecionar” a cada sync)
-    const prevSelected = this.currentRouteId || $sel1.val() || $sel2.val() || null;
-
     const routesSorted = Array.from(this.routes.values())
       .sort((a, b) => String(a.routeId).localeCompare(String(b.routeId)));
 
@@ -1192,16 +1238,9 @@ async applyWorkDay(dayISO) {
     // Select "Trocar rota" (com filtro por cluster)
     this.applyRouteDropdownFilter($('#route-search').val() || '');
 
-    // ✅ restaura seleção (preferindo o que estava selecionado antes do re-render)
-    const candidate = prevSelected ? String(prevSelected) : (this.currentRouteId ? String(this.currentRouteId) : '');
-    if (candidate && this.routes && this.routes.has(candidate)) {
-      this.currentRouteId = candidate;
-      $sel1.val(candidate);
-      // $sel2 é definido dentro do filtro (se estiver visível na lista filtrada)
-      this.applyRouteDropdownFilter($('#route-search').val() || '');
-    } else if (this.currentRouteId) {
-      // fallback para comportamento antigo
+    if (this.currentRouteId) {
       $sel1.val(this.currentRouteId);
+      // o $sel2 é definido dentro do filtro (se estiver visível na lista filtrada)
     }
   },
 
@@ -1313,10 +1352,7 @@ async applyWorkDay(dayISO) {
 
   deleteRoute(routeId) {
     if (!routeId) return;
-    const rid = String(routeId);
-    // tombstone (para não ressuscitar ao voltar do offline)
-    try { this.localMeta.deletedRoutes[rid] = Date.now(); } catch (_) {}
-    this.routes.delete(rid);
+    this.routes.delete(String(routeId));
     if (this.currentRouteId === String(routeId)) this.currentRouteId = null;
 
     // cache local (rápido)
@@ -1872,17 +1908,6 @@ this.saveToStorage(this.workDay);
 
     const correctRouteId = this.findCorrectRouteForId(codigo);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
-    if (isCorrectHere) {
-      // 1) se por algum motivo ele ficou "fora de rota" aqui, destrava
-      r.foraDeRota.delete(codigo);
-
-      // 2) remove o código de todas as outras rotas (inclusive da rota errada)
-      this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
-
-      // 3) opcional: se duplicados por rota forem um Map/Set, limpe também
-      if (r.duplicados?.has?.(codigo)) r.duplicados.delete(codigo);
-    }
-
 
     if (isCorrectHere) {
       this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
@@ -2469,6 +2494,7 @@ $('#extract-btn').click(() => {
   // ✅ limpa o campo após importar
   $('#html-input').val('');
 
+  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
 // Carregar rota
@@ -2799,19 +2825,6 @@ async function refreshAdminOps() {
   }
 }
 
-$('#op-select').on('change', async () => {
-  const code = $('#op-select').val();
-  this.setOperationCode(code);
-  if (typeof this.currentOperationCode !== 'undefined') {
-    this.currentOperationCode = code;
-  }
-
-  // aplica dia atual/selecionado e já puxa do banco
-  const day = this.workDay || this.todayLocalISO();
-  await this.applyWorkDay(day);
-});
-
-
 $(document).on('click', '#btn-admin-login', async () => {
   const email = $('#admin-email').val();
   const pass = $('#admin-pass').val();
@@ -2888,3 +2901,4 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
+
