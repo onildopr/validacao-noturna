@@ -1,7 +1,11 @@
 const { jsPDF } = window.jspdf || {};
 
 const SYNC_INTERVAL_MS = 1000;
-const AUTO_SAVE_INTERVAL_MS = 1000; // 2 min
+const AUTO_SAVE_INTERVAL_MS = 1000;
+
+// Prefixo de chaves no localStorage (separa por operação e por dia)
+const STORAGE_KEY_PREFIX = 'conferencia.routes.v3';
+ // 2 min
 
 
 const ConferenciaApp = {
@@ -163,11 +167,25 @@ const ConferenciaApp = {
   // Tabela esperada: routes_state(operation_code text, day date, data jsonb, updated_at timestamptz, device_id text)
   // =======================
   getSb() {
-    // tenta usar client já criado no HTML; se não existir, tenta criar com config global (SB_URL/SB_ANON)
+    // tenta usar client já criado no HTML; se não existir, cria com config global (SB_URL/SB_ANON)
     if (window.sbClient) return window.sbClient;
+
     if (window.supabase && window.SB_URL && window.SB_ANON) {
       try {
-        window.sbClient = window.supabase.createClient(window.SB_URL, window.SB_ANON);
+        const url = window.SB_URL;
+        const key = window.SB_ANON;
+
+        // Força headers para evitar "Invalid API key" quando algum trecho sobrescreve config.
+        window.sbClient = window.supabase.createClient(url, key, {
+          auth: { persistSession: false },
+          global: {
+            headers: {
+              apikey: key,
+              Authorization: `Bearer ${key}`,
+            },
+          },
+        });
+
         return window.sbClient;
       } catch (e) {
         console.warn('Falha ao criar Supabase client automaticamente:', e);
@@ -249,6 +267,9 @@ const ConferenciaApp = {
       this.cloudDirty = false;
       this.cloudLastSaveAt = Date.now();
       this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
+      // ✅ Se salvou no banco com sucesso, limpa o indicador local de pendência
+      this.dirty = false;
+      $('#dirty-flag').addClass('d-none');
     } finally {
       this.cloudSaving = false;
     }
@@ -379,6 +400,11 @@ create policy "routes_state_update_all"
     const current = this.getOperationCode();
     const exists = (data || []).some(o => o.code === current);
 
+    // mantém o select alinhado ao valor salvo
+    if ($sel.length && current && exists) {
+      $sel.val(current);
+    }
+
     if (!current || !exists) {
       // abre modal
       $('#modal-operation').modal({ backdrop: 'static', keyboard: false });
@@ -471,6 +497,83 @@ async adminLoadOperations(includeInactive = true) {
     return m;
   },
 
+  // Status local (no dia carregado) caso o ID não exista no banco
+  getLocalStatusForId(idRaw) {
+    const id = String(idRaw || '').trim();
+    if (!id) return null;
+
+    for (const r of this.routes.values()) {
+      const rid = String(r.routeId || '');
+      const cl = r.cluster ? String(r.cluster).trim() : '';
+      const xpt = (r.destinationFacilityId != null && r.destinationFacilityId !== '') ? String(r.destinationFacilityId) : '';
+
+      if (r.conferidos?.has(id)) return { where: 'local', status: 'conferido', route_id: rid, cluster: cl, xpt };
+      if (r.foraDeRota?.has(id)) return { where: 'local', status: 'fora', route_id: rid, cluster: cl, xpt };
+      if (r.duplicados?.has(id)) return { where: 'local', status: 'duplicado', route_id: rid, cluster: cl, xpt };
+      if (r.faltantes?.has(id)) return { where: 'local', status: 'faltante', route_id: rid, cluster: cl, xpt };
+      if (r.ids?.has(id)) return { where: 'local', status: 'pertence', route_id: rid, cluster: cl, xpt };
+    }
+
+    return null;
+  },
+
+  // Busca completa: histórico no banco + fallback de status local
+  async searchIdsFull(idsRaw, opts = {}) {
+    const ids = Array.isArray(idsRaw) ? idsRaw.map(String) : this.parseIdsList(idsRaw);
+    if (!ids.length) return { ids: [], rows: [], summary: [] };
+
+    const rows = await this.searchScanEventsByIds(ids, opts);
+
+    // agrupa eventos por ID
+    const byId = new Map(); // id -> { id, events:[], ops:Set, last:null, local:null }
+    for (const id of ids) {
+      byId.set(id, { id, events: [], ops: new Set(), last: null, local: null });
+    }
+
+    for (const r of rows) {
+      const pid = String(r.package_id ?? '');
+      if (!byId.has(pid)) continue;
+
+      const ref = byId.get(pid);
+      ref.events.push(r);
+      if (r.operation_code) ref.ops.add(String(r.operation_code));
+    }
+
+    // monta resumo: último evento + ops envolvidas + status local se não houver evento
+    const summary = [];
+    for (const id of ids) {
+      const ref = byId.get(id);
+      const last = (ref.events && ref.events.length) ? ref.events[0] : null;
+      const local = !last ? this.getLocalStatusForId(id) : null;
+
+      ref.last = last;
+      ref.local = local;
+
+      summary.push({
+        id,
+        // último do banco
+        last_seen_at: last ? last.scanned_at : null,
+        last_operation: last ? last.operation_code : null,
+        last_day: last ? last.day : null,
+        last_route_id: last ? last.route_id : null,
+        last_cluster: last ? last.cluster : null,
+        last_xpt: last ? last.xpt : null,
+        last_result: last ? last.result : null,
+
+        operations: Array.from(ref.ops),
+
+        // fallback local
+        local_status: local ? local.status : null,
+        local_route_id: local ? local.route_id : null,
+        local_cluster: local ? local.cluster : null,
+        local_xpt: local ? local.xpt : null,
+
+        has_db_history: !!last
+      });
+    }
+
+    return { ids, rows, summary };
+  },
   // Metadados da rota para salvar/buscar
   getRouteMeta(routeId) {
     const rid = routeId != null ? String(routeId) : '';
@@ -537,6 +640,7 @@ async adminLoadOperations(includeInactive = true) {
   },
 
   // Busca no banco por lista de IDs
+// Busca no banco por lista de IDs (GLOBAL por padrão)
   async searchScanEventsByIds(idsRaw, opts = {}) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado.');
@@ -544,7 +648,10 @@ async adminLoadOperations(includeInactive = true) {
     const ids = Array.isArray(idsRaw) ? idsRaw.map(String) : this.parseIdsList(idsRaw);
     if (!ids.length) return [];
 
-    const op = (opts.operation_code || this.getOperationCode() || '').trim().toUpperCase();
+    // ✅ GLOBAL por padrão:
+    // - só filtra por operação se opts.operation_code vier preenchido
+    const op = (opts.operation_code ? String(opts.operation_code) : '').trim().toUpperCase();
+
     const dayFrom = opts.day_from ? String(opts.day_from) : null;
     const dayTo = opts.day_to ? String(opts.day_to) : null;
 
@@ -599,7 +706,43 @@ async adminLoadOperations(includeInactive = true) {
 
     if ($wrap.length) $wrap.removeClass('d-none');
   },
+  renderDbSearchSummary(summaryRows) {
+    const $tb = $('#db-search-results');
+    const $wrap = $('#db-search-results-wrap');
+    if (!$tb.length) return;
 
+    $tb.empty();
+
+    (summaryRows || []).forEach(r => {
+      const dt = r.last_seen_at ? new Date(r.last_seen_at) : null;
+      const day = r.last_day || (dt ? dt.toISOString().slice(0,10) : '');
+      const hhmm = dt ? String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0') : '';
+
+      const ops = (r.operations && r.operations.length) ? r.operations.join(',') : '';
+      const status = r.has_db_history
+        ? (r.last_result || '')
+        : (r.local_status ? `local:${r.local_status}` : 'sem histórico');
+
+      const routeId = r.has_db_history ? (r.last_route_id ?? '') : (r.local_route_id ?? '');
+      const cluster = r.has_db_history ? (r.last_cluster ?? '') : (r.local_cluster ?? '');
+      const xpt = r.has_db_history ? (r.last_xpt ?? '') : (r.local_xpt ?? '');
+
+      $tb.append(`
+        <tr>
+          <td>${r.id}</td>
+          <td>${r.has_db_history ? (r.last_operation ?? '') : ''}</td>
+          <td>${day}</td>
+          <td>${hhmm}</td>
+          <td>${routeId}</td>
+          <td>${cluster}</td>
+          <td>${xpt}</td>
+          <td>${status} ${ops ? `<small class="text-muted">(${ops})</small>` : ''}</td>
+        </tr>
+      `);
+    });
+
+    if ($wrap.length) $wrap.removeClass('d-none');
+  },
   pushEvent(evt) {
     // evt: {ts, type: 'ok'|'fora'|'dup', code, currentRouteId, correctRouteId}
     const e = this.enrichEventForCloud(evt);
@@ -1048,6 +1191,10 @@ async adminLoadOperations(includeInactive = true) {
   // =======================
   
 async applyWorkDay(dayISO) {
+  // troca de dia sempre reinicia o estado em memória (evita misturar dias/operações)
+  this.routes.clear();
+  this.currentRouteId = null;
+
   this.workDay = dayISO;
   $('#work-day').val(dayISO);
 
@@ -2409,6 +2556,47 @@ getIdsForExportByTimestamp(r) {
 // =======================
 
 $(document).ready(async () => {
+
+  // ===== Pesquisa de IDs no Banco (Histórico) =====
+  $(document).on('click', '#db-search-open', () => {
+    $('#initial-interface').addClass('d-none');
+    $('#db-search-interface').removeClass('d-none');
+    $('#db-search-results-wrap').addClass('d-none');
+  });
+
+  $(document).on('click', '#db-search-back', () => {
+    $('#db-search-interface').addClass('d-none');
+    $('#db-search-results-wrap').addClass('d-none');
+    $('#initial-interface').removeClass('d-none');
+  });
+
+  $(document).on('click', '#db-search-btn', async () => {
+    try {
+      const rawIds = ($('#db-ids').val() || '').trim();
+      if (!rawIds) { alert('Informe pelo menos um ID.'); return; }
+
+      const dayFrom = ($('#db-day-from').val() || '').trim() || undefined;
+      const dayTo = ($('#db-day-to').val() || '').trim() || undefined;
+      const op = ($('#db-op-filter').val() || '').trim() || undefined;
+
+      ConferenciaApp.setStatus('Buscando histórico no banco...', 'info');
+
+      const res = await ConferenciaApp.searchIdsFull(rawIds, {
+        operation_code: op,
+        day_from: dayFrom,
+        day_to: dayTo
+      });
+
+      ConferenciaApp.renderDbSearchSummary(res.summary);
+      ConferenciaApp.setStatus(`Busca concluída • ${res.summary.length} ID(s)`, 'success');
+    } catch (e) {
+      console.error(e);
+      ConferenciaApp.setStatus('Erro ao buscar histórico.', 'danger');
+      alert('Erro na busca: ' + (e?.message || e));
+    }
+  });
+
+
   const today = ConferenciaApp.todayLocalISO();
   $('#work-day').val(today);
 
@@ -2493,6 +2681,8 @@ $('#extract-btn').click(() => {
 
   // ✅ limpa o campo após importar
   $('#html-input').val('');
+
+  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
 // Carregar rota
@@ -2899,5 +3089,4 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
-
 
