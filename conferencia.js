@@ -8,6 +8,8 @@ const STORAGE_KEY_PREFIX = 'conferencia.routes.v3';
  // 2 min
 
 
+
+
 const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
   currentRouteId: null,
@@ -23,6 +25,7 @@ const ConferenciaApp = {
   cloudPullGraceMs: 2000,
   workDay: null,               // YYYY-MM-DD
   lastEvents: [],            // log simples de bipagens (últimos eventos)
+  deletedRoutes: new Map(), // routeId -> ts (epoch ms)
 
   // =======================
   // Carretas (Placa -> Rotas QR)
@@ -199,6 +202,9 @@ const ConferenciaApp = {
     for (const [routeId, r] of this.routes.entries()) {
       obj[routeId] = this.serializeRoute(r);
     }
+    obj.__meta = {
+      deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map())
+    };
     return obj;
   },
 
@@ -244,6 +250,7 @@ const ConferenciaApp = {
       });
     }, 1200);
   },
+  
 
   async flushCloudSave() {
     if (!this.cloudEnabled) return;
@@ -276,11 +283,27 @@ const ConferenciaApp = {
   },
 
   mergeSnapshotIntoLocal(snapshotObj) {
+    // 0) aplica deletados do snapshot remoto
+    const remoteDel = snapshotObj?.__meta?.deletedRoutes || {};
+    for (const [rid, ts] of Object.entries(remoteDel)) {
+      const id = String(rid);
+      const t = Number(ts || 0);
+      const cur = Number(this.deletedRoutes?.get(id) || 0);
+      if (!this.deletedRoutes) this.deletedRoutes = new Map();
+      if (t > cur) this.deletedRoutes.set(id, t);
+    }
+
+    // Se está deletada localmente (tombstone), garante que não exista na memória
+    for (const [rid] of (this.deletedRoutes || new Map()).entries()) {
+      this.routes.delete(String(rid));
+    }
     // snapshotObj: { [routeId]: serializedRoute }
     if (!snapshotObj || typeof snapshotObj !== 'object') return;
 
     for (const [routeId, ser] of Object.entries(snapshotObj)) {
       const id = String(routeId);
+      if (id === '__meta') continue;
+      if (this.deletedRoutes?.has(id)) continue; // ✅ não ressuscita rota deletada
       const existing = this.routes.get(id);
 
       if (!existing) {
@@ -1039,13 +1062,15 @@ async adminLoadOperations(includeInactive = true) {
       if (!raw) return;
 
       const parsed = JSON.parse(raw);
+      this.deletedRoutes = new Map(Object.entries(parsed?.__meta?.deletedRoutes || {}).map(([k,v]) => [String(k), Number(v||0)]));
       if (!parsed || typeof parsed !== 'object') return;
 
       this.routes.clear();
       this.currentRouteId = null;
 
       for (const [routeId, r] of Object.entries(parsed)) {
-        const route = this.makeEmptyRoute(routeId);
+        if (routeId === '__meta') continue;                 // ✅ ignora meta
+        if (this.deletedRoutes.has(String(routeId))) continue; // ✅ não carrega rota deletada
 
         route.cluster = r.cluster || '';
         route.destinationFacilityId = r.destinationFacilityId || '';
@@ -1094,6 +1119,9 @@ async adminLoadOperations(includeInactive = true) {
       for (const [routeId, r] of this.routes.entries()) {
         obj[routeId] = this.serializeRoute(r);
       }
+      obj.__meta = {
+        deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map())
+      };
       localStorage.setItem(key, JSON.stringify(obj));
       this.markCloudDirty();
     } catch (e) {
@@ -1499,10 +1527,17 @@ async applyWorkDay(dayISO) {
 
   deleteRoute(routeId) {
     if (!routeId) return;
-    this.routes.delete(String(routeId));
-    if (this.currentRouteId === String(routeId)) this.currentRouteId = null;
+    const rid = String(routeId);
 
-    // cache local (rápido)
+    // ✅ tombstone
+    if (!this.deletedRoutes) this.deletedRoutes = new Map();
+    this.deletedRoutes.set(rid, Date.now());
+
+    // remove da memória
+    this.routes.delete(rid);
+    if (this.currentRouteId === rid) this.currentRouteId = null;
+
+    // persiste
     this.saveToStorage(this.workDay);
     this.markDirty('excluir rota');
 
@@ -1512,6 +1547,11 @@ async applyWorkDay(dayISO) {
   },
 
   clearAllRoutes() {
+    if (!this.deletedRoutes) this.deletedRoutes = new Map();
+    const now = Date.now();
+    for (const rid of this.routes.keys()) {
+      this.deletedRoutes.set(String(rid), now);
+    }
     this.routes.clear();
     this.currentRouteId = null;
 
@@ -2681,6 +2721,8 @@ $('#extract-btn').click(() => {
 
   // ✅ limpa o campo após importar
   $('#html-input').val('');
+
+  alert(`${qtd} rota(s) importada(s) e salva(s)! Agora selecione e clique em "Carregar rota".`);
 });
 
 // Carregar rota
@@ -3087,5 +3129,4 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
-
 
