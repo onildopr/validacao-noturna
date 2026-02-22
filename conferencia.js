@@ -2197,12 +2197,32 @@ this.saveToStorage(this.workDay);
 
     const correctRouteId = this.findCorrectRouteForId(codigo);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
-
     if (isCorrectHere) {
+      // Se o ID pertence a esta rota, garante que ele fique como CONFERIDO aqui,
+      // mesmo que (por algum motivo) ele não esteja mais em "faltantes".
+      if (!r.conferidos.has(codigo)) {
+        if (r.faltantes && r.faltantes.has(codigo)) r.faltantes.delete(codigo);
+        if (r.foraDeRota && r.foraDeRota.has(codigo)) r.foraDeRota.delete(codigo);
+        r.conferidos.add(codigo);
+        r.timestamps.set(codigo, now);
+
+        // limpa marcações "fora/dup" em outras rotas e remove timestamps inúteis
+        this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
+
+        $('#barcode-input').val('').focus();
+        this.pushEvent({ ts: now, type: 'ok', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
+        this.markDirty('bipagem');
+
+        this.saveToStorage(this.workDay);
+        this.atualizarListas();
+        return;
+      }
+
+      // já conferido aqui -> deixa cair na regra de duplicado abaixo
       this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
     }
 
-    // duplicata se já conferido OU já fora de rota nessa rota
+// duplicata se já conferido OU já fora de rota nessa rota
     if (r.conferidos.has(codigo) || r.foraDeRota.has(codigo)) {
       const count = r.duplicados.get(codigo) || 1;
       r.duplicados.set(codigo, count + 1);
@@ -3192,9 +3212,6 @@ $(document).on('click', '#btn-admin-save-op', async () => {
   }
 });
 
-
-
-
 // Abrir acompanhamento geral (todas operações)
 $(document).on('click', '#btn-global-acomp', async () => {
   try {
@@ -3230,9 +3247,6 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
-
-
-
 // encerra canal realtime ao sair da página
 window.addEventListener('beforeunload', () => {
   try { ConferenciaApp.stopRealtimeSync(); } catch {}
