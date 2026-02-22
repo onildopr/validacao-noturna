@@ -26,6 +26,7 @@ const ConferenciaApp = {
   workDay: null,               // YYYY-MM-DD
   lastEvents: [],            // log simples de bipagens (últimos eventos)
   deletedRoutes: new Map(), // routeId -> ts (epoch ms)
+  revivedRoutes: new Map(), // routeId -> ts (epoch ms) (desfaz exclusão)
 
   // ===== Realtime sync (Supabase) =====
   rtChannel: null,
@@ -305,7 +306,8 @@ async startRealtimeSync(dayISO) {
       obj[routeId] = this.serializeRoute(r);
     }
     obj.__meta = {
-      deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map())
+      deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map()),
+      revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map())
     };
     return obj;
   },
@@ -393,6 +395,21 @@ async startRealtimeSync(dayISO) {
       const cur = Number(this.deletedRoutes?.get(id) || 0);
       if (!this.deletedRoutes) this.deletedRoutes = new Map();
       if (t > cur) this.deletedRoutes.set(id, t);
+    }
+
+    // 0.5) aplica "revive" do snapshot remoto (permite reimportar rota excluída)
+    const remoteRev = snapshotObj?.__meta?.revivedRoutes || {};
+    for (const [rid, ts] of Object.entries(remoteRev)) {
+      const id = String(rid);
+      const t = Number(ts || 0);
+      const del = Number(this.deletedRoutes?.get(id) || 0);
+      if (!this.revivedRoutes) this.revivedRoutes = new Map();
+      const curRev = Number(this.revivedRoutes.get(id) || 0);
+      if (t > curRev) this.revivedRoutes.set(id, t);
+      if (t > del) {
+        // revive se o reviveAt é mais novo que o deleteAt
+        this.deletedRoutes?.delete(id);
+      }
     }
 
     // Se está deletada localmente (tombstone), garante que não exista na memória
@@ -1165,6 +1182,13 @@ async adminLoadOperations(includeInactive = true) {
 
       const parsed = JSON.parse(raw);
       this.deletedRoutes = new Map(Object.entries(parsed?.__meta?.deletedRoutes || {}).map(([k,v]) => [String(k), Number(v||0)]));
+      this.revivedRoutes = new Map(Object.entries(parsed?.__meta?.revivedRoutes || {}).map(([k,v]) => [String(k), Number(v||0)]));
+
+      // ✅ se uma rota foi reimportada após exclusão, revive (revivedAt > deletedAt)
+      for (const [rid, rts] of (this.revivedRoutes || new Map()).entries()) {
+        const delTs = Number(this.deletedRoutes?.get(rid) || 0);
+        if (Number(rts || 0) > delTs) this.deletedRoutes.delete(rid);
+      }
       if (!parsed || typeof parsed !== 'object') return;
 
       this.routes.clear();
@@ -1217,7 +1241,8 @@ async adminLoadOperations(includeInactive = true) {
         obj[routeId] = this.serializeRoute(r);
       }
       obj.__meta = {
-        deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map())
+        deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map()),
+        revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map())
       };
       localStorage.setItem(key, JSON.stringify(obj));
       this.markCloudDirty();
@@ -1633,7 +1658,9 @@ async applyWorkDay(dayISO) {
 
     // ✅ tombstone
     if (!this.deletedRoutes) this.deletedRoutes = new Map();
-    this.deletedRoutes.set(rid, Date.now());
+    const now = Date.now();
+    this.deletedRoutes.set(rid, now);
+    if (this.revivedRoutes) this.revivedRoutes.delete(rid);
 
     // remove da memória
     this.routes.delete(rid);
@@ -1653,6 +1680,7 @@ async applyWorkDay(dayISO) {
     const now = Date.now();
     for (const rid of this.routes.keys()) {
       this.deletedRoutes.set(String(rid), now);
+      if (this.revivedRoutes) this.revivedRoutes.delete(String(rid));
     }
     this.routes.clear();
     this.currentRouteId = null;
@@ -2297,6 +2325,12 @@ this.saveToStorage(this.workDay);
       if (!routeMatch) continue;
 
       const routeId = String(routeMatch[1]);
+      // ✅ Se esta rota foi excluída antes, ao importar novamente devemos 'reviver'
+      if (this.deletedRoutes?.has(routeId)) {
+        this.deletedRoutes.delete(routeId);
+        if (!this.revivedRoutes) this.revivedRoutes = new Map();
+        this.revivedRoutes.set(routeId, Date.now());
+      }
       const route = this.routes.get(routeId) || this.makeEmptyRoute(routeId);
 
       const clusterMatch = /"cluster":"([^"]+)"/.exec(block);
@@ -3212,6 +3246,9 @@ $(document).on('click', '#btn-admin-save-op', async () => {
   }
 });
 
+
+
+
 // Abrir acompanhamento geral (todas operações)
 $(document).on('click', '#btn-global-acomp', async () => {
   try {
@@ -3247,6 +3284,9 @@ $(document).on('click', '#global-back', () => {
   $('#global-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 });
+
+
+
 // encerra canal realtime ao sair da página
 window.addEventListener('beforeunload', () => {
   try { ConferenciaApp.stopRealtimeSync(); } catch {}
