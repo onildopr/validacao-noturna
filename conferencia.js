@@ -27,6 +27,11 @@ const ConferenciaApp = {
   lastEvents: [],            // log simples de bipagens (últimos eventos)
   deletedRoutes: new Map(), // routeId -> ts (epoch ms)
 
+  // ===== Realtime sync (Supabase) =====
+  rtChannel: null,
+  rtBound: { op: null, day: null },
+
+
   // =======================
   // Carretas (Placa -> Rotas QR)
   // =======================
@@ -196,6 +201,103 @@ const ConferenciaApp = {
     }
     return null;
   },
+// =======================
+// Realtime (escuta routes_state por operação+dia)
+// =======================
+async stopRealtimeSync() {
+  try {
+    const sb = this.getSb();
+    if (sb && this.rtChannel) {
+      await sb.removeChannel(this.rtChannel);
+    }
+  } catch (e) {
+    console.warn('Falha ao parar realtime:', e);
+  } finally {
+    this.rtChannel = null;
+    this.rtBound = { op: null, day: null };
+  }
+},
+
+async startRealtimeSync(dayISO) {
+  const sb = this.getSb();
+  const op = this.getOperationCode();
+  if (!sb || !op || !dayISO) return;
+
+  // já ligado para este op/dia
+  if (this.rtChannel && this.rtBound && this.rtBound.op === op && this.rtBound.day === dayISO) return;
+
+  // troca de canal => encerra anterior
+  await this.stopRealtimeSync();
+
+  // IMPORTANTE:
+  // Alguns ambientes fecham o canal (status CLOSED) quando usamos múltiplas condições no `filter`.
+  // Para não depender disso, ouvimos a tabela inteira e filtramos aqui no JS.
+  this.rtChannel = sb
+    .channel('routes_state_live')
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'routes_state' },
+      async (payload) => {
+        try {
+          // não puxa enquanto há alterações locais em andamento
+          if (this.cloudDirty) return;
+
+          const row = payload && payload.new;
+          if (!row || !row.data) return;
+
+          // filtra por operação e dia (sem depender do filter do realtime)
+          if (row.operation_code !== op) return;
+          if (row.day !== dayISO) return;
+
+          // ignora eventos gerados por este mesmo dispositivo (evita re-render em loop)
+          if (row.device_id && row.device_id === this.getDeviceId()) return;
+          this.mergeSnapshotIntoLocal(row.data);
+          this.saveToStorage(dayISO);
+
+          // Atualiza UI com debounce (evita travar seleção quando há muitas alterações remotas)
+          if (this._rtUiTimer) clearTimeout(this._rtUiTimer);
+          this._rtUiTimer = setTimeout(() => {
+            try {
+              const keepRouteId = this.currentRouteId;
+              this.renderRoutesSelects();
+              if (keepRouteId && this.routes.has(String(keepRouteId))) {
+                this.currentRouteId = String(keepRouteId);
+              }
+              this.refreshUIFromCurrent();
+              this.renderAcompanhamento();
+              this.setStatus(`Realtime • atualizado • ${op} • ${dayISO}`, 'info');
+            } catch (e) {
+              console.warn('Falha ao renderizar após realtime:', e);
+            }
+          }, 250);
+        } catch (e) {
+          console.warn('Falha ao aplicar realtime payload:', e);
+        }
+      }
+    )
+    .subscribe((status) => {
+      // status comuns: SUBSCRIBED / TIMED_OUT / CHANNEL_ERROR / CLOSED
+      if (status === 'SUBSCRIBED') {
+        this.setStatus(`Realtime ON • ${op} • ${dayISO}`, 'success');
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        this.setStatus(`Realtime instável • ${op} • ${dayISO}`, 'warning');
+      } else if (status === 'CLOSED') {
+        this.setStatus(`Realtime CLOSED • ${op} • ${dayISO}`, 'warning');
+        // tenta religar automaticamente (sem interromper uso)
+        if (this._rtRetryTimer) clearTimeout(this._rtRetryTimer);
+        this._rtRetryTimer = setTimeout(() => {
+          // só religa se ainda estamos no mesmo op/dia
+          if (this.getOperationCode() === op && (this.workDay || this.todayLocalISO()) === dayISO) {
+            this.startRealtimeSync(dayISO).catch(() => {});
+          }
+        }, 2000);
+      }
+      // também loga no console para diagnóstico rápido
+      try { console.log('[Realtime]', status, { op, dayISO }); } catch {}
+    });
+
+  this.rtBound = { op, day: dayISO };
+},
 
   buildDaySnapshotObject() {
     const obj = {};
@@ -1072,6 +1174,8 @@ async adminLoadOperations(includeInactive = true) {
         if (routeId === '__meta') continue;                 // ✅ ignora meta
         if (this.deletedRoutes.has(String(routeId))) continue; // ✅ não carrega rota deletada
 
+        const route = this.makeEmptyRoute(routeId);
+
         route.cluster = r.cluster || '';
         route.destinationFacilityId = r.destinationFacilityId || '';
         route.destinationFacilityName = r.destinationFacilityName || '';
@@ -1082,15 +1186,8 @@ async adminLoadOperations(includeInactive = true) {
         route.plateLicense = r.plateLicense || '';
         route.routeQrKey = r.routeQrKey || '';
         route.routeQrRaw = r.routeQrRaw || '';
-
-    route.plateScanTs = Number(r.plateScanTs || 0);
-    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
-
-    
-    route.plateScanTs = Number(r.plateScanTs || 0);
-    route.routeQrScanTs = Number(r.routeQrScanTs || 0);
-
-    
+        route.plateScanTs = Number(r.plateScanTs || 0);
+        route.routeQrScanTs = Number(r.routeQrScanTs || 0);
 
         (r.ids || []).forEach(id => route.ids.add(id));
         (r.conferidos || []).forEach(id => route.conferidos.add(id));
@@ -1238,6 +1335,9 @@ async applyWorkDay(dayISO) {
   // 2) tenta sincronizar do banco (Supabase) e mesclar no local
   if (op) {
     await this.syncFromSupabaseForDay(dayISO);
+
+    // 2.5) liga realtime para este dia/operação
+    await this.startRealtimeSync(dayISO);
   }
 
   // 3) render
@@ -1253,6 +1353,8 @@ async applyWorkDay(dayISO) {
 
   
   resetForOperationChange() {
+    // encerra realtime da operação/dia anterior
+    this.stopRealtimeSync();
     // limpa estado e força voltar para a tela inicial
     this.routes.clear();
     this.currentRouteId = null;
@@ -2721,6 +2823,7 @@ $('#extract-btn').click(() => {
 
   // ✅ limpa o campo após importar
   $('#html-input').val('');
+
 });
 
 // Carregar rota
@@ -3129,3 +3232,8 @@ $(document).on('click', '#global-back', () => {
 });
 
 
+
+// encerra canal realtime ao sair da página
+window.addEventListener('beforeunload', () => {
+  try { ConferenciaApp.stopRealtimeSync(); } catch {}
+});
