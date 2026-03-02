@@ -171,36 +171,77 @@ const ConferenciaApp = {
     return this.operationCode;
   },
 
-  // =======================
-  // Supabase (snapshot por operação+dia)
-  // Tabela esperada: routes_state(operation_code text, day date, data jsonb, updated_at timestamptz, device_id text)
-  // =======================
+// =======================
+// Supabase: client ÚNICO (não reutiliza window.sbClient de fora)
+// =======================
   getSb() {
-    // tenta usar client já criado no HTML; se não existir, cria com config global (SB_URL/SB_ANON)
-    if (window.sbClient) return window.sbClient;
+    if (window.__confSbClient) return window.__confSbClient;
 
-    if (window.supabase && window.SB_URL && window.SB_ANON) {
-      try {
-        const url = window.SB_URL;
-        const key = window.SB_ANON;
+    if (!window.supabase || !window.SB_URL || !window.SB_ANON) return null;
 
-        // Força headers para evitar "Invalid API key" quando algum trecho sobrescreve config.
-        window.sbClient = window.supabase.createClient(url, key, {
-          auth: { persistSession: false },
-          global: {
-            headers: {
-              apikey: key,
-              Authorization: `Bearer ${key}`,
-            },
-          },
-        });
+    const url = window.SB_URL;
+    const key = window.SB_ANON;
 
-        return window.sbClient;
-      } catch (e) {
-        console.warn('Falha ao criar Supabase client automaticamente:', e);
-      }
+    // ✅ Não defina Authorization manualmente
+    window.__confSbClient = window.supabase.createClient(url, key, {
+      auth: {
+        // ✅ para não “perder” login entre ações (admin modal etc.)
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
+      global: {
+        headers: {
+          apikey: key,
+        },
+      },
+    });
+
+    return window.__confSbClient;
+  },
+
+  // =======================
+  // Admin login (garante que existe sessão de verdade)
+  // =======================
+  async adminSignIn(email, password) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado.');
+
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+    if (error) throw error;
+
+    // ⚠️ Se o Auth exigir confirmação de email, pode vir user sem session
+    if (!data?.session) {
+      throw new Error('Login ok, mas SEM sessão. Confirme o e-mail do usuário no Supabase Auth.');
     }
-    return null;
+
+    return data;
+  },
+
+  // =======================
+  // Admin upsert (verifica autenticação antes de gravar)
+  // =======================
+  async adminUpsertOperation(code, name, active = true) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado.');
+
+    // ✅ Checagem forte: garante que o request vai como authenticated
+    const { data: userData, error: userErr } = await sb.auth.getUser();
+    if (userErr) throw userErr;
+    if (!userData?.user) throw new Error('Você não está autenticado. Faça login admin antes de salvar.');
+
+    const op = {
+      code: String(code || '').trim().toUpperCase(),
+      name: String(name || '').trim() || null,
+      active: !!active,
+    };
+
+    if (!/^[A-Z]{3}\d$/.test(op.code)) {
+      throw new Error('Código inválido. Use 3 letras e 1 número (ex.: ERD1).');
+    }
+
+    const { error } = await sb.from('operations').upsert(op, { onConflict: 'code' });
+    if (error) throw error;
   },
 // =======================
 // Realtime (escuta routes_state por operação+dia)
@@ -1496,11 +1537,15 @@ async applyWorkDay(dayISO) {
   // UI / Rotas
   // =======================
   setCurrentRoute(routeId) {
+    console.log('[setCurrentRoute] versão', '2026-02-22-1');
+    //retira o alert para rotas importadas pela segunda vez pos ser apagadasivelmente, pois a rota pode ter sido deletada e reimportada (revived) e nesse caso queremos permitir acessar normalmente
+
     const id = String(routeId);
     if (!this.routes.has(id)) {
       alert('Rota não encontrada.');
       return;
     }
+    
     this.currentRouteId = id;
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
@@ -2363,7 +2408,9 @@ this.saveToStorage(this.workDay);
       route.totalInicial = route.ids.size;
       this.routes.set(routeId, route);
       imported++;
+      
     }
+    
 
     this.saveToStorage(this.workDay);
 
@@ -2371,7 +2418,17 @@ this.saveToStorage(this.workDay);
 
     this.renderRoutesSelects();
     this.renderAcompanhamento();
+    // garante que rota importada fica ativa
+    if (imported) this.currentRouteId = String(this.routes.keys().next().value);
+    this.refreshUIFromCurrent();
+    // retira o alerta de rota não encontrada ao trocar de rota, caso a rota importada seja a ativa
+    $('#route-not-found-alert').hide();
+    
+    this.atualizarListas();
+
     return imported;
+    
+    
   },
 
   // =======================
