@@ -5,10 +5,6 @@ const AUTO_SAVE_INTERVAL_MS = 1000;
 
 // Prefixo de chaves no localStorage (separa por operação e por dia)
 const STORAGE_KEY_PREFIX = 'conferencia.routes.v3';
- // 2 min
-
-
-
 
 const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
@@ -24,14 +20,13 @@ const ConferenciaApp = {
   lastLocalMutationAt: 0,
   cloudPullGraceMs: 2000,
   workDay: null,               // YYYY-MM-DD
-  lastEvents: [],            // log simples de bipagens (últimos eventos)
-  deletedRoutes: new Map(), // routeId -> ts (epoch ms)
-  revivedRoutes: new Map(), // routeId -> ts (epoch ms) (desfaz exclusão)
+  lastEvents: [],              // log simples de bipagens (últimos eventos)
+  deletedRoutes: new Map(),    // routeId -> ts (epoch ms)
+  revivedRoutes: new Map(),    // routeId -> ts (epoch ms) (desfaz exclusão)
 
   // ===== Realtime sync (Supabase) =====
   rtChannel: null,
   rtBound: { op: null, day: null },
-
 
   // =======================
   // Carretas (Placa -> Rotas QR)
@@ -43,7 +38,26 @@ const ConferenciaApp = {
     routesRaw: new Map(),     // routeKey -> rawText
     routesJson: new Map(),    // routeKey -> jsonText (para export)
     routesTs: new Map(),      // routeKey -> tsScan
+  },
 
+  // ===== Lock da UI de seleção de rotas =====
+  routeUiLockUntil: 0,
+  isRouteDropdownOpen: false,
+  lastRoutesSignature: '',
+
+  lockRouteUi(ms = 2500) {
+    this.routeUiLockUntil = Date.now() + ms;
+  },
+
+  isRouteUiLocked() {
+    return this.isRouteDropdownOpen || Date.now() < (this.routeUiLockUntil || 0);
+  },
+
+  getRoutesSignature() {
+    return Array.from(this.routes.values())
+      .map(r => `${r.routeId}|${r.cluster || ''}|${r.destinationFacilityId || ''}`)
+      .sort()
+      .join('||');
   },
 
   // =======================
@@ -55,38 +69,31 @@ const ConferenciaApp = {
     return String(v ?? '')
       .trim()
       .toUpperCase()
-      // remove acentos
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
-      // mantém letras/números/_/- e remove o resto (inclusive { } ^ espaços e caracteres estranhos)
       .replace(/[^\w\-]+/g, '');
   },
 
   pad2(n) { return String(n).padStart(2, '0'); },
 
   todayLocalISO() {
-    // Sempre calcula o "dia" no fuso de Rondônia, mesmo se o PC estiver com outro fuso
     const fmt = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'America/Porto_Velho',
       year: 'numeric',
       month: '2-digit',
       day: '2-digit'
     });
-    return fmt.format(new Date()); // YYYY-MM-DD
+    return fmt.format(new Date());
   },
 
   monthKeyFromDay(dayISO) {
-    // "2026-01"
     return String(dayISO || '').slice(0, 7);
   },
 
   normalizeCaretKey(k) {
     const key = String(k || '').trim().toLowerCase();
-
-    // remove acentos
     const noAcc = key.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
-    // mapeia variações comuns
     if (noAcc === 'assignment' || noAcc === 'assigment' || noAcc === 'asssignment') return 'assignment';
     if (noAcc === 'license_plate') return 'license_plate';
     if (noAcc === 'carrier_name') return 'carrier_name';
@@ -100,29 +107,20 @@ const ConferenciaApp = {
   },
 
   parseCaretKV(raw) {
-    // pega só a parte antes de "Placa" / "Rota" (se existir)
     const cleaned = String(raw || '').replace(/\r/g, '').trim();
     const first = cleaned.split('\n')[0].trim();
 
     const kv = {};
-
-    // separa por vírgula e tenta pegar pares "chave^Çvalor"
     const tokens = first.split(',').map(t => t.trim()).filter(Boolean);
 
     for (const tok of tokens) {
-      // exemplos de token:
-      // ^license_plate^Ç^SHM6F53^
-      // âssignment^Ç^J11_AM5^{
-      // ^container_id^Ç10356375
       const m = tok.match(/^(\^?)([^\\^]+?)\^Ç\^?(.+?)\^?$/);
       if (!m) continue;
 
       const rawKey = m[2];
       let val = m[3];
-
       const key = this.normalizeCaretKey(rawKey);
 
-      // limpa valor
       val = String(val)
         .replace(/^\^+|\^+$/g, '')
         .replace(/[{}]/g, '')
@@ -159,7 +157,6 @@ const ConferenciaApp = {
     if (!norm) return;
     localStorage.setItem('conf_operation_code.v1', norm);
     this.operationCode = norm;
-    // Atualiza badge no topo, se existir
     const $badge = $('#op-badge');
     if ($badge.length) $badge.text(norm);
   },
@@ -171,21 +168,18 @@ const ConferenciaApp = {
     return this.operationCode;
   },
 
-// =======================
-// Supabase: client ÚNICO (não reutiliza window.sbClient de fora)
-// =======================
+  // =======================
+  // Supabase: client ÚNICO
+  // =======================
   getSb() {
     if (window.__confSbClient) return window.__confSbClient;
-
     if (!window.supabase || !window.SB_URL || !window.SB_ANON) return null;
 
     const url = window.SB_URL;
     const key = window.SB_ANON;
 
-    // ✅ Não defina Authorization manualmente
     window.__confSbClient = window.supabase.createClient(url, key, {
       auth: {
-        // ✅ para não “perder” login entre ações (admin modal etc.)
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: false,
@@ -201,7 +195,7 @@ const ConferenciaApp = {
   },
 
   // =======================
-  // Admin login (garante que existe sessão de verdade)
+  // Admin
   // =======================
   async adminSignIn(email, password) {
     const sb = this.getSb();
@@ -210,7 +204,6 @@ const ConferenciaApp = {
     const { data, error } = await sb.auth.signInWithPassword({ email, password });
     if (error) throw error;
 
-    // ⚠️ Se o Auth exigir confirmação de email, pode vir user sem session
     if (!data?.session) {
       throw new Error('Login ok, mas SEM sessão. Confirme o e-mail do usuário no Supabase Auth.');
     }
@@ -218,14 +211,17 @@ const ConferenciaApp = {
     return data;
   },
 
-  // =======================
-  // Admin upsert (verifica autenticação antes de gravar)
-  // =======================
+  async adminSignOut() {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado.');
+    const { error } = await sb.auth.signOut();
+    if (error) throw error;
+  },
+
   async adminUpsertOperation(code, name, active = true) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado.');
 
-    // ✅ Checagem forte: garante que o request vai como authenticated
     const { data: userData, error: userErr } = await sb.auth.getUser();
     if (userErr) throw userErr;
     if (!userData?.user) throw new Error('Você não está autenticado. Faça login admin antes de salvar.');
@@ -243,103 +239,105 @@ const ConferenciaApp = {
     const { error } = await sb.from('operations').upsert(op, { onConflict: 'code' });
     if (error) throw error;
   },
-// =======================
-// Realtime (escuta routes_state por operação+dia)
-// =======================
-async stopRealtimeSync() {
-  try {
+
+  async adminLoadOperations(includeInactive = true) {
     const sb = this.getSb();
-    if (sb && this.rtChannel) {
-      await sb.removeChannel(this.rtChannel);
+    if (!sb) throw new Error('Supabase client não encontrado.');
+    let q = sb.from('operations').select('code,name,active,created_at').order('code', { ascending: true });
+    if (!includeInactive) q = q.eq('active', true);
+    const { data, error } = await q;
+    if (error) throw error;
+    return data || [];
+  },
+
+  // =======================
+  // Realtime
+  // =======================
+  async stopRealtimeSync() {
+    try {
+      const sb = this.getSb();
+      if (sb && this.rtChannel) {
+        await sb.removeChannel(this.rtChannel);
+      }
+    } catch (e) {
+      console.warn('Falha ao parar realtime:', e);
+    } finally {
+      this.rtChannel = null;
+      this.rtBound = { op: null, day: null };
     }
-  } catch (e) {
-    console.warn('Falha ao parar realtime:', e);
-  } finally {
-    this.rtChannel = null;
-    this.rtBound = { op: null, day: null };
-  }
-},
+  },
 
-async startRealtimeSync(dayISO) {
-  const sb = this.getSb();
-  const op = this.getOperationCode();
-  if (!sb || !op || !dayISO) return;
+  async startRealtimeSync(dayISO) {
+    const sb = this.getSb();
+    const op = this.getOperationCode();
+    if (!sb || !op || !dayISO) return;
 
-  // já ligado para este op/dia
-  if (this.rtChannel && this.rtBound && this.rtBound.op === op && this.rtBound.day === dayISO) return;
+    if (this.rtChannel && this.rtBound && this.rtBound.op === op && this.rtBound.day === dayISO) return;
 
-  // troca de canal => encerra anterior
-  await this.stopRealtimeSync();
+    await this.stopRealtimeSync();
 
-  // IMPORTANTE:
-  // Alguns ambientes fecham o canal (status CLOSED) quando usamos múltiplas condições no `filter`.
-  // Para não depender disso, ouvimos a tabela inteira e filtramos aqui no JS.
-  this.rtChannel = sb
-    .channel('routes_state_live')
-    .on(
-      'postgres_changes',
-      { event: '*', schema: 'public', table: 'routes_state' },
-      async (payload) => {
-        try {
-          // não puxa enquanto há alterações locais em andamento
-          if (this.cloudDirty) return;
+    this.rtChannel = sb
+      .channel('routes_state_live')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'routes_state' },
+        async (payload) => {
+          try {
+            if (this.cloudDirty) return;
 
-          const row = payload && payload.new;
-          if (!row || !row.data) return;
+            const row = payload && payload.new;
+            if (!row || !row.data) return;
 
-          // filtra por operação e dia (sem depender do filter do realtime)
-          if (row.operation_code !== op) return;
-          if (row.day !== dayISO) return;
+            if (row.operation_code !== op) return;
+            if (row.day !== dayISO) return;
+            if (row.device_id && row.device_id === this.getDeviceId()) return;
 
-          // ignora eventos gerados por este mesmo dispositivo (evita re-render em loop)
-          if (row.device_id && row.device_id === this.getDeviceId()) return;
-          this.mergeSnapshotIntoLocal(row.data);
-          this.saveToStorage(dayISO);
+            this.mergeSnapshotIntoLocal(row.data);
+            this.saveToStorage(dayISO);
 
-          // Atualiza UI com debounce (evita travar seleção quando há muitas alterações remotas)
-          if (this._rtUiTimer) clearTimeout(this._rtUiTimer);
-          this._rtUiTimer = setTimeout(() => {
-            try {
-              const keepRouteId = this.currentRouteId;
-              this.renderRoutesSelects();
-              if (keepRouteId && this.routes.has(String(keepRouteId))) {
-                this.currentRouteId = String(keepRouteId);
+            if (this._rtUiTimer) clearTimeout(this._rtUiTimer);
+            this._rtUiTimer = setTimeout(() => {
+              try {
+                const keepRouteId = this.currentRouteId;
+                const routeUiLocked = this.isRouteUiLocked();
+
+                if (!routeUiLocked) {
+                  this.renderRoutesSelects();
+                } else if (keepRouteId && this.routes.has(String(keepRouteId))) {
+                  this.currentRouteId = String(keepRouteId);
+                }
+
+                this.refreshUIFromCurrent();
+                this.renderAcompanhamento();
+                this.setStatus(`Realtime • atualizado • ${op} • ${dayISO}`, 'info');
+              } catch (e) {
+                console.warn('Falha ao renderizar após realtime:', e);
               }
-              this.refreshUIFromCurrent();
-              this.renderAcompanhamento();
-              this.setStatus(`Realtime • atualizado • ${op} • ${dayISO}`, 'info');
-            } catch (e) {
-              console.warn('Falha ao renderizar após realtime:', e);
-            }
-          }, 250);
-        } catch (e) {
-          console.warn('Falha ao aplicar realtime payload:', e);
-        }
-      }
-    )
-    .subscribe((status) => {
-      // status comuns: SUBSCRIBED / TIMED_OUT / CHANNEL_ERROR / CLOSED
-      if (status === 'SUBSCRIBED') {
-        this.setStatus(`Realtime ON • ${op} • ${dayISO}`, 'success');
-      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-        this.setStatus(`Realtime instável • ${op} • ${dayISO}`, 'warning');
-      } else if (status === 'CLOSED') {
-        this.setStatus(`Realtime CLOSED • ${op} • ${dayISO}`, 'warning');
-        // tenta religar automaticamente (sem interromper uso)
-        if (this._rtRetryTimer) clearTimeout(this._rtRetryTimer);
-        this._rtRetryTimer = setTimeout(() => {
-          // só religa se ainda estamos no mesmo op/dia
-          if (this.getOperationCode() === op && (this.workDay || this.todayLocalISO()) === dayISO) {
-            this.startRealtimeSync(dayISO).catch(() => {});
+            }, 250);
+          } catch (e) {
+            console.warn('Falha ao aplicar realtime payload:', e);
           }
-        }, 2000);
-      }
-      // também loga no console para diagnóstico rápido
-      try { console.log('[Realtime]', status, { op, dayISO }); } catch {}
-    });
+        }
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          this.setStatus(`Realtime ON • ${op} • ${dayISO}`, 'success');
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          this.setStatus(`Realtime instável • ${op} • ${dayISO}`, 'warning');
+        } else if (status === 'CLOSED') {
+          this.setStatus(`Realtime CLOSED • ${op} • ${dayISO}`, 'warning');
+          if (this._rtRetryTimer) clearTimeout(this._rtRetryTimer);
+          this._rtRetryTimer = setTimeout(() => {
+            if (this.getOperationCode() === op && (this.workDay || this.todayLocalISO()) === dayISO) {
+              this.startRealtimeSync(dayISO).catch(() => {});
+            }
+          }, 2000);
+        }
+        try { console.log('[Realtime]', status, { op, dayISO }); } catch {}
+      });
 
-  this.rtBound = { op, day: dayISO };
-},
+    this.rtBound = { op, day: dayISO };
+  },
 
   buildDaySnapshotObject() {
     const obj = {};
@@ -386,7 +384,6 @@ async startRealtimeSync(dayISO) {
   markCloudDirty() {
     this.cloudDirty = true;
     this.lastLocalMutationAt = Date.now();
-    // Debounce: não salva a cada bipagem
     if (this.cloudSaveTimer) clearTimeout(this.cloudSaveTimer);
     this.cloudSaveTimer = setTimeout(() => {
       this.flushCloudSave().catch(e => {
@@ -395,7 +392,6 @@ async startRealtimeSync(dayISO) {
       });
     }, 1200);
   },
-  
 
   async flushCloudSave() {
     if (!this.cloudEnabled) return;
@@ -408,18 +404,16 @@ async startRealtimeSync(dayISO) {
 
     this.cloudSaving = true;
     try {
-      // IMPORTANTíssimo: evita perder bipagens em cenários multi-PC (last-write-wins).
-      // 1) puxa o snapshot atual do banco
       const row = await this.supaLoadDaySnapshot(op, day).catch(() => null);
-      // 2) mescla banco -> local (união de conjuntos)
       if (row && row.data) this.mergeSnapshotIntoLocal(row.data);
-      // 3) salva o snapshot mesclado
+
       const snapshot = this.buildDaySnapshotObject();
       await this.supaSaveDaySnapshot(op, day, snapshot);
+
       this.cloudDirty = false;
       this.cloudLastSaveAt = Date.now();
       this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
-      // ✅ Se salvou no banco com sucesso, limpa o indicador local de pendência
+
       this.dirty = false;
       $('#dirty-flag').addClass('d-none');
     } finally {
@@ -428,7 +422,6 @@ async startRealtimeSync(dayISO) {
   },
 
   mergeSnapshotIntoLocal(snapshotObj) {
-    // 0) aplica deletados do snapshot remoto
     const remoteDel = snapshotObj?.__meta?.deletedRoutes || {};
     for (const [rid, ts] of Object.entries(remoteDel)) {
       const id = String(rid);
@@ -438,7 +431,6 @@ async startRealtimeSync(dayISO) {
       if (t > cur) this.deletedRoutes.set(id, t);
     }
 
-    // 0.5) aplica "revive" do snapshot remoto (permite reimportar rota excluída)
     const remoteRev = snapshotObj?.__meta?.revivedRoutes || {};
     for (const [rid, ts] of Object.entries(remoteRev)) {
       const id = String(rid);
@@ -448,27 +440,25 @@ async startRealtimeSync(dayISO) {
       const curRev = Number(this.revivedRoutes.get(id) || 0);
       if (t > curRev) this.revivedRoutes.set(id, t);
       if (t > del) {
-        // revive se o reviveAt é mais novo que o deleteAt
         this.deletedRoutes?.delete(id);
       }
     }
 
-    // Se está deletada localmente (tombstone), garante que não exista na memória
     for (const [rid] of (this.deletedRoutes || new Map()).entries()) {
       this.routes.delete(String(rid));
     }
-    // snapshotObj: { [routeId]: serializedRoute }
+
     if (!snapshotObj || typeof snapshotObj !== 'object') return;
 
     for (const [routeId, ser] of Object.entries(snapshotObj)) {
       const id = String(routeId);
       if (id === '__meta') continue;
-      if (this.deletedRoutes?.has(id)) continue; // ✅ não ressuscita rota deletada
+      if (this.deletedRoutes?.has(id)) continue;
+
       const existing = this.routes.get(id);
 
       if (!existing) {
         const r = this.deserializeRoute(id, ser);
-        // garante faltantes
         if (!r.faltantes.size && r.ids.size) {
           r.faltantes = new Set(r.ids);
           for (const c of r.conferidos) r.faltantes.delete(c);
@@ -477,7 +467,6 @@ async startRealtimeSync(dayISO) {
         continue;
       }
 
-      // merge: união dos conjuntos e mapas, priorizando timestamps mais recentes
       const tmp = this.deserializeRoute(id, ser);
 
       tmp.ids.forEach(v => existing.ids.add(v));
@@ -495,7 +484,6 @@ async startRealtimeSync(dayISO) {
         else existing.duplicados.set(k, Array.from(new Set([].concat(cur, v))));
       }
 
-      // recomputa faltantes
       if (existing.ids.size) {
         existing.faltantes = new Set(existing.ids);
         for (const c of existing.conferidos) existing.faltantes.delete(c);
@@ -506,7 +494,7 @@ async startRealtimeSync(dayISO) {
   async syncFromSupabaseForDay(dayISO) {
     const op = this.getOperationCode();
     if (!op) return;
-    // Evita sobrescrever estado local durante bipagens rápidas / antes do flush
+
     const now = Date.now();
     if (this.cloudDirty) return;
     if (this.lastLocalMutationAt && (now - this.lastLocalMutationAt) < (this.cloudPullGraceMs || 2000)) return;
@@ -515,15 +503,11 @@ async startRealtimeSync(dayISO) {
       const row = await this.supaLoadDaySnapshot(op, dayISO);
       if (!row || !row.data) return;
 
-      // Mescla do banco -> local
       this.mergeSnapshotIntoLocal(row.data);
-
-      // Persistir merge local
       this.saveToStorage(dayISO);
 
       this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
     } catch (e) {
-      // Se a tabela não existir, orientar com SQL
       if (e && (e.code === '42P01' || /routes_state/i.test(String(e.message || '')))) {
         this.setStatus('Tabela routes_state não existe no Supabase. Crie a tabela para sincronizar.', 'danger');
         console.warn('Crie no Supabase:', this.getRoutesStateCreateSQL());
@@ -560,7 +544,6 @@ create policy "routes_state_update_all"
   },
 
   async ensureOperationSelected() {
-    // Carrega lista de operações ativas e força seleção se não houver
     const sb = this.getSb();
     if (!sb) return;
 
@@ -570,7 +553,6 @@ create policy "routes_state_update_all"
       return;
     }
 
-    // Preenche select
     const $sel = $('#op-select');
     if ($sel.length) {
       $sel.empty();
@@ -583,77 +565,26 @@ create policy "routes_state_update_all"
     const current = this.getOperationCode();
     const exists = (data || []).some(o => o.code === current);
 
-    // mantém o select alinhado ao valor salvo
     if ($sel.length && current && exists) {
       $sel.val(current);
     }
 
     if (!current || !exists) {
-      // abre modal
       $('#modal-operation').modal({ backdrop: 'static', keyboard: false });
     } else {
       this.setOperationCode(current);
     }
   },
 
-// =======================
-// Admin (cadastrar operações) - requer login apenas para o admin
-// =======================
-async adminSignIn(email, password) {
-  const sb = this.getSb();
-  if (!sb) throw new Error('Supabase client não encontrado.');
-  const { data, error } = await sb.auth.signInWithPassword({ email, password });
-  if (error) throw error;
-  return data;
-},
-
-async adminSignOut() {
-  const sb = this.getSb();
-  if (!sb) throw new Error('Supabase client não encontrado.');
-  const { error } = await sb.auth.signOut();
-  if (error) throw error;
-},
-
-async adminUpsertOperation(code, name, active = true) {
-  const sb = this.getSb();
-  if (!sb) throw new Error('Supabase client não encontrado.');
-  const op = {
-    code: String(code || '').trim().toUpperCase(),
-    name: String(name || '').trim() || null,
-    active: !!active
-  };
-  if (!/^[A-Z]{3}\d$/.test(op.code)) {
-    throw new Error('Código inválido. Use 3 letras e 1 número (ex.: ERD1).');
-  }
-  const { error } = await sb.from('operations').upsert(op, { onConflict: 'code' });
-  if (error) throw error;
-},
-
-async adminLoadOperations(includeInactive = true) {
-  const sb = this.getSb();
-  if (!sb) throw new Error('Supabase client não encontrado.');
-  let q = sb.from('operations').select('code,name,active,created_at').order('code', { ascending: true });
-  if (!includeInactive) q = q.eq('active', true);
-  const { data, error } = await q;
-  if (error) throw error;
-  return data || [];
-},
-
-
-
-  setStatus(txt, kind='muted') {
+  setStatus(txt, kind = 'muted') {
     const $s = $('#sync-status');
-    $s.removeClass('text-muted text-success text-danger text-warning');
+    $s.removeClass('text-muted text-success text-danger text-warning text-info');
     $s.addClass(`text-${kind}`);
     $s.text(txt);
   },
 
-
-  // =======================
-  // =======================
   markDirty(reason = '') {
     this.dirty = true;
-    // Supabase: marca para salvar snapshot
     this.markCloudDirty();
     const msg = reason ? `pendente salvar (${reason})` : 'pendente salvar';
     this.setStatus(msg, 'warning');
@@ -667,10 +598,8 @@ async adminLoadOperations(includeInactive = true) {
   },
 
   // =======================
-  // Busca/Auditoria no banco (scan_events)
+  // Busca/Auditoria no banco
   // =======================
-
-  // Retorna o Map de rotas, mesmo se algum trecho tiver setado objeto por engano
   getRoutesMap() {
     if (this.routes instanceof Map) return this.routes;
     const m = new Map();
@@ -680,7 +609,6 @@ async adminLoadOperations(includeInactive = true) {
     return m;
   },
 
-  // Status local (no dia carregado) caso o ID não exista no banco
   getLocalStatusForId(idRaw) {
     const id = String(idRaw || '').trim();
     if (!id) return null;
@@ -700,15 +628,13 @@ async adminLoadOperations(includeInactive = true) {
     return null;
   },
 
-  // Busca completa: histórico no banco + fallback de status local
   async searchIdsFull(idsRaw, opts = {}) {
     const ids = Array.isArray(idsRaw) ? idsRaw.map(String) : this.parseIdsList(idsRaw);
     if (!ids.length) return { ids: [], rows: [], summary: [] };
 
     const rows = await this.searchScanEventsByIds(ids, opts);
 
-    // agrupa eventos por ID
-    const byId = new Map(); // id -> { id, events:[], ops:Set, last:null, local:null }
+    const byId = new Map();
     for (const id of ids) {
       byId.set(id, { id, events: [], ops: new Set(), last: null, local: null });
     }
@@ -716,13 +642,11 @@ async adminLoadOperations(includeInactive = true) {
     for (const r of rows) {
       const pid = String(r.package_id ?? '');
       if (!byId.has(pid)) continue;
-
       const ref = byId.get(pid);
       ref.events.push(r);
       if (r.operation_code) ref.ops.add(String(r.operation_code));
     }
 
-    // monta resumo: último evento + ops envolvidas + status local se não houver evento
     const summary = [];
     for (const id of ids) {
       const ref = byId.get(id);
@@ -734,7 +658,6 @@ async adminLoadOperations(includeInactive = true) {
 
       summary.push({
         id,
-        // último do banco
         last_seen_at: last ? last.scanned_at : null,
         last_operation: last ? last.operation_code : null,
         last_day: last ? last.day : null,
@@ -742,22 +665,18 @@ async adminLoadOperations(includeInactive = true) {
         last_cluster: last ? last.cluster : null,
         last_xpt: last ? last.xpt : null,
         last_result: last ? last.result : null,
-
         operations: Array.from(ref.ops),
-
-        // fallback local
         local_status: local ? local.status : null,
         local_route_id: local ? local.route_id : null,
         local_cluster: local ? local.cluster : null,
         local_xpt: local ? local.xpt : null,
-
         has_db_history: !!last
       });
     }
 
     return { ids, rows, summary };
   },
-  // Metadados da rota para salvar/buscar
+
   getRouteMeta(routeId) {
     const rid = routeId != null ? String(routeId) : '';
     const routesMap = this.getRoutesMap();
@@ -770,7 +689,6 @@ async adminLoadOperations(includeInactive = true) {
     };
   },
 
-  // Normaliza/gera infos que queremos salvar no banco
   enrichEventForCloud(evt) {
     const e = Object.assign({}, evt || {});
     const meta = this.getRouteMeta(e.currentRouteId);
@@ -778,8 +696,6 @@ async adminLoadOperations(includeInactive = true) {
     return e;
   },
 
-  // Grava cada bipagem no Supabase (audit trail)
-  // Requer tabela public.scan_events
   async logScanEventToCloud(evt) {
     try {
       const sb = this.getSb();
@@ -792,14 +708,12 @@ async adminLoadOperations(includeInactive = true) {
       const e = this.enrichEventForCloud(evt);
       const code = this.normalizarCodigo(e.code);
       if (!code) return;
-
-      // só aceita número
       if (!/^\d+$/.test(String(code))) return;
 
       const payload = {
         operation_code: String(op),
         day: String(dayISO),
-        package_id: String(code), // no Postgres vira bigint
+        package_id: String(code),
         scanned_at: new Date(Number(e.ts || Date.now())).toISOString(),
         result: String(e.type || '').toLowerCase() || null,
         route_id: e._meta?.routeId || null,
@@ -814,7 +728,6 @@ async adminLoadOperations(includeInactive = true) {
     }
   },
 
-  // Converte "123; 456, 789\n" -> ['123','456','789'] (dedup)
   parseIdsList(raw) {
     const txt = String(raw || '');
     const parts = txt.split(/[;,\s\n\r\t]+/g).map(s => this.normalizarCodigo(s)).filter(Boolean);
@@ -822,8 +735,6 @@ async adminLoadOperations(includeInactive = true) {
     return Array.from(new Set(onlyNums));
   },
 
-  // Busca no banco por lista de IDs
-// Busca no banco por lista de IDs (GLOBAL por padrão)
   async searchScanEventsByIds(idsRaw, opts = {}) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado.');
@@ -831,10 +742,7 @@ async adminLoadOperations(includeInactive = true) {
     const ids = Array.isArray(idsRaw) ? idsRaw.map(String) : this.parseIdsList(idsRaw);
     if (!ids.length) return [];
 
-    // ✅ GLOBAL por padrão:
-    // - só filtra por operação se opts.operation_code vier preenchido
     const op = (opts.operation_code ? String(opts.operation_code) : '').trim().toUpperCase();
-
     const dayFrom = opts.day_from ? String(opts.day_from) : null;
     const dayTo = opts.day_to ? String(opts.day_to) : null;
 
@@ -862,7 +770,6 @@ async adminLoadOperations(includeInactive = true) {
     return out;
   },
 
-  // Render opcional: se existir um <tbody id="db-search-results">, preenche
   renderDbSearchResults(rows) {
     const $tb = $('#db-search-results');
     const $wrap = $('#db-search-results-wrap');
@@ -871,8 +778,8 @@ async adminLoadOperations(includeInactive = true) {
     $tb.empty();
     (rows || []).forEach(r => {
       const dt = r.scanned_at ? new Date(r.scanned_at) : null;
-      const day = r.day || (dt ? dt.toISOString().slice(0,10) : '');
-      const hhmm = dt ? String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0') : '';
+      const day = r.day || (dt ? dt.toISOString().slice(0, 10) : '');
+      const hhmm = dt ? String(dt.getHours()).padStart(2, '0') + ':' + String(dt.getMinutes()).padStart(2, '0') : '';
       $tb.append(`
         <tr>
           <td>${r.package_id ?? ''}</td>
@@ -889,6 +796,7 @@ async adminLoadOperations(includeInactive = true) {
 
     if ($wrap.length) $wrap.removeClass('d-none');
   },
+
   renderDbSearchSummary(summaryRows) {
     const $tb = $('#db-search-results');
     const $wrap = $('#db-search-results-wrap');
@@ -898,8 +806,8 @@ async adminLoadOperations(includeInactive = true) {
 
     (summaryRows || []).forEach(r => {
       const dt = r.last_seen_at ? new Date(r.last_seen_at) : null;
-      const day = r.last_day || (dt ? dt.toISOString().slice(0,10) : '');
-      const hhmm = dt ? String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0') : '';
+      const day = r.last_day || (dt ? dt.toISOString().slice(0, 10) : '');
+      const hhmm = dt ? String(dt.getHours()).padStart(2, '0') + ':' + String(dt.getMinutes()).padStart(2, '0') : '';
 
       const ops = (r.operations && r.operations.length) ? r.operations.join(',') : '';
       const status = r.has_db_history
@@ -926,28 +834,23 @@ async adminLoadOperations(includeInactive = true) {
 
     if ($wrap.length) $wrap.removeClass('d-none');
   },
+
   pushEvent(evt) {
-    // evt: {ts, type: 'ok'|'fora'|'dup', code, currentRouteId, correctRouteId}
     const e = this.enrichEventForCloud(evt);
     this.lastEvents.unshift(e);
     if (this.lastEvents.length > 80) this.lastEvents.length = 80;
     this.renderAcompanhamento();
-    // grava no banco (não bloqueia a UI)
     this.logScanEventToCloud(e);
   },
 
   renderAcompanhamento() {
-    // badge pendente
     if (this.dirty) $('#dirty-flag').removeClass('d-none');
     else $('#dirty-flag').addClass('d-none');
 
-    // === Resumo por CLUSTER (consolidado) ===
-    const mapa = new Map(); 
-    // cluster -> { conferidos, total, precisaRevalidar }
+    const mapa = new Map();
 
     for (const r of this.routes.values()) {
       const cluster = (r.cluster && String(r.cluster).trim()) || '(sem cluster)';
-
       const total = (r.totalInicial || r.ids.size || 0);
       const conf = (r.conferidos ? r.conferidos.size : 0);
 
@@ -963,12 +866,10 @@ async adminLoadOperations(includeInactive = true) {
       acc.conferidos += conf;
       acc.total += total;
 
-      // 🔴 se alguma rota tiver faltante, marca o cluster
       if (conf < total) {
         acc.precisaRevalidar = true;
       }
     }
-
 
     const resumo = Array.from(mapa.entries())
       .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
@@ -977,7 +878,6 @@ async adminLoadOperations(includeInactive = true) {
         return `CLUSTER ${cluster}: ${v.conferidos}/${v.total}${ok}`;
       })
       .join('<br>');
-      
 
     $('#acompanhamento-resumo')
       .css({
@@ -996,13 +896,11 @@ async adminLoadOperations(includeInactive = true) {
 
     $('#clusters-copiavel').val(textoClusters);
 
-
-    // === Log de bipagens ===
     const items = this.lastEvents.slice(0, 30).map(ev => {
       const d = new Date(ev.ts);
-      const hh = String(d.getHours()).padStart(2,'0');
-      const mm = String(d.getMinutes()).padStart(2,'0');
-      const ss = String(d.getSeconds()).padStart(2,'0');
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
       const base = `${hh}:${mm}:${ss} • ${ev.code}`;
 
       if (ev.type === 'fora') {
@@ -1021,7 +919,7 @@ async adminLoadOperations(includeInactive = true) {
   },
 
   // =======================
-  // Relatório Noturno (sidebar)
+  // Relatório Noturno
   // =======================
   escHtml(s) {
     return String(s ?? '')
@@ -1032,9 +930,12 @@ async adminLoadOperations(includeInactive = true) {
       .replace(/'/g, '&#39;');
   },
 
+  escapeHtml(s) {
+    return this.escHtml(s);
+  },
+
   locateIdInOtherRoutes(id, excludeRouteId) {
     const ex = String(excludeRouteId ?? '');
-    // prioridade: conferido > fora de rota > pertence (ids/faltantes)
     for (const r of this.routes.values()) {
       if (String(r.routeId) === ex) continue;
       if (r.conferidos && r.conferidos.has(id)) {
@@ -1087,7 +988,7 @@ async adminLoadOperations(includeInactive = true) {
     const headerLine = (it) => {
       const c = it.cluster ? `CLUSTER ${esc(it.cluster)}` : 'CLUSTER (vazio)';
       const perc = it.total ? Math.floor((it.conf / it.total) * 100) : 0;
-      const badge = it.ok ? `<span class="badge badge-success ml-2">100%</span>` : `<span class="badge badge-warning ml-2">${esc(it.falt) } falt.</span>`;
+      const badge = it.ok ? `<span class="badge badge-success ml-2">100%</span>` : `<span class="badge badge-warning ml-2">${esc(it.falt)} falt.</span>`;
       return `${c} <small class="text-muted">• Rota ${esc(it.routeId)} • ${esc(it.conf)}/${esc(it.total)} (${perc}%)</small>${badge}`;
     };
 
@@ -1100,7 +1001,7 @@ async adminLoadOperations(includeInactive = true) {
           const collapseId = `nr_${esc(it.routeId)}_${idx}`;
           const r = it.route;
           const faltantes = Array.from(r.faltantes || []);
-          faltantes.sort((a,b)=>String(a).localeCompare(String(b)));
+          faltantes.sort((a, b) => String(a).localeCompare(String(b)));
 
           const faltHtml = faltantes.map(id => {
             const loc = this.locateIdInOtherRoutes(id, r.routeId);
@@ -1185,23 +1086,21 @@ async adminLoadOperations(includeInactive = true) {
       destinationFacilityId: '',
       destinationFacilityName: '',
 
-      timestamps: new Map(), // id -> epoch (ms)
+      timestamps: new Map(),
       ids: new Set(),
       faltantes: new Set(),
       conferidos: new Set(),
       foraDeRota: new Set(),
-      duplicados: new Map(), // id -> count
+      duplicados: new Map(),
 
       totalInicial: 0,
 
-      // vínculo Carreta/QR
       plateKey: '',
       plateRaw: '',
       plateLicense: '',
       routeQrKey: '',
       routeQrRaw: '',
 
-      // timestamps de bipagem (para export CSV estilo scanner)
       plateScanTs: 0,
       routeQrScanTs: 0
     };
@@ -1213,7 +1112,7 @@ async adminLoadOperations(includeInactive = true) {
   },
 
   // =======================
-  // Persistência local (cache por dia)
+  // Persistência local
   // =======================
   loadFromStorage(dayISO) {
     try {
@@ -1222,22 +1121,22 @@ async adminLoadOperations(includeInactive = true) {
       if (!raw) return;
 
       const parsed = JSON.parse(raw);
-      this.deletedRoutes = new Map(Object.entries(parsed?.__meta?.deletedRoutes || {}).map(([k,v]) => [String(k), Number(v||0)]));
-      this.revivedRoutes = new Map(Object.entries(parsed?.__meta?.revivedRoutes || {}).map(([k,v]) => [String(k), Number(v||0)]));
+      this.deletedRoutes = new Map(Object.entries(parsed?.__meta?.deletedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
+      this.revivedRoutes = new Map(Object.entries(parsed?.__meta?.revivedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
 
-      // ✅ se uma rota foi reimportada após exclusão, revive (revivedAt > deletedAt)
       for (const [rid, rts] of (this.revivedRoutes || new Map()).entries()) {
         const delTs = Number(this.deletedRoutes?.get(rid) || 0);
         if (Number(rts || 0) > delTs) this.deletedRoutes.delete(rid);
       }
+
       if (!parsed || typeof parsed !== 'object') return;
 
       this.routes.clear();
       this.currentRouteId = null;
 
       for (const [routeId, r] of Object.entries(parsed)) {
-        if (routeId === '__meta') continue;                 // ✅ ignora meta
-        if (this.deletedRoutes.has(String(routeId))) continue; // ✅ não carrega rota deletada
+        if (routeId === '__meta') continue;
+        if (this.deletedRoutes.has(String(routeId))) continue;
 
         const route = this.makeEmptyRoute(routeId);
 
@@ -1333,8 +1232,6 @@ async adminLoadOperations(includeInactive = true) {
     route.routeQrKey = r.routeQrKey || '';
     route.routeQrRaw = r.routeQrRaw || '';
 
-    
-
     route.plateScanTs = Number(r.plateScanTs || 0);
     route.routeQrScanTs = Number(r.routeQrScanTs || 0);
 
@@ -1355,7 +1252,6 @@ async adminLoadOperations(includeInactive = true) {
   },
 
   globalCleanupForaDeRotaForConferidos() {
-    // mapa: id -> rota onde está conferido (pode existir mais de uma, mas tratamos como "válido" em qualquer)
     const conferidosIds = new Set();
     for (const r of this.routes.values()) {
       for (const id of r.conferidos) conferidosIds.add(id);
@@ -1366,10 +1262,8 @@ async adminLoadOperations(includeInactive = true) {
     for (const r of this.routes.values()) {
       for (const id of conferidosIds) {
         if (r.conferidos.has(id)) {
-          // se conferido aqui, garante que não esteja fora de rota aqui
           if (r.foraDeRota.has(id)) r.foraDeRota.delete(id);
         } else {
-          // se não é conferido aqui, não deve ficar preso como fora de rota aqui se ele foi validado em outra rota
           if (r.foraDeRota.has(id)) r.foraDeRota.delete(id);
           if (r.duplicados.has(id)) r.duplicados.delete(id);
         }
@@ -1380,53 +1274,41 @@ async adminLoadOperations(includeInactive = true) {
   // =======================
   // Troca de dia
   // =======================
-  
-async applyWorkDay(dayISO) {
-  // troca de dia sempre reinicia o estado em memória (evita misturar dias/operações)
-  this.routes.clear();
-  this.currentRouteId = null;
+  async applyWorkDay(dayISO) {
+    this.routes.clear();
+    this.currentRouteId = null;
+    this.lastRoutesSignature = '';
 
-  this.workDay = dayISO;
-  $('#work-day').val(dayISO);
+    this.workDay = dayISO;
+    $('#work-day').val(dayISO);
 
-  // garante operação selecionada (modal se necessário)
-  await this.ensureOperationSelected();
+    await this.ensureOperationSelected();
 
-  const op = this.getOperationCode();
-  if (op) $('#op-badge').text(op);
+    const op = this.getOperationCode();
+    if (op) $('#op-badge').text(op);
 
-  // 1) sempre começa pelo cache local do dia
-  this.loadFromStorage(dayISO);
+    this.loadFromStorage(dayISO);
 
-  // 2) tenta sincronizar do banco (Supabase) e mesclar no local
-  if (op) {
-    await this.syncFromSupabaseForDay(dayISO);
+    if (op) {
+      await this.syncFromSupabaseForDay(dayISO);
+      await this.startRealtimeSync(dayISO);
+    }
 
-    // 2.5) liga realtime para este dia/operação
-    await this.startRealtimeSync(dayISO);
-  }
+    this.renderRoutesSelects();
+    this.refreshUIFromCurrent();
+    this.renderAcompanhamento();
 
-  // 3) render
-  this.renderRoutesSelects();
-  this.refreshUIFromCurrent();
-  this.renderAcompanhamento();
+    if (op) this.setStatus(`dia carregado • ${op} • ${dayISO}`, 'success');
+    else this.setStatus('dia carregado (sem operação)', 'warning');
+  },
 
-  if (op) this.setStatus(`dia carregado • ${op} • ${dayISO}`, 'success');
-  else this.setStatus('dia carregado (sem operação)', 'warning');
-},
-
-
-
-  
   resetForOperationChange() {
-    // encerra realtime da operação/dia anterior
     this.stopRealtimeSync();
-    // limpa estado e força voltar para a tela inicial
     this.routes.clear();
     this.currentRouteId = null;
     this.viaCsv = false;
+    this.lastRoutesSignature = '';
 
-    // limpa selects/listas visuais mais comuns
     try {
       $('#saved-routes').html('<option value="">(Nenhuma selecionada)</option>');
       $('#saved-routes-inapp').empty();
@@ -1440,7 +1322,6 @@ async applyWorkDay(dayISO) {
       $('#verified-total').text('0');
     } catch {}
 
-    // alterna interfaces
     $('#global-interface').addClass('d-none');
     $('#carreta-interface').addClass('d-none');
     $('#manual-interface').addClass('d-none');
@@ -1448,7 +1329,6 @@ async applyWorkDay(dayISO) {
   },
 
   computeSnapshotStats(snapshotObj) {
-    // snapshotObj: { routeId: serializedRoute, ... }
     const routes = snapshotObj && typeof snapshotObj === 'object' ? Object.values(snapshotObj) : [];
     let routesCount = 0, totalIds = 0, conferidos = 0, faltantes = 0, fora = 0;
 
@@ -1471,7 +1351,6 @@ async applyWorkDay(dayISO) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
 
-    // lista operações ativas
     const { data: ops, error: e1 } = await sb
       .from('operations')
       .select('code,name,active')
@@ -1479,7 +1358,6 @@ async applyWorkDay(dayISO) {
       .order('code', { ascending: true });
     if (e1) throw e1;
 
-    // para cada operação, pega snapshot do dia (se existir)
     const tasks = (ops || []).map(async (o) => {
       const code = String(o.code || '').toUpperCase();
       const row = await this.supaLoadDaySnapshot(code, dayISO).catch(() => null);
@@ -1503,7 +1381,7 @@ async applyWorkDay(dayISO) {
     $tb.empty();
     $log.empty();
 
-    const sorted = (items || []).slice().sort((a,b)=> (a.code||'').localeCompare(b.code||''));
+    const sorted = (items || []).slice().sort((a, b) => (a.code || '').localeCompare(b.code || ''));
 
     for (const it of sorted) {
       const u = it.updated_at ? new Date(it.updated_at).toLocaleString('pt-BR') : '-';
@@ -1519,7 +1397,6 @@ async applyWorkDay(dayISO) {
         </tr>
       `);
 
-      // log simplificado
       $log.append(`
         <li class="list-group-item d-flex justify-content-between align-items-center">
           <span><strong>${it.code}</strong> • ${it.stats.conferidos}/${it.stats.totalIds} conferidos • ${it.stats.faltantes} faltantes</span>
@@ -1533,19 +1410,18 @@ async applyWorkDay(dayISO) {
     }
   },
 
-// =======================
+  // =======================
   // UI / Rotas
   // =======================
   setCurrentRoute(routeId) {
     console.log('[setCurrentRoute] versão', '2026-02-22-1');
-    //retira o alert para rotas importadas pela segunda vez pos ser apagadasivelmente, pois a rota pode ter sido deletada e reimportada (revived) e nesse caso queremos permitir acessar normalmente
 
     const id = String(routeId);
     if (!this.routes.has(id)) {
       alert('Rota não encontrada.');
       return;
     }
-    
+
     this.currentRouteId = id;
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
@@ -1567,34 +1443,56 @@ async applyWorkDay(dayISO) {
       return parts.join(' • ') || `(sem dados) • Rota ${r.routeId}`;
     };
 
-    // cache para filtro (somente o dropdown "in-app")
-    this._routesDropdownCache = routesSorted.map(r => ({
+    const newCache = routesSorted.map(r => ({
       routeId: String(r.routeId),
       label: makeLabel(r),
       clusterKey: this.normalizeCluster(r.cluster || ''),
       labelKey: this.normalizeCluster(makeLabel(r)),
     }));
 
-    // Select da tela inicial (sem filtro)
-    $sel1.html(
-      ['<option value="">(Nenhuma selecionada)</option>']
-        .concat(this._routesDropdownCache.map(x => `<option value="${x.routeId}">${x.label}</option>`))
-        .join('')
-    );
+    const sig = newCache
+      .map(x => `${x.routeId}|${x.clusterKey}|${x.label}`)
+      .join('||');
 
-    // Select "Trocar rota" (com filtro por cluster)
-    this.applyRouteDropdownFilter($('#route-search').val() || '');
+    const changed = sig !== this.lastRoutesSignature;
+
+    if (changed) {
+      this.lastRoutesSignature = sig;
+      this._routesDropdownCache = newCache;
+
+      $sel1.html(
+        ['<option value="">(Nenhuma selecionada)</option>']
+          .concat(this._routesDropdownCache.map(x => `<option value="${x.routeId}">${x.label}</option>`))
+          .join('')
+      );
+
+      this.applyRouteDropdownFilter($('#route-search').val() || '');
+    }
 
     if (this.currentRouteId) {
-      $sel1.val(this.currentRouteId);
-      // o $sel2 é definido dentro do filtro (se estiver visível na lista filtrada)
+      $sel1.val(String(this.currentRouteId));
+
+      const filteredText = $('#route-search').val() || '';
+      const q = this.normalizeCluster(String(filteredText).trim());
+
+      const filtered = !q
+        ? (this._routesDropdownCache || [])
+        : (this._routesDropdownCache || []).filter(x =>
+            (x.clusterKey && x.clusterKey.includes(q)) ||
+            (x.labelKey && x.labelKey.includes(q)) ||
+            String(x.routeId).includes(String(filteredText).trim())
+          );
+
+      const existsInFiltered = filtered.some(x => x.routeId === String(this.currentRouteId));
+      if (existsInFiltered) {
+        $sel2.val(String(this.currentRouteId));
+      }
     }
   },
 
   applyRouteDropdownFilter(filterText) {
     const $sel2 = $('#saved-routes-inapp');
 
-    // se ainda não carregou rotas, só zera
     const list = Array.isArray(this._routesDropdownCache) ? this._routesDropdownCache : [];
     const q = this.normalizeCluster(String(filterText || '').trim());
 
@@ -1612,14 +1510,11 @@ async applyWorkDay(dayISO) {
 
     $sel2.html(options);
 
-    // preserva seleção atual, se ainda estiver na lista filtrada
     if (this.currentRouteId) {
       const exists = filtered.some(x => x.routeId === String(this.currentRouteId));
       if (exists) $sel2.val(String(this.currentRouteId));
     }
   },
-
-
 
   refreshUIFromCurrent() {
     const r = this.current;
@@ -1685,7 +1580,7 @@ async applyWorkDay(dayISO) {
         return `<li class='list-group-item list-group-item-warning'>${id}</li>`;
       }).join('')
     );
-        
+
     $('#duplicados-list').html(
       `<h6>Duplicados (<span class='badge badge-secondary'>${r.duplicados.size}</span>)</h6>` +
       Array.from(r.duplicados.entries())
@@ -1701,17 +1596,15 @@ async applyWorkDay(dayISO) {
     if (!routeId) return;
     const rid = String(routeId);
 
-    // ✅ tombstone
     if (!this.deletedRoutes) this.deletedRoutes = new Map();
     const now = Date.now();
     this.deletedRoutes.set(rid, now);
     if (this.revivedRoutes) this.revivedRoutes.delete(rid);
 
-    // remove da memória
     this.routes.delete(rid);
     if (this.currentRouteId === rid) this.currentRouteId = null;
 
-    // persiste
+    this.lastRoutesSignature = '';
     this.saveToStorage(this.workDay);
     this.markDirty('excluir rota');
 
@@ -1729,8 +1622,8 @@ async applyWorkDay(dayISO) {
     }
     this.routes.clear();
     this.currentRouteId = null;
+    this.lastRoutesSignature = '';
 
-    // remove cache do dia
     localStorage.removeItem(this.storageKeyForDay(this.workDay));
     this.markDirty('limpar dia');
 
@@ -1756,78 +1649,71 @@ async applyWorkDay(dayISO) {
   },
 
   // =======================
-  // Leitura inteligente (Placa/QR Rota/ID)
+  // Leitura inteligente
   // =======================
   parseScanPayload(raw) {
     const cleaned = String(raw || '').trim();
     if (!cleaned) return { kind: 'empty' };
 
-    // 0) QR em formato “caret” (ex.: ^license_plate^Ç^SHW8J07^, ...)
-// Esse formato vem do leitor; transformamos em KV tolerante (aceita "âssignment", "asssignment", etc).
-const firstLine = cleaned.split(/\?\n/)[0].trim();
-if (firstLine.includes('^') && firstLine.includes('Ç')) {
-  const kv = this.parseCaretKV(firstLine);
+    const firstLine = cleaned.split(/\?\n/)[0].trim();
+    if (firstLine.includes('^') && firstLine.includes('Ç')) {
+      const kv = this.parseCaretKV(firstLine);
 
-  // QR PLACA (carreta)
-  if (kv.license_plate) {
-    const plateKey = String(kv.license_plate).trim().toUpperCase();
-    const plateObj = {
-      id: kv.id || '',
-      carrier_id: kv.carrier_id || '',
-      carrier_name: kv.carrier_name || '',
-      license_plate: plateKey,
-      vehicle_type_description: kv.vehicle_type_description || ''
-    };
-    const jsonText = JSON.stringify(plateObj);
-    return {
-      kind: 'plate',
-      plateKey,
-      plate: {
-        raw: firstLine,
-        jsonText,
-        license_plate: plateKey,
-        carrier_name: plateObj.carrier_name || '',
-        vehicle_type_description: plateObj.vehicle_type_description || '',
-        carrier_id: plateObj.carrier_id || '',
-        id: plateObj.id || ''
+      if (kv.license_plate) {
+        const plateKey = String(kv.license_plate).trim().toUpperCase();
+        const plateObj = {
+          id: kv.id || '',
+          carrier_id: kv.carrier_id || '',
+          carrier_name: kv.carrier_name || '',
+          license_plate: plateKey,
+          vehicle_type_description: kv.vehicle_type_description || ''
+        };
+        const jsonText = JSON.stringify(plateObj);
+        return {
+          kind: 'plate',
+          plateKey,
+          plate: {
+            raw: firstLine,
+            jsonText,
+            license_plate: plateKey,
+            carrier_name: plateObj.carrier_name || '',
+            vehicle_type_description: plateObj.vehicle_type_description || '',
+            carrier_id: plateObj.carrier_id || '',
+            id: plateObj.id || ''
+          }
+        };
       }
-    };
-  }
 
-  // QR ROTA (container / assignment)
-  if (kv.container_id || kv.assignment) {
-    let assignment = kv.assignment ? String(kv.assignment).trim() : '';
-    assignment = this.normalizeCluster(assignment); // normaliza (remove lixo e deixa comparável ao cluster)
+      if (kv.container_id || kv.assignment) {
+        let assignment = kv.assignment ? String(kv.assignment).trim() : '';
+        assignment = this.normalizeCluster(assignment);
 
-    const obj = {
-      container_id: kv.container_id ? Number(kv.container_id) : undefined,
-      facility_id: kv.facility_id || '',
-      assignment: assignment
-    };
-    Object.keys(obj).forEach(k => obj[k] === undefined && delete obj[k]);
+        const obj = {
+          container_id: kv.container_id ? Number(kv.container_id) : undefined,
+          facility_id: kv.facility_id || '',
+          assignment: assignment
+        };
+        Object.keys(obj).forEach(k => obj[k] === undefined && delete obj[k]);
 
-    const routeKey = assignment
-      ? `assignment:${assignment}`
-      : (kv.container_id ? `container:${kv.container_id}` : `caret:${firstLine}`);
+        const routeKey = assignment
+          ? `assignment:${assignment}`
+          : (kv.container_id ? `container:${kv.container_id}` : `caret:${firstLine}`);
 
-    const jsonText = JSON.stringify(obj);
+        const jsonText = JSON.stringify(obj);
 
-    return {
-      kind: 'routeqr',
-      routeKey,
-      routeIdCandidate: '',
-      route: { raw: firstLine, obj, jsonText }
-    };
-  }
-}
+        return {
+          kind: 'routeqr',
+          routeKey,
+          routeIdCandidate: '',
+          route: { raw: firstLine, obj, jsonText }
+        };
+      }
+    }
 
-
-  // 1) tenta JSON (QR da placa / QR da rota)
     if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
       try {
         const obj = JSON.parse(cleaned);
 
-        // QR PLACA (carreta)
         if (obj && typeof obj === 'object' && obj.license_plate) {
           const plateKey = String(obj.license_plate || '').trim().toUpperCase();
           return {
@@ -1845,7 +1731,6 @@ if (firstLine.includes('^') && firstLine.includes('Ç')) {
           };
         }
 
-        // QR ROTA (container/assignment/etc)
         if (obj && typeof obj === 'object' && (obj.container_id || obj.assignment || obj.routeId || obj.route_id)) {
           const candidate = obj.routeId || obj.route_id || obj.container_id || obj.assignment;
           const routeIdCandidate = candidate != null ? String(candidate) : '';
@@ -1862,16 +1747,12 @@ if (firstLine.includes('^') && firstLine.includes('Ç')) {
             route: { raw: cleaned, obj }
           };
         }
-      } catch (e) {
-        // cai para parse normal
-      }
+      } catch (e) {}
     }
 
-    // 2) tenta ID de envio (padrão do sistema atual)
     const shipmentId = this.normalizarCodigo(cleaned);
     if (shipmentId) return { kind: 'shipment', shipmentId };
 
-    // 3) fallback: placa em texto
     const plateLike = cleaned.toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (/^[A-Z]{3}\d[A-Z]\d{2}$/.test(plateLike) || /^[A-Z]{3}\d{4}$/.test(plateLike)) {
       return {
@@ -1881,7 +1762,6 @@ if (firstLine.includes('^') && firstLine.includes('Ç')) {
       };
     }
 
-    // 4) rota numérica simples
     const digits = cleaned.replace(/\D/g, '');
     if (digits.length >= 4) {
       const routeIdCandidate = digits;
@@ -1946,15 +1826,11 @@ if (firstLine.includes('^') && firstLine.includes('Ç')) {
     if (jsonText) this.carretas.routesJson.set(routeKey, jsonText);
     if (!this.carretas.routesTs.get(routeKey)) this.carretas.routesTs.set(routeKey, Date.now());
 
-    // tenta vincular também ao objeto de rota (se existir no sistema)
-    // IMPORTANTE: no seu cenário o QR da rota NÃO traz routeId; ele traz "assignment" (ex.: J9_AM3), que corresponde ao CLUSTER.
-    // Então vinculamos por cluster (e o dia já é isolado pelo cache do sistema).
     const assignMatch = String(routeKey).match(/^assignment:(.+)$/);
     const clusterCandidate = this.normalizeCluster(assignMatch?.[1] || '');
 
     let linked = 0;
 
-    // 1) Principal: vincular por CLUSTER = assignment
     if (clusterCandidate) {
       for (const r of this.routes.values()) {
         const c = this.normalizeCluster(r.cluster);
@@ -1964,18 +1840,15 @@ if (firstLine.includes('^') && firstLine.includes('Ç')) {
           r.plateLicense = plate.license_plate || plateKey;
           r.routeQrKey = routeKey;
           r.routeQrRaw = (typeof routeRaw === 'string' ? routeRaw : (routeRaw && routeRaw.raw) ? routeRaw.raw : '') || '';
-          // se houver jsonText no parse, usa no export
           const _json = (routeRaw && routeRaw.jsonText) ? routeRaw.jsonText : '';
           if (_json) r.routeQrRaw = _json;
-          
           r.plateScanTs = Number(plate.tsLast || Date.now());
           r.routeQrScanTs = Date.now();
-linked++;
+          linked++;
         }
       }
     }
 
-    // 2) Fallback: se por algum motivo vier um routeId em outro formato, tenta achar diretamente pelo Map
     if (!linked) {
       const candidateIds = [];
       if (routeIdCandidate) candidateIds.push(String(routeIdCandidate));
@@ -1990,51 +1863,48 @@ linked++;
           r.plateLicense = plate.license_plate || plateKey;
           r.routeQrKey = routeKey;
           r.routeQrRaw = (typeof routeRaw === 'string' ? routeRaw : (routeRaw && routeRaw.raw) ? routeRaw.raw : '') || '';
-          // se houver jsonText no parse, usa no export
           const _json = (routeRaw && routeRaw.jsonText) ? routeRaw.jsonText : '';
           if (_json) r.routeQrRaw = _json;
-          
           r.plateScanTs = Number(plate.tsLast || Date.now());
           r.routeQrScanTs = Date.now();
-linked++;
+          linked++;
         }
       }
     }
 
-this.saveToStorage(this.workDay);
+    this.saveToStorage(this.workDay);
     this.markDirty('carreta');
     return true;
   },
+
   checkLinksForCurrentPlate() {
-  const plateKey = this.carretas.currentPlateKey;
-  if (!plateKey) return alert('Nenhuma placa ativa.');
+    const plateKey = this.carretas.currentPlateKey;
+    if (!plateKey) return alert('Nenhuma placa ativa.');
 
-  const p = this.carretas.plates.get(plateKey);
-  if (!p) return alert('Placa ativa não encontrada na memória.');
+    const p = this.carretas.plates.get(plateKey);
+    if (!p) return alert('Placa ativa não encontrada na memória.');
 
-  const routes = Array.from(p.routes || []);
-  routes.sort((a,b)=>String(a).localeCompare(String(b)));
+    const routes = Array.from(p.routes || []);
+    routes.sort((a, b) => String(a).localeCompare(String(b)));
 
-  // quais clusters importados existem
-  const clustersImportados = new Set(
-    Array.from(this.routes.values()).map(r => this.normalizeCluster(r.cluster)).filter(Boolean)
-  );
+    const clustersImportados = new Set(
+      Array.from(this.routes.values()).map(r => this.normalizeCluster(r.cluster)).filter(Boolean)
+    );
 
-  // checa para cada routeKey se o cluster existe nas rotas importadas
-  const detalhes = routes.map(rk => {
-    const m = String(rk).match(/^assignment:(.+)$/);
-    const cl = this.normalizeCluster(m?.[1] || '');
-    const ok = cl && clustersImportados.has(cl);
-    return `- ${rk}  => cluster: ${cl || '(vazio)'}  ${ok ? '[OK]' : '[NÃO ENCONTRADO NAS ROTAS IMPORTADAS]'}`;
-  });
+    const detalhes = routes.map(rk => {
+      const m = String(rk).match(/^assignment:(.+)$/);
+      const cl = this.normalizeCluster(m?.[1] || '');
+      const ok = cl && clustersImportados.has(cl);
+      return `- ${rk}  => cluster: ${cl || '(vazio)'}  ${ok ? '[OK]' : '[NÃO ENCONTRADO NAS ROTAS IMPORTADAS]'}`;
+    });
 
-  const msg =
-    `PLACA ATIVA: ${plateKey}\n` +
-    `ROTAS VINCULADAS: ${routes.length}\n\n` +
-    (detalhes.length ? detalhes.join('\n') : '(nenhuma rota vinculada)\n') +
-    `\n\nObs: [OK] significa que existe rota importada com cluster igual ao do QR.`;
+    const msg =
+      `PLACA ATIVA: ${plateKey}\n` +
+      `ROTAS VINCULADAS: ${routes.length}\n\n` +
+      (detalhes.length ? detalhes.join('\n') : '(nenhuma rota vinculada)\n') +
+      `\n\nObs: [OK] significa que existe rota importada com cluster igual ao do QR.`;
 
-  alert(msg);
+    alert(msg);
   },
 
   clearBipagemForPlate(plateKeyRaw) {
@@ -2044,7 +1914,6 @@ this.saveToStorage(this.workDay);
     const p = this.carretas.plates.get(plateKey);
     if (!p) return alert('Essa placa não está carregada/vinculada.');
 
-    // 1) remove vínculo das rotas QR na estrutura carretas
     const routeKeys = Array.from(p.routes || []);
     for (const rk of routeKeys) {
       this.carretas.routeToPlate.delete(rk);
@@ -2053,10 +1922,8 @@ this.saveToStorage(this.workDay);
       this.carretas.routesTs.delete(rk);
     }
 
-    // zera lista de rotas na placa
     p.routes = new Set();
 
-    // 2) limpa também nas rotas do sistema (conferência)
     for (const r of this.routes.values()) {
       if ((r.plateKey || '').toUpperCase() === plateKey) {
         r.plateKey = '';
@@ -2069,7 +1936,6 @@ this.saveToStorage(this.workDay);
       }
     }
 
-    // se a placa ativa era essa, mantém ativa mas sem rotas
     if (this.carretas.currentPlateKey === plateKey) {
       this.carretas.currentPlateKey = plateKey;
     }
@@ -2077,7 +1943,7 @@ this.saveToStorage(this.workDay);
     this.saveToStorage(this.workDay);
     this.markDirty('excluir bipagem placa');
     this.renderCarretaUI();
-      this.renderPatioGeral();
+    this.renderPatioGeral();
     this.renderAcompanhamento();
 
     alert(`Bipagem/vínculos removidos para a placa ${plateKey}.`);
@@ -2115,19 +1981,16 @@ this.saveToStorage(this.workDay);
     );
 
     $sum.text(`${routesArr.length} rota(s) vinculada(s)`);
-      this.renderCarretaProgress();
+    this.renderCarretaProgress();
   },
 
-
   renderCarretaProgress() {
-    // Atualiza o card "Acompanhamento da Placa" (esperadas no dia × bipadas na placa ativa)
     const $label = $('#carreta-progress-label');
     const $pct = $('#carreta-progress-percent');
     const $bar = $('#carreta-progress-bar');
     const $missing = $('#carreta-missing-list');
     const $extra = $('#carreta-extra-list');
 
-    // Se o HTML não tiver esses elementos (caso futuro), não faz nada.
     if (!$label.length || !$pct.length || !$bar.length) return;
 
     const plateKey = this.carretas.currentPlateKey;
@@ -2140,8 +2003,6 @@ this.saveToStorage(this.workDay);
       $bar.attr('aria-valuenow', String(pctVal));
     };
 
-    // ✅ Rotas "esperadas" = rotas IMPORTADAS (routeId) no dia.
-    // Isso permite ver pendências mesmo que você ainda não tenha bipado QR de rota.
     const expected = Array.from(this.routes.keys()).map(String);
     expected.sort((a, b) => (Number(a) - Number(b)) || String(a).localeCompare(String(b)));
 
@@ -2154,7 +2015,6 @@ this.saveToStorage(this.workDay);
 
     const plate = this.carretas.plates.get(plateKey);
 
-    // Rotas importadas já VINCULADAS a essa placa (por cluster via QR, ou por ligação direta)
     const linked = expected.filter(routeId => {
       const r = this.routes.get(String(routeId));
       return r && String(r.plateKey || '') === String(plateKey);
@@ -2162,7 +2022,6 @@ this.saveToStorage(this.workDay);
 
     const missing = expected.filter(routeId => !linked.includes(routeId));
 
-    // "Extra" aqui vira: QRs de rota bipados nessa placa que NÃO batem com nenhuma rota importada.
     const clustersImportados = new Set(
       Array.from(this.routes.values()).map(r => this.normalizeCluster(r.cluster)).filter(Boolean)
     );
@@ -2204,6 +2063,9 @@ this.saveToStorage(this.workDay);
     );
   },
 
+  renderPatioGeral() {
+    // placeholder seguro caso não exista implementação específica
+  },
 
   playAlertSound() {
     try {
@@ -2213,7 +2075,7 @@ this.saveToStorage(this.workDay);
   },
 
   // =======================
-  // Fora de rota inteligente (global)
+  // Fora de rota inteligente
   // =======================
   findCorrectRouteForId(id) {
     for (const [rid, r] of this.routes.entries()) {
@@ -2270,16 +2132,14 @@ this.saveToStorage(this.workDay);
 
     const correctRouteId = this.findCorrectRouteForId(codigo);
     const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
+
     if (isCorrectHere) {
-      // Se o ID pertence a esta rota, garante que ele fique como CONFERIDO aqui,
-      // mesmo que (por algum motivo) ele não esteja mais em "faltantes".
       if (!r.conferidos.has(codigo)) {
         if (r.faltantes && r.faltantes.has(codigo)) r.faltantes.delete(codigo);
         if (r.foraDeRota && r.foraDeRota.has(codigo)) r.foraDeRota.delete(codigo);
         r.conferidos.add(codigo);
         r.timestamps.set(codigo, now);
 
-        // limpa marcações "fora/dup" em outras rotas e remove timestamps inúteis
         this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
 
         $('#barcode-input').val('').focus();
@@ -2291,11 +2151,9 @@ this.saveToStorage(this.workDay);
         return;
       }
 
-      // já conferido aqui -> deixa cair na regra de duplicado abaixo
       this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
     }
 
-// duplicata se já conferido OU já fora de rota nessa rota
     if (r.conferidos.has(codigo) || r.foraDeRota.has(codigo)) {
       const count = r.duplicados.get(codigo) || 1;
       r.duplicados.set(codigo, count + 1);
@@ -2317,7 +2175,6 @@ this.saveToStorage(this.workDay);
       r.conferidos.add(codigo);
       r.timestamps.set(codigo, now);
 
-      // se entrou como conferido aqui, remove fora de rota em outras rotas
       this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
 
       $('#barcode-input').val('').focus();
@@ -2329,7 +2186,6 @@ this.saveToStorage(this.workDay);
       return;
     }
 
-    // fora de rota
     r.foraDeRota.add(codigo);
     r.timestamps.set(codigo, now);
     if (!this.viaCsv) this.playAlertSound();
@@ -2343,7 +2199,7 @@ this.saveToStorage(this.workDay);
   },
 
   // =======================
-  // Importação HTML: várias rotas
+  // Importação HTML
   // =======================
   importRoutesFromHtml(rawHtml) {
     const html = String(rawHtml || '').replace(/<[^>]+>/g, ' ');
@@ -2370,12 +2226,13 @@ this.saveToStorage(this.workDay);
       if (!routeMatch) continue;
 
       const routeId = String(routeMatch[1]);
-      // ✅ Se esta rota foi excluída antes, ao importar novamente devemos 'reviver'
+
       if (this.deletedRoutes?.has(routeId)) {
         this.deletedRoutes.delete(routeId);
         if (!this.revivedRoutes) this.revivedRoutes = new Map();
         this.revivedRoutes.set(routeId, Date.now());
       }
+
       const route = this.routes.get(routeId) || this.makeEmptyRoute(routeId);
 
       const clusterMatch = /"cluster":"([^"]+)"/.exec(block);
@@ -2388,9 +2245,6 @@ this.saveToStorage(this.workDay);
       }
 
       const idsExtraidos = new Set();
-
-      // Extrai IDs de envio de forma tolerante (sem depender de receiver_id).
-      // Padrão: "id": 11 dígitos (na prática começam com 4...)
       const regexId = /"id":\s*(\d{11})/g;
       let mId;
       while ((mId = regexId.exec(block)) !== null) {
@@ -2408,59 +2262,43 @@ this.saveToStorage(this.workDay);
       route.totalInicial = route.ids.size;
       this.routes.set(routeId, route);
       imported++;
-      
     }
-    
 
+    this.lastRoutesSignature = '';
     this.saveToStorage(this.workDay);
-
     this.markDirty('import HTML');
 
     this.renderRoutesSelects();
     this.renderAcompanhamento();
-    // garante que rota importada fica ativa
+
     if (imported) this.currentRouteId = String(this.routes.keys().next().value);
     this.refreshUIFromCurrent();
-    // retira o alerta de rota não encontrada ao trocar de rota, caso a rota importada seja a ativa
     $('#route-not-found-alert').hide();
-    
     this.atualizarListas();
 
     return imported;
-    
-    
   },
 
   // =======================
-  // EXPORT: rota atual CSV (FORMATO ANTIGO PADRÃO)
+  // Export helpers
   // =======================
+  getIdsForExportByTimestamp(r) {
+    if (!r) return [];
+    const set = new Set([
+      ...Array.from(r.conferidos || []),
+      ...Array.from(r.foraDeRota || []),
+      ...Array.from((r.duplicados || new Map()).keys())
+    ]);
+    const ids = Array.from(set);
 
-  // =======================
-// Export helpers
-// =======================
-getIdsForExportByTimestamp(r) {
-  if (!r) return [];
-  const set = new Set([
-    ...Array.from(r.conferidos || []),
-    ...Array.from(r.foraDeRota || []),
-    ...Array.from((r.duplicados || new Map()).keys())
-  ]);
-  const ids = Array.from(set);
+    ids.sort((a, b) => {
+      const ta = r.timestamps?.get(a) ? Number(r.timestamps.get(a)) : 0;
+      const tb = r.timestamps?.get(b) ? Number(r.timestamps.get(b)) : 0;
+      return (ta - tb) || String(a).localeCompare(String(b));
+    });
+    return ids;
+  },
 
-  ids.sort((a, b) => {
-    const ta = r.timestamps?.get(a) ? Number(r.timestamps.get(a)) : 0;
-    const tb = r.timestamps?.get(b) ? Number(r.timestamps.get(b)) : 0;
-    return (ta - tb) || String(a).localeCompare(String(b));
-  });
-  return ids;
-},
-
-// =======================
-  // EXPORT: CSV com PLACA + QR ROTA (novo)
-  // =======================
-  // CSV estilo "scanner" (igual exemplo)
-  // Cada linha é um evento com colunas: date,time,time_zone,format,text,notes,favorite,date_utc,time_utc,metadata
-  // =======================
   csvEscape(v) {
     const s = (v == null) ? '' : String(v);
     return '"' + s.replace(/"/g, '""') + '"';
@@ -2470,21 +2308,19 @@ getIdsForExportByTimestamp(r) {
     return '"date","time","time_zone","format","text","notes","favorite","date_utc","time_utc","metadata"';
   },
 
-    buildScannerCsvRow(dt, format, text, metadata = '') {
+  buildScannerCsvRow(dt, format, text, metadata = '') {
     const d = (dt instanceof Date) ? dt : new Date(Number(dt || Date.now()));
     const pad2 = n => String(n).padStart(2, '0');
 
-    const date = `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+    const date = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 
-    // UTC
     const iso = d.toISOString();
     const dateUtc = iso.slice(0, 10);
     const timeUtc = iso.split('T')[1].split('.')[0];
 
     const tzLabel = 'Horário Padrão do Amazonas';
 
-    // IMPORTANT: o validador espera tudo entre aspas e separador vírgula
     const esc = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
 
     return [
@@ -2501,12 +2337,6 @@ getIdsForExportByTimestamp(r) {
     ].join(',');
   },
 
-  // Monta as linhas (scanner) de uma rota: PLACA -> QR ROTA -> IDs (por timestamp)
-    // Monta as linhas (scanner) de uma rota: PLACA -> QR ROTA -> IDs (por timestamp)
-  // Formato validado:
-  // - linha de PLACA: QR Code com JSON contendo "license_plate"
-  // - linha de ROTA: QR Code com JSON contendo container_id/facility_id/assignment quando houver
-  // - linhas de IDs: QR Code com JSON {"id":"<id>","t":"lm"}
   buildScannerCsvLinesForRoute(r) {
     const lines = [];
     if (!r) return lines;
@@ -2517,14 +2347,12 @@ getIdsForExportByTimestamp(r) {
     const plateTs = r.plateScanTs || firstIdTs;
     const routeTs = r.routeQrScanTs || (plateTs ? (Number(plateTs) + 1) : firstIdTs);
 
-    // ===== PLACA (JSON deve conter license_plate) =====
     let plateText = '';
     if (r.plateKey) {
       const p = this.carretas?.plates?.get(r.plateKey);
       if (p && p.jsonText) {
         plateText = String(p.jsonText);
       } else {
-        // fallback mínimo (mas compatível com o validador)
         plateText = JSON.stringify({
           id: (p && p.id) ? Number(p.id) : undefined,
           carrier_id: (p && p.carrier_id) ? Number(p.carrier_id) : undefined,
@@ -2534,22 +2362,18 @@ getIdsForExportByTimestamp(r) {
           vehicle_type_id: (p && p.vehicle_type_id) ? Number(p.vehicle_type_id) : undefined,
           tracking_provider_ids: []
         }, (k, v) => (v === undefined ? undefined : v));
-        // remove undefined
         plateText = plateText.replace(/,\s*"(?:id|carrier_id|carrier_name|vehicle_type_description|vehicle_type_id)"\s*:\s*null/g, '');
       }
     }
 
-    // ===== QR DA ROTA (JSON) =====
     let routeText = '';
     if (r.routeQrKey) {
-      // tenta pegar json salvo na estrutura carretas
       const routeJson = this.carretas?.routesJson?.get(r.routeQrKey);
       if (routeJson) {
         routeText = String(routeJson);
       } else if (r.routeQrRaw && String(r.routeQrRaw).trim().startsWith('{')) {
         routeText = String(r.routeQrRaw).trim();
       } else {
-        // fallback: monta JSON com assignment
         routeText = JSON.stringify({
           container_id: (r.container_id != null) ? Number(r.container_id) : undefined,
           facility_id: (r.destinationFacilityId || ''),
@@ -2561,7 +2385,6 @@ getIdsForExportByTimestamp(r) {
     if (plateText) lines.push(this.buildScannerCsvRow(plateTs, 'QR Code', plateText, ''));
     if (routeText) lines.push(this.buildScannerCsvRow(routeTs, 'QR Code', routeText, ''));
 
-    // ===== IDs: QR Code + JSON com id =====
     for (const id of ids) {
       const ts = r.timestamps?.get(id) || Date.now();
       const payload = JSON.stringify({ id: String(id), t: 'lm' });
@@ -2571,12 +2394,7 @@ getIdsForExportByTimestamp(r) {
     return lines;
   },
 
-  // - 1 arquivo por rota (rota atual)
-  // - 1 arquivo com todas as rotas
-  // - 1 arquivo "mapa" (placa -> rotas qrs)
-  // =======================
-  
-    exportRotaAtualCsvComPlacaERota() {
+  exportRotaAtualCsvComPlacaERota() {
     const r = this.current;
     if (!r) return alert('Nenhuma rota selecionada.');
 
@@ -2602,13 +2420,12 @@ getIdsForExportByTimestamp(r) {
     link.click();
   },
 
-    exportTodasRotasCsvComPlacaERota() {
+  exportTodasRotasCsvComPlacaERota() {
     if (!this.routes || this.routes.size === 0) return alert('Não há rotas salvas para exportar.');
 
-    // Agrupa por PLACA
-    const plateGroups = new Map(); // plateKey -> [routeObj]
+    const plateGroups = new Map();
     for (const r of this.routes.values()) {
-      if (!r.plateKey || !r.routeQrKey) continue; // só rotas vinculadas
+      if (!r.plateKey || !r.routeQrKey) continue;
       if (!plateGroups.has(r.plateKey)) plateGroups.set(r.plateKey, []);
       plateGroups.get(r.plateKey).push(r);
     }
@@ -2620,14 +2437,14 @@ getIdsForExportByTimestamp(r) {
     const lines = [];
     lines.push(this.buildScannerCsvHeader());
 
-    const plateKeys = Array.from(plateGroups.keys()).sort((a,b)=>String(a).localeCompare(String(b)));
+    const plateKeys = Array.from(plateGroups.keys()).sort((a, b) => String(a).localeCompare(String(b)));
 
     for (const plateKey of plateKeys) {
       const routesArr = plateGroups.get(plateKey) || [];
-      routesArr.sort((a,b) => {
-        const ca = String(a.cluster||'').localeCompare(String(b.cluster||''));
+      routesArr.sort((a, b) => {
+        const ca = String(a.cluster || '').localeCompare(String(b.cluster || ''));
         if (ca !== 0) return ca;
-        return String(a.routeId||'').localeCompare(String(b.routeId||''));
+        return String(a.routeId || '').localeCompare(String(b.routeId || ''));
       });
 
       for (const r of routesArr) {
@@ -2644,7 +2461,7 @@ getIdsForExportByTimestamp(r) {
     link.href = URL.createObjectURL(blob);
 
     const now = new Date();
-    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
+    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth() + 1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
     link.download = `RECEBIMENTO_${this.workDay || this.todayLocalISO()}_PLACAS_ROTAS_${stamp}.csv`;
     link.click();
   },
@@ -2663,7 +2480,7 @@ getIdsForExportByTimestamp(r) {
       const vt = (p.vehicle_type_description || '').replace(/,/g, ' ');
       for (const rk of Array.from(p.routes)) {
         const raw = (this.carretas.routesRaw.get(rk) || '').replace(/\r?\n/g, ' ');
-        const rawEsc = `"${String(raw).replace(/"/g,'""')}"`;
+        const rawEsc = `"${String(raw).replace(/"/g, '""')}"`;
         linhas.push(`${plateKey},${carrier},${vt},${rk},${rawEsc}`);
       }
     }
@@ -2674,7 +2491,7 @@ getIdsForExportByTimestamp(r) {
     link.href = URL.createObjectURL(blob);
 
     const now = new Date();
-    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
+    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth() + 1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
     link.download = `mapa_carretas_${this.workDay || this.todayLocalISO()}_${stamp}.csv`;
     link.click();
   },
@@ -2726,7 +2543,7 @@ getIdsForExportByTimestamp(r) {
     const linhas = all.map(id => {
       const lidaEm = parseDateSafe(r.timestamps.get(id));
       const pad2 = n => String(n).padStart(2, '0');
-      const date = `${lidaEm.getFullYear()}-${pad2(lidaEm.getMonth()+1)}-${pad2(lidaEm.getDate())}`;
+      const date = `${lidaEm.getFullYear()}-${pad2(lidaEm.getMonth() + 1)}-${pad2(lidaEm.getDate())}`;
       const time = `${pad2(lidaEm.getHours())}:${pad2(lidaEm.getMinutes())}:${pad2(lidaEm.getSeconds())}`;
 
       const dateUtc = lidaEm.toISOString().slice(0, 10);
@@ -2748,10 +2565,6 @@ getIdsForExportByTimestamp(r) {
     link.click();
   },
 
-  // =======================
-  // EXPORT: todas as rotas XLSX
-  // 1 aba ("Bipagens"), 1 coluna por rota, só IDs conferidos
-  // =======================
   exportTodasRotasXlsx() {
     if (typeof XLSX === 'undefined') {
       alert('Biblioteca XLSX não carregou. Verifique o script do SheetJS no HTML.');
@@ -2798,7 +2611,7 @@ getIdsForExportByTimestamp(r) {
     XLSX.utils.book_append_sheet(wb, ws, 'Bipagens');
 
     const now = new Date();
-    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth()+1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
+    const stamp = `${now.getFullYear()}-${this.pad2(now.getMonth() + 1)}-${this.pad2(now.getDate())}_${this.pad2(now.getHours())}${this.pad2(now.getMinutes())}`;
 
     XLSX.writeFile(wb, `bipagens_todas_rotas_${this.workDay || this.todayLocalISO()}_${stamp}.xlsx`);
   }
@@ -2807,10 +2620,7 @@ getIdsForExportByTimestamp(r) {
 // =======================
 // Eventos / Boot
 // =======================
-
 $(document).ready(async () => {
-
-  // ===== Pesquisa de IDs no Banco (Histórico) =====
   $(document).on('click', '#db-search-open', () => {
     $('#initial-interface').addClass('d-none');
     $('#db-search-interface').removeClass('d-none');
@@ -2849,14 +2659,11 @@ $(document).ready(async () => {
     }
   });
 
-
   const today = ConferenciaApp.todayLocalISO();
   $('#work-day').val(today);
 
-  // força seleção de operação ao entrar
   await ConferenciaApp.ensureOperationSelected();
 
-  // se já tiver operação, carrega o dia
   if (ConferenciaApp.getOperationCode()) {
     await ConferenciaApp.applyWorkDay(today);
   }
@@ -2880,9 +2687,23 @@ $(document).on('click', '#btn-change-op', async () => {
   $('#modal-operation').modal('show');
 });
 
+// Filtro de rotas
+$(document).on('focus mousedown keydown input', '#saved-routes-inapp, #saved-routes, #route-search', () => {
+  ConferenciaApp.lockRouteUi(3000);
+});
 
-// Filtro de rotas (pesquisa por cluster)
+$(document).on('focus', '#saved-routes-inapp', () => {
+  ConferenciaApp.isRouteDropdownOpen = true;
+  ConferenciaApp.lockRouteUi(3000);
+});
+
+$(document).on('blur change', '#saved-routes-inapp', () => {
+  ConferenciaApp.isRouteDropdownOpen = false;
+  ConferenciaApp.lockRouteUi(800);
+});
+
 $(document).on('input', '#route-search', (e) => {
+  ConferenciaApp.lockRouteUi(3000);
   ConferenciaApp.applyRouteDropdownFilter(e.target.value);
 });
 
@@ -2893,13 +2714,10 @@ $(document).on('change', '#work-day', async (e) => {
   await ConferenciaApp.applyWorkDay(day);
 });
 
-// =======================
-// Relatório noturno (sidebar)
-// =======================
+// Relatório noturno
 $(document).on('click', '#finish-night-btn', () => {
   try {
     ConferenciaApp.showNightReport();
-    // garante que o conteúdo do relatório fique visível
     const el = document.querySelector('#night-report');
     if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
   } catch (e) {
@@ -2908,7 +2726,6 @@ $(document).on('click', '#finish-night-btn', () => {
   }
 });
 
-// Botão vermelho da tela principal também pode abrir o relatório noturno
 $(document).on('click', '#finish-btn', () => {
   try {
     ConferenciaApp.showNightReport();
@@ -2932,9 +2749,7 @@ $('#extract-btn').click(() => {
   const qtd = ConferenciaApp.importRoutesFromHtml(raw);
   if (!qtd) return alert('Nenhuma rota importada. Confira se o HTML está completo.');
 
-  // ✅ limpa o campo após importar
   $('#html-input').val('');
-
 });
 
 // Carregar rota
@@ -2959,14 +2774,12 @@ $('#delete-route').click(() => {
 
 // Limpar todas
 $('#clear-all-routes').click(() => {
-  // 1ª confirmação (sim/não)
   const ok1 = confirm(
     'ATENÇÃO: isso vai APAGAR TODAS as rotas do DIA selecionado.\n\n' +
     'Quer continuar?'
   );
   if (!ok1) return;
 
-  // 2ª confirmação (digitação)
   const day = ConferenciaApp.workDay || $('#work-day').val() || '(dia desconhecido)';
   const typed = prompt(
     `CONFIRMAÇÃO FINAL\n\n` +
@@ -3019,6 +2832,7 @@ $('#submit-manual').click(() => {
     route.totalInicial = route.ids.size;
     ConferenciaApp.routes.set(String(routeId), route);
 
+    ConferenciaApp.lastRoutesSignature = '';
     ConferenciaApp.saveToStorage(ConferenciaApp.workDay);
     ConferenciaApp.markDirty('inserção manual');
 
@@ -3034,7 +2848,7 @@ $('#submit-manual').click(() => {
   }
 });
 
-// Leitura do barcode (ENTER)
+// Leitura do barcode
 $('#barcode-input').on('keypress', (e) => {
   if (e.which === 13) {
     ConferenciaApp.viaCsv = false;
@@ -3051,7 +2865,7 @@ $('#barcode-input').on('keypress', (e) => {
   }
 });
 
-// Checar CSV (importa bipagens)
+// Checar CSV
 $('#check-csv').click(() => {
   const r = ConferenciaApp.current;
   if (!r) return alert('Selecione uma rota antes.');
@@ -3099,22 +2913,16 @@ $(document).on('click', '#export-xlsx-todas-rotas', () => {
   ConferenciaApp.exportTodasRotasXlsx();
 });
 
-// Sem bind no finalizar
 $('#back-btn').click(() => {
-  // volta para a tela inicial sem perder conexão do arquivo
   $('#conference-interface').addClass('d-none');
   $('#manual-interface').addClass('d-none');
   $('#initial-interface').removeClass('d-none');
 
-  // opcional: limpa campo de leitura e foca
   $('#barcode-input').val('');
   $('#html-input').focus();
 });
 
-
-// =======================
-// Carretas: abrir/voltar + leitura
-// =======================
+// Carretas
 $(document).on('click', '#carreta-btn', () => {
   $('#initial-interface').addClass('d-none');
   $('#conference-interface').addClass('d-none');
@@ -3137,16 +2945,15 @@ $(document).on('click', '#carreta-clear-current', () => {
   ConferenciaApp.renderCarretaUI();
   $('#carreta-input').val('').focus();
 });
+
 $(document).on('click', '#patio-refresh', function() {
   ConferenciaApp.renderPatioGeral();
 });
+
 $(document).on('click', '#carreta-refresh-progress', () => {
   ConferenciaApp.renderCarretaProgress();
 });
 
-
-
-// leitura na tela de carretas (scanner costuma enviar ENTER; alguns enviam via keydown)
 const processCarretaScan = (rawValue) => {
   const raw = String(rawValue || '').trim();
   if (!raw) return;
@@ -3179,7 +2986,6 @@ const processCarretaScan = (rawValue) => {
     return;
   }
 
-  // Se cair aqui, pode ser ID de envio; nessa tela a gente só avisa para não misturar
   if (parsed.kind === 'shipment') {
     alert('Aqui é a tela da CARRETA. Bipe a PLACA e os QRs das ROTAS (assignment/container).');
     return;
@@ -3196,6 +3002,7 @@ $(document).on('keydown', '#carreta-input', (e) => {
     processCarretaScan(raw);
   }
 });
+
 $(document).on('click', '#carreta-check-links', () => {
   ConferenciaApp.checkLinksForCurrentPlate();
 });
@@ -3218,7 +3025,6 @@ $(document).on('keypress', '#carreta-input', (e) => {
   }
 });
 
-// suporte a colar (alguns leitores “digitam” e você cola do CSV)
 $(document).on('paste', '#carreta-input', (e) => {
   const pasted = (e.originalEvent && e.originalEvent.clipboardData)
     ? e.originalEvent.clipboardData.getData('text')
@@ -3230,21 +3036,20 @@ $(document).on('paste', '#carreta-input', (e) => {
   }, 0);
 });
 
-// Exports novos (CSV com placa/rota)
+// Exports novos
 $(document).on('click', '#export-csv-rota-atual-placa', () => {
   ConferenciaApp.exportRotaAtualCsvComPlacaERota();
 });
+
 $(document).on('click', '#export-csv-todas-rotas-placa', () => {
   ConferenciaApp.exportTodasRotasCsvComPlacaERota();
 });
+
 $(document).on('click', '#export-csv-mapa-carretas', () => {
   ConferenciaApp.exportMapaCarretasCsv();
 });
 
-
-// =======================
-// Admin UI handlers
-// =======================
+// Admin UI
 $(document).on('click', '#btn-admin-open', async () => {
   $('#modal-admin').modal('show');
 });
@@ -3303,14 +3108,11 @@ $(document).on('click', '#btn-admin-save-op', async () => {
   }
 });
 
-
-
-
-// Abrir acompanhamento geral (todas operações)
+// Acompanhamento geral
 $(document).on('click', '#btn-global-acomp', async () => {
   try {
     const day = $('#work-day').val() || ConferenciaApp.todayLocalISO();
-    // troca telas
+
     $('#initial-interface').addClass('d-none');
     $('#carreta-interface').addClass('d-none');
     $('#manual-interface').addClass('d-none');
@@ -3342,9 +3144,7 @@ $(document).on('click', '#global-back', () => {
   $('#initial-interface').removeClass('d-none');
 });
 
-
-
-// encerra canal realtime ao sair da página
+// encerra realtime ao sair
 window.addEventListener('beforeunload', () => {
   try { ConferenciaApp.stopRealtimeSync(); } catch {}
 });
