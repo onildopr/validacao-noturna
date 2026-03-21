@@ -329,7 +329,7 @@ const ConferenciaApp = {
           if (this._rtRetryTimer) clearTimeout(this._rtRetryTimer);
           this._rtRetryTimer = setTimeout(() => {
             if (this.getOperationCode() === op && (this.workDay || this.todayLocalISO()) === dayISO) {
-              this.startRealtimeSync(dayISO).catch(() => {});
+              this.saveToStorage(dayISO, { syncCloud: false });
             }
           }, 2000);
         }
@@ -381,25 +381,33 @@ const ConferenciaApp = {
     if (error) throw error;
   },
 
-  markCloudDirty() {
+  markCloudDirty(targetDay = this.workDay || this.todayLocalISO(), targetOp = this.getOperationCode()) {
     this.cloudDirty = true;
     this.lastLocalMutationAt = Date.now();
+
+    this.pendingCloudSave = {
+      day: targetDay,
+      op: targetOp
+    };
+
     if (this.cloudSaveTimer) clearTimeout(this.cloudSaveTimer);
+
     this.cloudSaveTimer = setTimeout(() => {
-      this.flushCloudSave().catch(e => {
+      const pending = this.pendingCloudSave || {};
+      this.flushCloudSave(pending.op, pending.day).catch(e => {
         console.warn('Falha ao salvar no Supabase (vai tentar de novo depois):', e);
         this.setStatus('Falha ao salvar no banco (Supabase). Mantido no cache local.', 'warning');
       });
     }, 1200);
   },
 
-  async flushCloudSave() {
+  async flushCloudSave(forceOp, forceDay) {
     if (!this.cloudEnabled) return;
     if (this.cloudSaving) return;
     if (!this.cloudDirty) return;
 
-    const op = this.getOperationCode();
-    const day = this.workDay || this.todayLocalISO();
+    const op = forceOp || this.getOperationCode();
+    const day = forceDay || this.workDay || this.todayLocalISO();
     if (!op || !day) return;
 
     this.cloudSaving = true;
@@ -412,6 +420,7 @@ const ConferenciaApp = {
 
       this.cloudDirty = false;
       this.cloudLastSaveAt = Date.now();
+      this.pendingCloudSave = null;
       this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
 
       this.dirty = false;
@@ -504,7 +513,7 @@ const ConferenciaApp = {
       if (!row || !row.data) return;
 
       this.mergeSnapshotIntoLocal(row.data);
-      this.saveToStorage(dayISO);
+      this.saveToStorage(dayISO, { syncCloud: false });
 
       this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
     } catch (e) {
@@ -1173,19 +1182,27 @@ create policy "routes_state_update_all"
     }
   },
 
-  saveToStorage(dayISO) {
+  saveToStorage(dayISO, opts = {}) {
+    const { syncCloud = true } = opts;
+
     try {
       const key = this.storageKeyForDay(dayISO);
       const obj = {};
+
       for (const [routeId, r] of this.routes.entries()) {
         obj[routeId] = this.serializeRoute(r);
       }
+
       obj.__meta = {
         deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map()),
         revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map())
       };
+
       localStorage.setItem(key, JSON.stringify(obj));
-      this.markCloudDirty();
+
+      if (syncCloud) {
+        this.markCloudDirty(dayISO, this.getOperationCode());
+      }
     } catch (e) {
       console.warn('Falha ao salvar storage:', e);
     }
@@ -1275,9 +1292,18 @@ create policy "routes_state_update_all"
   // Troca de dia
   // =======================
   async applyWorkDay(dayISO) {
+    if (this.cloudSaveTimer) {
+      clearTimeout(this.cloudSaveTimer);
+      this.cloudSaveTimer = null;
+    }
+
     this.routes.clear();
     this.currentRouteId = null;
     this.lastRoutesSignature = '';
+
+    this.deletedRoutes = new Map();
+    this.revivedRoutes = new Map();
+    this.lastEvents = [];
 
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
@@ -1425,7 +1451,6 @@ create policy "routes_state_update_all"
     this.currentRouteId = id;
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
-    this.saveToStorage(this.workDay);
     this.renderAcompanhamento();
   },
 
@@ -1616,15 +1641,17 @@ create policy "routes_state_update_all"
   clearAllRoutes() {
     if (!this.deletedRoutes) this.deletedRoutes = new Map();
     const now = Date.now();
+
     for (const rid of this.routes.keys()) {
       this.deletedRoutes.set(String(rid), now);
       if (this.revivedRoutes) this.revivedRoutes.delete(String(rid));
     }
+
     this.routes.clear();
     this.currentRouteId = null;
     this.lastRoutesSignature = '';
 
-    localStorage.removeItem(this.storageKeyForDay(this.workDay));
+    this.saveToStorage(this.workDay, { syncCloud: true });
     this.markDirty('limpar dia');
 
     this.renderRoutesSelects();
