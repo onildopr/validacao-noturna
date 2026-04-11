@@ -27,6 +27,9 @@ const ConferenciaApp = {
   // ===== Realtime sync (Supabase) =====
   rtChannel: null,
   rtBound: { op: null, day: null },
+  lastRemoteUpdatedAt: null,
+  lastPushedSnapshotHash: '',
+  lastSavedLocalSnapshotHash: '',
 
   // =======================
   // Carretas (Placa -> Rotas QR)
@@ -173,6 +176,10 @@ const ConferenciaApp = {
   // =======================
   getSb() {
     if (window.__confSbClient) return window.__confSbClient;
+    if (window.sbClient) {
+      window.__confSbClient = window.sbClient;
+      return window.__confSbClient;
+    }
     if (!window.supabase || !window.SB_URL || !window.SB_ANON) return null;
 
     const url = window.SB_URL;
@@ -180,13 +187,19 @@ const ConferenciaApp = {
 
     window.__confSbClient = window.supabase.createClient(url, key, {
       auth: {
-        persistSession: true,
-        autoRefreshToken: true,
+        persistSession: false,
+        autoRefreshToken: false,
         detectSessionInUrl: false,
       },
       global: {
         headers: {
           apikey: key,
+          Authorization: `Bearer ${key}`,
+        },
+      },
+      realtime: {
+        params: {
+          eventsPerSecond: 2,
         },
       },
     });
@@ -280,7 +293,7 @@ const ConferenciaApp = {
       .channel('routes_state_live')
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'routes_state' },
+        { event: '*', schema: 'public', table: 'routes_state', filter: `operation_code=eq.${op}` },
         async (payload) => {
           try {
             if (this.cloudDirty) return;
@@ -292,8 +305,9 @@ const ConferenciaApp = {
             if (row.day !== dayISO) return;
             if (row.device_id && row.device_id === this.getDeviceId()) return;
 
+            this.lastRemoteUpdatedAt = row.updated_at || this.lastRemoteUpdatedAt;
             this.mergeSnapshotIntoLocal(row.data);
-            this.saveToStorage(dayISO);
+            this.saveToStorage(dayISO, { syncCloud: false });
 
             if (this._rtUiTimer) clearTimeout(this._rtUiTimer);
             this._rtUiTimer = setTimeout(() => {
@@ -349,6 +363,14 @@ const ConferenciaApp = {
       revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map())
     };
     return obj;
+  },
+
+  computeSnapshotHash(snapshotObj) {
+    try {
+      return JSON.stringify(snapshotObj || {});
+    } catch {
+      return `${Date.now()}`;
+    }
   },
 
   async supaLoadDaySnapshot(operationCode, dayISO) {
@@ -412,15 +434,24 @@ const ConferenciaApp = {
 
     this.cloudSaving = true;
     try {
-      const row = await this.supaLoadDaySnapshot(op, day).catch(() => null);
-      if (row && row.data) this.mergeSnapshotIntoLocal(row.data);
-
       const snapshot = this.buildDaySnapshotObject();
+      const snapshotHash = this.computeSnapshotHash(snapshot);
+      if (snapshotHash === this.lastPushedSnapshotHash) {
+        this.cloudDirty = false;
+        this.pendingCloudSave = null;
+        this.dirty = false;
+        $('#dirty-flag').addClass('d-none');
+        this.setStatus(`Sem mudanças para salvar • ${op} • ${day}`, 'info');
+        return;
+      }
+
       await this.supaSaveDaySnapshot(op, day, snapshot);
 
       this.cloudDirty = false;
       this.cloudLastSaveAt = Date.now();
       this.pendingCloudSave = null;
+      this.lastPushedSnapshotHash = snapshotHash;
+      this.lastRemoteUpdatedAt = new Date().toISOString();
       this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
 
       this.dirty = false;
@@ -512,6 +543,13 @@ const ConferenciaApp = {
       const row = await this.supaLoadDaySnapshot(op, dayISO);
       if (!row || !row.data) return;
 
+      const remoteHash = this.computeSnapshotHash(row.data);
+      if (row.updated_at && this.lastRemoteUpdatedAt === row.updated_at && remoteHash === this.lastPushedSnapshotHash) {
+        return;
+      }
+
+      this.lastRemoteUpdatedAt = row.updated_at || this.lastRemoteUpdatedAt;
+      this.lastPushedSnapshotHash = remoteHash;
       this.mergeSnapshotIntoLocal(row.data);
       this.saveToStorage(dayISO, { syncCloud: false });
 
@@ -1143,6 +1181,8 @@ create policy "routes_state_update_all"
       this.routes.clear();
       this.currentRouteId = null;
 
+      this.lastSavedLocalSnapshotHash = this.computeSnapshotHash(parsed);
+
       for (const [routeId, r] of Object.entries(parsed)) {
         if (routeId === '__meta') continue;
         if (this.deletedRoutes.has(String(routeId))) continue;
@@ -1198,9 +1238,14 @@ create policy "routes_state_update_all"
         revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map())
       };
 
-      localStorage.setItem(key, JSON.stringify(obj));
+      const raw = JSON.stringify(obj);
+      const hash = this.computeSnapshotHash(obj);
+      if (hash !== this.lastSavedLocalSnapshotHash) {
+        localStorage.setItem(key, raw);
+        this.lastSavedLocalSnapshotHash = hash;
+      }
 
-      if (syncCloud) {
+      if (syncCloud && hash !== this.lastPushedSnapshotHash) {
         this.markCloudDirty(dayISO, this.getOperationCode());
       }
     } catch (e) {
@@ -1304,6 +1349,9 @@ create policy "routes_state_update_all"
     this.deletedRoutes = new Map();
     this.revivedRoutes = new Map();
     this.lastEvents = [];
+    this.lastRemoteUpdatedAt = null;
+    this.lastPushedSnapshotHash = '';
+    this.lastSavedLocalSnapshotHash = '';
 
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
