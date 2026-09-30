@@ -1,7 +1,7 @@
-const { jsPDF } = window.jspdf || {};
-
-const SYNC_INTERVAL_MS = 1000;
-const AUTO_SAVE_INTERVAL_MS = 1000;
+// Pull periódico do banco (rede de segurança caso o realtime caia)
+const SYNC_INTERVAL_MS = 15000;
+// Espera após a última bipagem antes de enviar ao banco
+const CLOUD_SAVE_DEBOUNCE_MS = 1200;
 
 // Prefixo de chaves no localStorage (separa por operação e por dia)
 const STORAGE_KEY_PREFIX = 'conferencia.routes.v3';
@@ -17,6 +17,8 @@ const ConferenciaApp = {
   cloudSaving: false,
   cloudLastSaveAt: 0,
   cloudSaveTimer: null,
+  cloudMutationSeq: 0,         // incrementa a cada mudança local (detecta bipagens durante o save)
+  syncTimer: null,
   lastLocalMutationAt: 0,
   cloudPullGraceMs: 2000,
   workDay: null,               // YYYY-MM-DD
@@ -48,19 +50,22 @@ const ConferenciaApp = {
   isRouteDropdownOpen: false,
   lastRoutesSignature: '',
 
+  // Escapa texto antes de inserir em HTML (IDs, clusters, QRs, nomes vindos de fora)
+  escHtml(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  },
+
   lockRouteUi(ms = 2500) {
     this.routeUiLockUntil = Date.now() + ms;
   },
 
   isRouteUiLocked() {
     return this.isRouteDropdownOpen || Date.now() < (this.routeUiLockUntil || 0);
-  },
-
-  getRoutesSignature() {
-    return Array.from(this.routes.values())
-      .map(r => `${r.routeId}|${r.cluster || ''}|${r.destinationFacilityId || ''}`)
-      .sort()
-      .join('||');
   },
 
   // =======================
@@ -210,34 +215,9 @@ const ConferenciaApp = {
   // =======================
   // Admin
   // =======================
-  async adminSignIn(email, password) {
-    const sb = this.getSb();
-    if (!sb) throw new Error('Supabase client não encontrado.');
-
-    const { data, error } = await sb.auth.signInWithPassword({ email, password });
-    if (error) throw error;
-
-    if (!data?.session) {
-      throw new Error('Login ok, mas SEM sessão. Confirme o e-mail do usuário no Supabase Auth.');
-    }
-
-    return data;
-  },
-
-  async adminSignOut() {
-    const sb = this.getSb();
-    if (!sb) throw new Error('Supabase client não encontrado.');
-    const { error } = await sb.auth.signOut();
-    if (error) throw error;
-  },
-
   async adminUpsertOperation(code, name, active = true) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado.');
-
-    const { data: userData, error: userErr } = await sb.auth.getUser();
-    if (userErr) throw userErr;
-    if (!userData?.user) throw new Error('Você não está autenticado. Faça login admin antes de salvar.');
 
     const op = {
       code: String(code || '').trim().toUpperCase(),
@@ -296,8 +276,6 @@ const ConferenciaApp = {
         { event: '*', schema: 'public', table: 'routes_state', filter: `operation_code=eq.${op}` },
         async (payload) => {
           try {
-            if (this.cloudDirty) return;
-
             const row = payload && payload.new;
             if (!row || !row.data) return;
 
@@ -305,29 +283,19 @@ const ConferenciaApp = {
             if (row.day !== dayISO) return;
             if (row.device_id && row.device_id === this.getDeviceId()) return;
 
+            // A mesclagem é por união, então é seguro aplicar mesmo com mudanças locais pendentes
             this.lastRemoteUpdatedAt = row.updated_at || this.lastRemoteUpdatedAt;
             this.mergeSnapshotIntoLocal(row.data);
             this.saveToStorage(dayISO, { syncCloud: false });
 
-            if (this._rtUiTimer) clearTimeout(this._rtUiTimer);
-            this._rtUiTimer = setTimeout(() => {
-              try {
-                const keepRouteId = this.currentRouteId;
-                const routeUiLocked = this.isRouteUiLocked();
+            // Se o local tem algo a mais que o remoto, reenvia a união
+            const remoteHash = this.computeSnapshotHash(row.data);
+            const localHash = this.computeSnapshotHash(this.buildDaySnapshotObject());
+            if (localHash !== remoteHash) this.markCloudDirty(dayISO, op);
+            else if (!this.cloudDirty) this.lastPushedSnapshotHash = remoteHash;
 
-                if (!routeUiLocked) {
-                  this.renderRoutesSelects();
-                } else if (keepRouteId && this.routes.has(String(keepRouteId))) {
-                  this.currentRouteId = String(keepRouteId);
-                }
-
-                this.refreshUIFromCurrent();
-                this.renderAcompanhamento();
-                this.setStatus(`Realtime • atualizado • ${op} • ${dayISO}`, 'info');
-              } catch (e) {
-                console.warn('Falha ao renderizar após realtime:', e);
-              }
-            }, 250);
+            this.refreshAfterRemoteMerge();
+            this.setStatus(`Realtime • atualizado • ${op} • ${dayISO}`, "info");
           } catch (e) {
             console.warn('Falha ao aplicar realtime payload:', e);
           }
@@ -339,13 +307,8 @@ const ConferenciaApp = {
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
           this.setStatus(`Realtime instável • ${op} • ${dayISO}`, 'warning');
         } else if (status === 'CLOSED') {
+          // O pull periódico (startPeriodicSync) cobre o período sem realtime
           this.setStatus(`Realtime CLOSED • ${op} • ${dayISO}`, 'warning');
-          if (this._rtRetryTimer) clearTimeout(this._rtRetryTimer);
-          this._rtRetryTimer = setTimeout(() => {
-            if (this.getOperationCode() === op && (this.workDay || this.todayLocalISO()) === dayISO) {
-              this.saveToStorage(dayISO, { syncCloud: false });
-            }
-          }, 2000);
         }
         try { console.log('[Realtime]', status, { op, dayISO }); } catch {}
       });
@@ -360,14 +323,100 @@ const ConferenciaApp = {
     }
     obj.__meta = {
       deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map()),
-      revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map())
+      revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map()),
+      carretas: this.serializeCarretas()
     };
     return obj;
   },
 
+  // =======================
+  // Carretas: persistência (vai junto no snapshot do dia)
+  // =======================
+  resetCarretas() {
+    this.carretas = {
+      currentPlateKey: null,
+      plates: new Map(),
+      routeToPlate: new Map(),
+      routesRaw: new Map(),
+      routesJson: new Map(),
+      routesTs: new Map(),
+    };
+  },
+
+  serializeCarretas() {
+    const c = this.carretas;
+    const plates = {};
+    for (const [k, p] of c.plates.entries()) {
+      plates[k] = Object.assign({}, p, { routes: Array.from(p.routes || []) });
+    }
+    return {
+      plates,
+      routesRaw: Object.fromEntries(c.routesRaw),
+      routesJson: Object.fromEntries(c.routesJson),
+      routesTs: Object.fromEntries(c.routesTs),
+    };
+  },
+
+  mergeCarretas(ser) {
+    if (!ser || typeof ser !== 'object') return;
+    const c = this.carretas;
+
+    for (const [k, p] of Object.entries(ser.plates || {})) {
+      const remoteRoutes = Array.isArray(p.routes) ? p.routes : [];
+      const cur = c.plates.get(k);
+      if (!cur) {
+        c.plates.set(k, Object.assign({}, p, { routes: new Set(remoteRoutes) }));
+      } else {
+        remoteRoutes.forEach(rk => cur.routes.add(rk));
+        if (Number(p.tsLast || 0) > Number(cur.tsLast || 0)) {
+          for (const f of ['raw', 'jsonText', 'carrier_name', 'vehicle_type_description', 'tsLast', 'tsScan']) {
+            if (p[f]) cur[f] = p[f];
+          }
+        }
+      }
+      remoteRoutes.forEach(rk => c.routeToPlate.set(rk, k));
+    }
+
+    // Desempate determinístico para que todos os aparelhos terminem com o mesmo valor
+    const pick = (map, rk, v) => {
+      const cur = map.get(rk);
+      if (cur == null || String(v) > String(cur)) map.set(rk, v);
+    };
+    for (const [rk, v] of Object.entries(ser.routesRaw || {})) pick(c.routesRaw, rk, v);
+    for (const [rk, v] of Object.entries(ser.routesJson || {})) pick(c.routesJson, rk, v);
+    for (const [rk, v] of Object.entries(ser.routesTs || {})) {
+      if (Number(v) > Number(c.routesTs.get(rk) || 0)) c.routesTs.set(rk, Number(v));
+    }
+
+    // "Excluir bipagem desta placa" precisa vencer a união: remove rotas bipadas antes da limpeza
+    for (const [k, p] of Object.entries(ser.plates || {})) {
+      const cur = c.plates.get(k);
+      if (!cur) continue;
+      cur.clearedAt = Math.max(Number(cur.clearedAt || 0), Number(p.clearedAt || 0));
+      if (!cur.clearedAt) continue;
+      for (const rk of Array.from(cur.routes)) {
+        if (Number(c.routesTs.get(rk) || 0) <= cur.clearedAt) {
+          cur.routes.delete(rk);
+          if (c.routeToPlate.get(rk) === k) c.routeToPlate.delete(rk);
+        }
+      }
+    }
+  },
+
+  // Hash independente de ordem (Sets/Maps viram arrays/objetos em ordem de inserção,
+  // que muda entre aparelhos). Sem isso dois aparelhos ficariam reenviando o mesmo estado.
   computeSnapshotHash(snapshotObj) {
+    const canon = (v) => {
+      if (Array.isArray(v)) return v.map(canon).sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1));
+      if (v && typeof v === 'object') {
+        const out = {};
+        for (const k of Object.keys(v).sort()) out[k] = canon(v[k]);
+        return out;
+      }
+      return v;
+    };
     try {
-      return JSON.stringify(snapshotObj || {});
+      return JSON.stringify(canon(snapshotObj || {}));
     } catch {
       return `${Date.now()}`;
     }
@@ -405,6 +454,7 @@ const ConferenciaApp = {
 
   markCloudDirty(targetDay = this.workDay || this.todayLocalISO(), targetOp = this.getOperationCode()) {
     this.cloudDirty = true;
+    this.cloudMutationSeq++;
     this.lastLocalMutationAt = Date.now();
 
     this.pendingCloudSave = {
@@ -412,98 +462,142 @@ const ConferenciaApp = {
       op: targetOp
     };
 
-    if (this.cloudSaveTimer) clearTimeout(this.cloudSaveTimer);
+    this.scheduleCloudSave(CLOUD_SAVE_DEBOUNCE_MS);
+  },
 
+  scheduleCloudSave(delayMs) {
+    if (this.cloudSaveTimer) clearTimeout(this.cloudSaveTimer);
     this.cloudSaveTimer = setTimeout(() => {
+      this.cloudSaveTimer = null;
       const pending = this.pendingCloudSave || {};
       this.flushCloudSave(pending.op, pending.day).catch(e => {
-        console.warn('Falha ao salvar no Supabase (vai tentar de novo depois):', e);
-        this.setStatus('Falha ao salvar no banco (Supabase). Mantido no cache local.', 'warning');
+        console.warn('Falha ao salvar no Supabase (vai tentar de novo):', e);
+        this.setStatus('Falha ao salvar no banco (Supabase). Mantido no cache local, tentando de novo...', 'warning');
+        this.scheduleCloudSave(5000);
       });
-    }, 1200);
+    }, delayMs);
   },
 
   async flushCloudSave(forceOp, forceDay) {
     if (!this.cloudEnabled) return;
-    if (this.cloudSaving) return;
     if (!this.cloudDirty) return;
+    if (this.cloudSaving) {
+      // Já tem um save em andamento: tenta de novo quando ele terminar
+      this.scheduleCloudSave(500);
+      return;
+    }
 
     const op = forceOp || this.getOperationCode();
     const day = forceDay || this.workDay || this.todayLocalISO();
     if (!op || !day) return;
 
+    // Só envia se o estado em memória ainda for desse dia/operação
+    if (op !== this.getOperationCode() || day !== (this.workDay || this.todayLocalISO())) return;
+
     this.cloudSaving = true;
+    const seqAtStart = this.cloudMutationSeq;
     try {
+      // Ler → mesclar → gravar: incorpora o que outros aparelhos salvaram antes de sobrescrever
+      const remote = await this.supaLoadDaySnapshot(op, day);
+      if (remote && remote.data) {
+        this.mergeSnapshotIntoLocal(remote.data);
+        this.saveToStorage(day, { syncCloud: false });
+      }
+
       const snapshot = this.buildDaySnapshotObject();
       const snapshotHash = this.computeSnapshotHash(snapshot);
-      if (snapshotHash === this.lastPushedSnapshotHash) {
+      const remoteHash = remote && remote.data ? this.computeSnapshotHash(remote.data) : '';
+
+      if (snapshotHash !== remoteHash) {
+        await this.supaSaveDaySnapshot(op, day, snapshot);
+        this.lastRemoteUpdatedAt = new Date().toISOString();
+      }
+
+      this.cloudLastSaveAt = Date.now();
+      this.lastPushedSnapshotHash = snapshotHash;
+
+      // Se alguém bipou durante o save, continua sujo e agenda outro envio
+      if (this.cloudMutationSeq !== seqAtStart) {
+        this.scheduleCloudSave(300);
+      } else {
         this.cloudDirty = false;
         this.pendingCloudSave = null;
         this.dirty = false;
         $('#dirty-flag').addClass('d-none');
-        this.setStatus(`Sem mudanças para salvar • ${op} • ${day}`, 'info');
-        return;
+        this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
       }
 
-      await this.supaSaveDaySnapshot(op, day, snapshot);
-
-      this.cloudDirty = false;
-      this.cloudLastSaveAt = Date.now();
-      this.pendingCloudSave = null;
-      this.lastPushedSnapshotHash = snapshotHash;
-      this.lastRemoteUpdatedAt = new Date().toISOString();
-      this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
-
-      this.dirty = false;
-      $('#dirty-flag').addClass('d-none');
+      if (remote && remote.data) this.refreshAfterRemoteMerge();
     } finally {
       this.cloudSaving = false;
     }
   },
 
+  // Re-renderiza a tela depois de mesclar dados vindos do banco
+  refreshAfterRemoteMerge() {
+    if (this._rtUiTimer) clearTimeout(this._rtUiTimer);
+    this._rtUiTimer = setTimeout(() => {
+      try {
+        const keepRouteId = this.currentRouteId;
+        if (!this.isRouteUiLocked()) {
+          this.renderRoutesSelects();
+        } else if (keepRouteId && this.routes.has(String(keepRouteId))) {
+          this.currentRouteId = String(keepRouteId);
+        }
+        this.refreshUIFromCurrent();
+        this.renderAcompanhamento();
+        if (!$('#carreta-interface').hasClass('d-none')) this.renderCarretaUI();
+      } catch (e) {
+        console.warn('Falha ao renderizar após sync:', e);
+      }
+    }, 250);
+  },
+
+  // Converte duplicados antigos (que viraram array por bug de merge) em número
+  dupCount(v) {
+    if (Array.isArray(v)) return v.reduce((m, x) => Math.max(m, Number(x) || 0), 0);
+    return Number(v) || 0;
+  },
+
   mergeSnapshotIntoLocal(snapshotObj) {
-    const remoteDel = snapshotObj?.__meta?.deletedRoutes || {};
+    if (!snapshotObj || typeof snapshotObj !== 'object') return;
+    if (!this.deletedRoutes) this.deletedRoutes = new Map();
+    if (!this.revivedRoutes) this.revivedRoutes = new Map();
+
+    const remoteDel = snapshotObj.__meta?.deletedRoutes || {};
     for (const [rid, ts] of Object.entries(remoteDel)) {
       const id = String(rid);
       const t = Number(ts || 0);
-      const cur = Number(this.deletedRoutes?.get(id) || 0);
-      if (!this.deletedRoutes) this.deletedRoutes = new Map();
-      if (t > cur) this.deletedRoutes.set(id, t);
+      if (t > Number(this.deletedRoutes.get(id) || 0)) this.deletedRoutes.set(id, t);
     }
 
-    const remoteRev = snapshotObj?.__meta?.revivedRoutes || {};
+    const remoteRev = snapshotObj.__meta?.revivedRoutes || {};
     for (const [rid, ts] of Object.entries(remoteRev)) {
       const id = String(rid);
       const t = Number(ts || 0);
-      const del = Number(this.deletedRoutes?.get(id) || 0);
-      if (!this.revivedRoutes) this.revivedRoutes = new Map();
-      const curRev = Number(this.revivedRoutes.get(id) || 0);
-      if (t > curRev) this.revivedRoutes.set(id, t);
-      if (t > del) {
-        this.deletedRoutes?.delete(id);
-      }
+      if (t > Number(this.revivedRoutes.get(id) || 0)) this.revivedRoutes.set(id, t);
     }
 
-    for (const [rid] of (this.deletedRoutes || new Map()).entries()) {
+    // Exclusão vs. reimportação: vence o mais recente
+    for (const [id, delTs] of Array.from(this.deletedRoutes.entries())) {
+      if (Number(this.revivedRoutes.get(id) || 0) > Number(delTs)) this.deletedRoutes.delete(id);
+    }
+
+    for (const rid of this.deletedRoutes.keys()) {
       this.routes.delete(String(rid));
     }
 
-    if (!snapshotObj || typeof snapshotObj !== 'object') return;
+    this.mergeCarretas(snapshotObj.__meta?.carretas);
 
     for (const [routeId, ser] of Object.entries(snapshotObj)) {
       const id = String(routeId);
       if (id === '__meta') continue;
-      if (this.deletedRoutes?.has(id)) continue;
+      if (this.deletedRoutes.has(id)) continue;
 
       const existing = this.routes.get(id);
 
       if (!existing) {
-        const r = this.deserializeRoute(id, ser);
-        if (!r.faltantes.size && r.ids.size) {
-          r.faltantes = new Set(r.ids);
-          for (const c of r.conferidos) r.faltantes.delete(c);
-        }
-        this.routes.set(id, r);
+        this.routes.set(id, this.deserializeRoute(id, ser));
         continue;
       }
 
@@ -512,47 +606,75 @@ const ConferenciaApp = {
       tmp.ids.forEach(v => existing.ids.add(v));
       tmp.conferidos.forEach(v => existing.conferidos.add(v));
       tmp.foraDeRota.forEach(v => existing.foraDeRota.add(v));
-      tmp.faltantes.forEach(v => existing.faltantes.add(v));
+
+      // Campos de texto: pega o preenchido; se ambos preenchidos e diferentes, escolha determinística
+      for (const f of ['cluster', 'destinationFacilityId', 'destinationFacilityName']) {
+        const a = String(existing[f] || '');
+        const b = String(tmp[f] || '');
+        if (!a || (b && b > a)) existing[f] = b || a;
+      }
+
+      // Vínculo placa/rota: vence o mais recente
+      if (Number(tmp.plateUpdatedAt || 0) > Number(existing.plateUpdatedAt || 0)) {
+        for (const f of ['plateKey', 'plateRaw', 'plateLicense', 'routeQrKey', 'routeQrRaw', 'plateScanTs', 'routeQrScanTs', 'plateUpdatedAt']) {
+          existing[f] = tmp[f];
+        }
+      }
 
       for (const [k, v] of tmp.timestamps.entries()) {
         const cur = existing.timestamps.get(k);
-        if (!cur || String(v) > String(cur)) existing.timestamps.set(k, v);
+        if (!cur || Number(v) > Number(cur)) existing.timestamps.set(k, v);
       }
       for (const [k, v] of tmp.duplicados.entries()) {
-        const cur = existing.duplicados.get(k);
-        if (!cur) existing.duplicados.set(k, v);
-        else existing.duplicados.set(k, Array.from(new Set([].concat(cur, v))));
+        existing.duplicados.set(k, Math.max(this.dupCount(existing.duplicados.get(k)), this.dupCount(v)));
       }
 
-      if (existing.ids.size) {
-        existing.faltantes = new Set(existing.ids);
-        for (const c of existing.conferidos) existing.faltantes.delete(c);
-      }
+      // Um ID conferido não pode continuar em "fora de rota" na mesma rota
+      for (const c of existing.conferidos) existing.foraDeRota.delete(c);
+
+      existing.totalInicial = Math.max(Number(existing.totalInicial || 0), Number(tmp.totalInicial || 0), existing.ids.size);
+      existing.faltantes = new Set(existing.ids);
+      for (const c of existing.conferidos) existing.faltantes.delete(c);
     }
+
+    // A união traria de volta "fora de rota" já resolvidos em outro aparelho; limpa aqui
+    this.globalCleanupForaDeRotaForConferidos();
   },
 
   async syncFromSupabaseForDay(dayISO) {
     const op = this.getOperationCode();
     if (!op) return;
-
-    const now = Date.now();
-    if (this.cloudDirty) return;
-    if (this.lastLocalMutationAt && (now - this.lastLocalMutationAt) < (this.cloudPullGraceMs || 2000)) return;
+    if (this.cloudSaving) return;
 
     try {
       const row = await this.supaLoadDaySnapshot(op, dayISO);
-      if (!row || !row.data) return;
-
-      const remoteHash = this.computeSnapshotHash(row.data);
-      if (row.updated_at && this.lastRemoteUpdatedAt === row.updated_at && remoteHash === this.lastPushedSnapshotHash) {
+      if (!row || !row.data) {
+        // Banco ainda sem esse dia, mas há dados locais (ex.: bipado offline): envia
+        if (this.routes.size && op === this.getOperationCode() && dayISO === this.workDay) {
+          this.markCloudDirty(dayISO, op);
+        }
         return;
       }
 
+      // O dia/operação pode ter mudado enquanto a consulta estava em andamento
+      if (op !== this.getOperationCode() || dayISO !== this.workDay) return;
+
+      const remoteHash = this.computeSnapshotHash(row.data);
+      if (remoteHash === this.lastPushedSnapshotHash) return;
+
       this.lastRemoteUpdatedAt = row.updated_at || this.lastRemoteUpdatedAt;
-      this.lastPushedSnapshotHash = remoteHash;
       this.mergeSnapshotIntoLocal(row.data);
       this.saveToStorage(dayISO, { syncCloud: false });
 
+      // Se o local tem algo que o banco não tem (ex.: bipado offline), envia
+      const localHash = this.computeSnapshotHash(this.buildDaySnapshotObject());
+      if (localHash !== remoteHash) {
+        this.markCloudDirty(dayISO, op);
+      } else {
+        this.lastPushedSnapshotHash = remoteHash;
+      }
+
+      this.refreshAfterRemoteMerge();
       this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
     } catch (e) {
       if (e && (e.code === '42P01' || /routes_state/i.test(String(e.message || '')))) {
@@ -562,6 +684,19 @@ const ConferenciaApp = {
       }
       console.warn('Falha ao sincronizar do Supabase:', e);
     }
+  },
+
+  startPeriodicSync() {
+    if (this.syncTimer) clearInterval(this.syncTimer);
+    this.syncTimer = setInterval(() => {
+      if (!this.workDay || !this.getOperationCode()) return;
+      if (this.cloudDirty) {
+        // Save travado (ex.: falha de rede sem retry agendado)? força nova tentativa
+        if (!this.cloudSaveTimer && !this.cloudSaving) this.scheduleCloudSave(0);
+        return;
+      }
+      this.syncFromSupabaseForDay(this.workDay);
+    }, SYNC_INTERVAL_MS);
   },
 
   getRoutesStateCreateSQL() {
@@ -605,7 +740,7 @@ create policy "routes_state_update_all"
       $sel.empty();
       (data || []).forEach(op => {
         const label = op.name ? `${op.code} — ${op.name}` : op.code;
-        $sel.append(`<option value="${op.code}">${label}</option>`);
+        $sel.append(`<option value="${this.escHtml(op.code)}">${this.escHtml(label)}</option>`);
       });
     }
 
@@ -777,9 +912,11 @@ create policy "routes_state_update_all"
 
   parseIdsList(raw) {
     const txt = String(raw || '');
-    const parts = txt.split(/[;,\s\n\r\t]+/g).map(s => this.normalizarCodigo(s)).filter(Boolean);
-    const onlyNums = parts.map(p => String(p).replace(/\D+/g, '')).filter(Boolean);
-    return Array.from(new Set(onlyNums));
+    // Aceita qualquer ID numérico (não só o padrão de 11 dígitos da bipagem)
+    const ids = txt.split(/[;,\s]+/g)
+      .map(p => this.normalizarCodigo(p) || String(p).replace(/\D+/g, ''))
+      .filter(p => p && p.length >= 5);
+    return Array.from(new Set(ids));
   },
 
   async searchScanEventsByIds(idsRaw, opts = {}) {
@@ -817,33 +954,6 @@ create policy "routes_state_update_all"
     return out;
   },
 
-  renderDbSearchResults(rows) {
-    const $tb = $('#db-search-results');
-    const $wrap = $('#db-search-results-wrap');
-    if (!$tb.length) return;
-
-    $tb.empty();
-    (rows || []).forEach(r => {
-      const dt = r.scanned_at ? new Date(r.scanned_at) : null;
-      const day = r.day || (dt ? dt.toISOString().slice(0, 10) : '');
-      const hhmm = dt ? String(dt.getHours()).padStart(2, '0') + ':' + String(dt.getMinutes()).padStart(2, '0') : '';
-      $tb.append(`
-        <tr>
-          <td>${r.package_id ?? ''}</td>
-          <td>${r.operation_code ?? ''}</td>
-          <td>${day}</td>
-          <td>${hhmm}</td>
-          <td>${r.route_id ?? ''}</td>
-          <td>${r.cluster ?? ''}</td>
-          <td>${r.xpt ?? ''}</td>
-          <td>${r.result ?? ''}</td>
-        </tr>
-      `);
-    });
-
-    if ($wrap.length) $wrap.removeClass('d-none');
-  },
-
   renderDbSearchSummary(summaryRows) {
     const $tb = $('#db-search-results');
     const $wrap = $('#db-search-results-wrap');
@@ -865,16 +975,17 @@ create policy "routes_state_update_all"
       const cluster = r.has_db_history ? (r.last_cluster ?? '') : (r.local_cluster ?? '');
       const xpt = r.has_db_history ? (r.last_xpt ?? '') : (r.local_xpt ?? '');
 
+      const esc = (x) => this.escHtml(x);
       $tb.append(`
         <tr>
-          <td>${r.id}</td>
-          <td>${r.has_db_history ? (r.last_operation ?? '') : ''}</td>
-          <td>${day}</td>
+          <td>${esc(r.id)}</td>
+          <td>${esc(r.has_db_history ? (r.last_operation ?? '') : '')}</td>
+          <td>${esc(day)}</td>
           <td>${hhmm}</td>
-          <td>${routeId}</td>
-          <td>${cluster}</td>
-          <td>${xpt}</td>
-          <td>${status} ${ops ? `<small class="text-muted">(${ops})</small>` : ''}</td>
+          <td>${esc(routeId)}</td>
+          <td>${esc(cluster)}</td>
+          <td>${esc(xpt)}</td>
+          <td>${esc(status)} ${ops ? `<small class="text-muted">(${esc(ops)})</small>` : ''}</td>
         </tr>
       `);
     });
@@ -922,7 +1033,7 @@ create policy "routes_state_update_all"
       .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
       .map(([cluster, v]) => {
         const ok = (v.total > 0 && v.conferidos === v.total) ? ' ✅' : '';
-        return `CLUSTER ${cluster}: ${v.conferidos}/${v.total}${ok}`;
+        return `CLUSTER ${this.escHtml(cluster)}: ${v.conferidos}/${v.total}${ok}`;
       })
       .join('<br>');
 
@@ -948,12 +1059,12 @@ create policy "routes_state_update_all"
       const hh = String(d.getHours()).padStart(2, '0');
       const mm = String(d.getMinutes()).padStart(2, '0');
       const ss = String(d.getSeconds()).padStart(2, '0');
-      const base = `${hh}:${mm}:${ss} • ${ev.code}`;
+      const base = `${hh}:${mm}:${ss} • ${this.escHtml(ev.code)}`;
 
       if (ev.type === 'fora') {
         const rr = ev.correctRouteId ? this.routes.get(String(ev.correctRouteId)) : null;
         const cl = rr && rr.cluster ? String(rr.cluster).trim() : '';
-        const extra = (cl ? ` <small class="text-muted">(CLUSTER ${cl})</small>` : ' <small class="text-muted">(cluster desconhecido)</small>');
+        const extra = (cl ? ` <small class="text-muted">(CLUSTER ${this.escHtml(cl)})</small>` : ' <small class="text-muted">(cluster desconhecido)</small>');
         return `<li class="list-group-item list-group-item-warning">${base}${extra}</li>`;
       }
       if (ev.type === 'dup') {
@@ -968,15 +1079,6 @@ create policy "routes_state_update_all"
   // =======================
   // Relatório Noturno
   // =======================
-  escHtml(s) {
-    return String(s ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  },
-
   escapeHtml(s) {
     return this.escHtml(s);
   },
@@ -1149,7 +1251,8 @@ create policy "routes_state_update_all"
       routeQrRaw: '',
 
       plateScanTs: 0,
-      routeQrScanTs: 0
+      routeQrScanTs: 0,
+      plateUpdatedAt: 0
     };
   },
 
@@ -1168,55 +1271,27 @@ create policy "routes_state_update_all"
       if (!raw) return;
 
       const parsed = JSON.parse(raw);
-      this.deletedRoutes = new Map(Object.entries(parsed?.__meta?.deletedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
-      this.revivedRoutes = new Map(Object.entries(parsed?.__meta?.revivedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
+      if (!parsed || typeof parsed !== 'object') return;
 
-      for (const [rid, rts] of (this.revivedRoutes || new Map()).entries()) {
-        const delTs = Number(this.deletedRoutes?.get(rid) || 0);
+      this.deletedRoutes = new Map(Object.entries(parsed.__meta?.deletedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
+      this.revivedRoutes = new Map(Object.entries(parsed.__meta?.revivedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
+
+      for (const [rid, rts] of this.revivedRoutes.entries()) {
+        const delTs = Number(this.deletedRoutes.get(rid) || 0);
         if (Number(rts || 0) > delTs) this.deletedRoutes.delete(rid);
       }
-
-      if (!parsed || typeof parsed !== 'object') return;
 
       this.routes.clear();
       this.currentRouteId = null;
 
-      this.lastSavedLocalSnapshotHash = this.computeSnapshotHash(parsed);
-
       for (const [routeId, r] of Object.entries(parsed)) {
         if (routeId === '__meta') continue;
         if (this.deletedRoutes.has(String(routeId))) continue;
-
-        const route = this.makeEmptyRoute(routeId);
-
-        route.cluster = r.cluster || '';
-        route.destinationFacilityId = r.destinationFacilityId || '';
-        route.destinationFacilityName = r.destinationFacilityName || '';
-        route.totalInicial = Number(r.totalInicial || 0);
-
-        route.plateKey = r.plateKey || '';
-        route.plateRaw = r.plateRaw || '';
-        route.plateLicense = r.plateLicense || '';
-        route.routeQrKey = r.routeQrKey || '';
-        route.routeQrRaw = r.routeQrRaw || '';
-        route.plateScanTs = Number(r.plateScanTs || 0);
-        route.routeQrScanTs = Number(r.routeQrScanTs || 0);
-
-        (r.ids || []).forEach(id => route.ids.add(id));
-        (r.conferidos || []).forEach(id => route.conferidos.add(id));
-        (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
-        route.faltantes = new Set(r.faltantes || []);
-
-        route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [k, v]));
-        route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, v]));
-
-        if (!route.faltantes.size && route.ids.size) {
-          route.faltantes = new Set(route.ids);
-          for (const c of route.conferidos) route.faltantes.delete(c);
-        }
-
-        this.routes.set(String(routeId), route);
+        this.routes.set(String(routeId), this.deserializeRoute(routeId, r));
       }
+
+      this.mergeCarretas(parsed.__meta?.carretas);
+      this.lastSavedLocalSnapshotHash = this.computeSnapshotHash(this.buildDaySnapshotObject());
     } catch (e) {
       console.warn('Falha ao carregar storage:', e);
     }
@@ -1227,21 +1302,11 @@ create policy "routes_state_update_all"
 
     try {
       const key = this.storageKeyForDay(dayISO);
-      const obj = {};
+      const obj = this.buildDaySnapshotObject();
 
-      for (const [routeId, r] of this.routes.entries()) {
-        obj[routeId] = this.serializeRoute(r);
-      }
-
-      obj.__meta = {
-        deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map()),
-        revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map())
-      };
-
-      const raw = JSON.stringify(obj);
       const hash = this.computeSnapshotHash(obj);
       if (hash !== this.lastSavedLocalSnapshotHash) {
-        localStorage.setItem(key, raw);
+        localStorage.setItem(key, JSON.stringify(obj));
         this.lastSavedLocalSnapshotHash = hash;
       }
 
@@ -1269,6 +1334,7 @@ create policy "routes_state_update_all"
 
       plateScanTs: Number(r.plateScanTs || 0),
       routeQrScanTs: Number(r.routeQrScanTs || 0),
+      plateUpdatedAt: Number(r.plateUpdatedAt || 0),
 
       ids: Array.from(r.ids),
       faltantes: Array.from(r.faltantes),
@@ -1282,6 +1348,7 @@ create policy "routes_state_update_all"
 
   deserializeRoute(routeId, r) {
     const route = this.makeEmptyRoute(routeId);
+    r = r || {};
 
     route.cluster = r.cluster || '';
     route.destinationFacilityId = r.destinationFacilityId || '';
@@ -1296,38 +1363,49 @@ create policy "routes_state_update_all"
 
     route.plateScanTs = Number(r.plateScanTs || 0);
     route.routeQrScanTs = Number(r.routeQrScanTs || 0);
+    route.plateUpdatedAt = Number(r.plateUpdatedAt || r.routeQrScanTs || 0);
 
     (r.ids || []).forEach(id => route.ids.add(id));
     (r.conferidos || []).forEach(id => route.conferidos.add(id));
     (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
-    route.faltantes = new Set(r.faltantes || []);
 
-    route.timestamps = new Map(Object.entries(r.timestamps || {}).map(([k, v]) => [k, v]));
-    route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, v]));
+    route.timestamps = new Map(Object.entries(r.timestamps || {}));
+    route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, this.dupCount(v)]));
 
-    if (!route.faltantes.size && route.ids.size) {
+    // Faltantes sempre derivados de ids - conferidos (evita lista desatualizada)
+    if (route.ids.size) {
       route.faltantes = new Set(route.ids);
       for (const c of route.conferidos) route.faltantes.delete(c);
+    } else {
+      route.faltantes = new Set(r.faltantes || []);
     }
 
     return route;
   },
 
+  // Remove "fora de rota" de IDs que depois foram conferidos na rota certa.
+  // Mantém o alerta quando o "fora" aconteceu DEPOIS da conferência (pacote foi parar na gaiola errada).
   globalCleanupForaDeRotaForConferidos() {
-    const conferidosIds = new Set();
+    const conferidoTs = new Map(); // id -> ts da conferência
     for (const r of this.routes.values()) {
-      for (const id of r.conferidos) conferidosIds.add(id);
+      for (const id of r.conferidos) {
+        const ts = Number(r.timestamps.get(id) || 0);
+        conferidoTs.set(id, Math.max(conferidoTs.get(id) || 0, ts));
+      }
     }
-
-    if (!conferidosIds.size) return;
+    if (!conferidoTs.size) return;
 
     for (const r of this.routes.values()) {
-      for (const id of conferidosIds) {
+      for (const id of Array.from(r.foraDeRota)) {
+        if (!conferidoTs.has(id)) continue;
         if (r.conferidos.has(id)) {
-          if (r.foraDeRota.has(id)) r.foraDeRota.delete(id);
-        } else {
-          if (r.foraDeRota.has(id)) r.foraDeRota.delete(id);
-          if (r.duplicados.has(id)) r.duplicados.delete(id);
+          r.foraDeRota.delete(id);
+          continue;
+        }
+        const foraTs = Number(r.timestamps.get(id) || 0);
+        if (foraTs <= conferidoTs.get(id)) {
+          r.foraDeRota.delete(id);
+          r.duplicados.delete(id);
         }
       }
     }
@@ -1336,13 +1414,35 @@ create policy "routes_state_update_all"
   // =======================
   // Troca de dia
   // =======================
-  async applyWorkDay(dayISO) {
+  // Envia ao banco o que estiver pendente (usado antes de trocar dia/operação)
+  async flushPendingNow() {
     if (this.cloudSaveTimer) {
       clearTimeout(this.cloudSaveTimer);
       this.cloudSaveTimer = null;
     }
+    for (let i = 0; i < 50 && this.cloudSaving; i++) {
+      await new Promise(res => setTimeout(res, 100));
+    }
+    if (!this.cloudDirty) return;
+    try {
+      const pending = this.pendingCloudSave || {};
+      await this.flushCloudSave(pending.op, pending.day);
+    } catch (e) {
+      console.warn("Falha ao enviar pendências antes da troca (ficam no cache local):", e);
+    }
+    if (this.cloudSaveTimer) {
+      clearTimeout(this.cloudSaveTimer);
+      this.cloudSaveTimer = null;
+    }
+  },
+
+  async applyWorkDay(dayISO) {
+    await this.flushPendingNow();
+    this.cloudDirty = false;
+    this.pendingCloudSave = null;
 
     this.routes.clear();
+    this.resetCarretas();
     this.currentRouteId = null;
     this.lastRoutesSignature = '';
 
@@ -1356,8 +1456,6 @@ create policy "routes_state_update_all"
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
 
-    await this.ensureOperationSelected();
-
     const op = this.getOperationCode();
     if (op) $('#op-badge').text(op);
 
@@ -1366,6 +1464,7 @@ create policy "routes_state_update_all"
     if (op) {
       await this.syncFromSupabaseForDay(dayISO);
       await this.startRealtimeSync(dayISO);
+      this.startPeriodicSync();
     }
 
     this.renderRoutesSelects();
@@ -1379,6 +1478,7 @@ create policy "routes_state_update_all"
   resetForOperationChange() {
     this.stopRealtimeSync();
     this.routes.clear();
+    this.resetCarretas();
     this.currentRouteId = null;
     this.viaCsv = false;
     this.lastRoutesSignature = '';
@@ -1461,7 +1561,7 @@ create policy "routes_state_update_all"
       const u = it.updated_at ? new Date(it.updated_at).toLocaleString('pt-BR') : '-';
       $tb.append(`
         <tr>
-          <td><strong>${it.code}</strong>${it.name ? ` <span class="text-muted small">(${this.escapeHtml(it.name)})</span>` : ''}</td>
+          <td><strong>${this.escHtml(it.code)}</strong>${it.name ? ` <span class="text-muted small">(${this.escapeHtml(it.name)})</span>` : ''}</td>
           <td>${it.stats.routesCount}</td>
           <td>${it.stats.totalIds}</td>
           <td>${it.stats.conferidos}</td>
@@ -1473,7 +1573,7 @@ create policy "routes_state_update_all"
 
       $log.append(`
         <li class="list-group-item d-flex justify-content-between align-items-center">
-          <span><strong>${it.code}</strong> • ${it.stats.conferidos}/${it.stats.totalIds} conferidos • ${it.stats.faltantes} faltantes</span>
+          <span><strong>${this.escHtml(it.code)}</strong> • ${it.stats.conferidos}/${it.stats.totalIds} conferidos • ${it.stats.faltantes} faltantes</span>
           <span class="badge badge-light">${u}</span>
         </li>
       `);
@@ -1535,7 +1635,7 @@ create policy "routes_state_update_all"
 
       $sel1.html(
         ['<option value="">(Nenhuma selecionada)</option>']
-          .concat(this._routesDropdownCache.map(x => `<option value="${x.routeId}">${x.label}</option>`))
+          .concat(this._routesDropdownCache.map(x => `<option value="${this.escHtml(x.routeId)}">${this.escHtml(x.label)}</option>`))
           .join('')
       );
 
@@ -1578,7 +1678,7 @@ create policy "routes_state_update_all"
         );
 
     const options = ['<option value="">(Selecione)</option>']
-      .concat(filtered.map(x => `<option value="${x.routeId}">${x.label}</option>`))
+      .concat(filtered.map(x => `<option value="${this.escHtml(x.routeId)}">${this.escHtml(x.label)}</option>`))
       .join('');
 
     $sel2.html(options);
@@ -1603,10 +1703,11 @@ create policy "routes_state_update_all"
       return;
     }
 
-    $('#route-title').html(`ROTA: <strong>${r.routeId}</strong>`);
-    $('#cluster-title').html(r.cluster ? `CLUSTER: <strong>${r.cluster}</strong>` : '');
-    $('#destination-facility-title').html(r.destinationFacilityId ? `<strong>XPT:</strong> ${r.destinationFacilityId}` : '');
-    $('#destination-facility-name').html(r.destinationFacilityName ? `<strong>DESTINO:</strong> ${r.destinationFacilityName}` : '');
+    const esc = (x) => this.escHtml(x);
+    $('#route-title').html(`ROTA: <strong>${esc(r.routeId)}</strong>`);
+    $('#cluster-title').html(r.cluster ? `CLUSTER: <strong>${esc(r.cluster)}</strong>` : '');
+    $('#destination-facility-title').html(r.destinationFacilityId ? `<strong>XPT:</strong> ${esc(r.destinationFacilityId)}` : '');
+    $('#destination-facility-name').html(r.destinationFacilityName ? `<strong>DESTINO:</strong> ${esc(r.destinationFacilityName)}` : '');
 
     $('#extracted-total').text(r.totalInicial || r.ids.size);
     $('#verified-total').text(r.conferidos.size);
@@ -1630,12 +1731,12 @@ create policy "routes_state_update_all"
 
     $('#conferidos-list').html(
       `<h6>Conferidos (<span class='badge badge-success'>${r.conferidos.size}</span>)</h6>` +
-      Array.from(r.conferidos).map(id => `<li class='list-group-item list-group-item-success'>${id}</li>`).join('')
+      Array.from(r.conferidos).map(id => `<li class='list-group-item list-group-item-success'>${this.escHtml(id)}</li>`).join('')
     );
 
     $('#faltantes-list').html(
       `<h6>Faltantes (<span class='badge badge-danger'>${r.faltantes.size}</span>)</h6>` +
-      Array.from(r.faltantes).map(id => `<li class='list-group-item list-group-item-danger'>${id}</li>`).join('')
+      Array.from(r.faltantes).map(id => `<li class='list-group-item list-group-item-danger'>${this.escHtml(id)}</li>`).join('')
     );
 
     $('#fora-rota-list').html(
@@ -1646,18 +1747,18 @@ create policy "routes_state_update_all"
           const rr = this.routes.get(String(correct));
           const cl = rr && rr.cluster ? String(rr.cluster).trim() : '';
           const extra = cl
-            ? ` <small class="text-muted">(CLUSTER ${cl})</small>`
+            ? ` <small class="text-muted">(CLUSTER ${this.escHtml(cl)})</small>`
             : ` <small class="text-muted">(cluster desconhecido)</small>`;
-          return `<li class='list-group-item list-group-item-warning'>${id}${extra}</li>`;
+          return `<li class='list-group-item list-group-item-warning'>${this.escHtml(id)}${extra}</li>`;
         }
-        return `<li class='list-group-item list-group-item-warning'>${id}</li>`;
+        return `<li class='list-group-item list-group-item-warning'>${this.escHtml(id)}</li>`;
       }).join('')
     );
 
     $('#duplicados-list').html(
       `<h6>Duplicados (<span class='badge badge-secondary'>${r.duplicados.size}</span>)</h6>` +
       Array.from(r.duplicados.entries())
-        .map(([id, count]) => `<li class='list-group-item list-group-item-secondary'>${id} <span class="badge badge-dark ml-2">${count}x</span></li>`)
+        .map(([id, count]) => `<li class='list-group-item list-group-item-secondary'>${this.escHtml(id)} <span class="badge badge-dark ml-2">${this.dupCount(count)}x</span></li>`)
         .join('')
     );
 
@@ -1899,7 +2000,7 @@ create policy "routes_state_update_all"
 
     if (rawStr) this.carretas.routesRaw.set(routeKey, rawStr);
     if (jsonText) this.carretas.routesJson.set(routeKey, jsonText);
-    if (!this.carretas.routesTs.get(routeKey)) this.carretas.routesTs.set(routeKey, Date.now());
+    this.carretas.routesTs.set(routeKey, Date.now());
 
     const assignMatch = String(routeKey).match(/^assignment:(.+)$/);
     const clusterCandidate = this.normalizeCluster(assignMatch?.[1] || '');
@@ -1919,6 +2020,7 @@ create policy "routes_state_update_all"
           if (_json) r.routeQrRaw = _json;
           r.plateScanTs = Number(plate.tsLast || Date.now());
           r.routeQrScanTs = Date.now();
+          r.plateUpdatedAt = Date.now();
           linked++;
         }
       }
@@ -1942,6 +2044,7 @@ create policy "routes_state_update_all"
           if (_json) r.routeQrRaw = _json;
           r.plateScanTs = Number(plate.tsLast || Date.now());
           r.routeQrScanTs = Date.now();
+          r.plateUpdatedAt = Date.now();
           linked++;
         }
       }
@@ -1998,6 +2101,7 @@ create policy "routes_state_update_all"
     }
 
     p.routes = new Set();
+    p.clearedAt = Date.now();
 
     for (const r of this.routes.values()) {
       if ((r.plateKey || '').toUpperCase() === plateKey) {
@@ -2008,11 +2112,8 @@ create policy "routes_state_update_all"
         r.routeQrRaw = '';
         r.plateScanTs = 0;
         r.routeQrScanTs = 0;
+        r.plateUpdatedAt = Date.now();
       }
-    }
-
-    if (this.carretas.currentPlateKey === plateKey) {
-      this.carretas.currentPlateKey = plateKey;
     }
 
     this.saveToStorage(this.workDay);
@@ -2042,16 +2143,17 @@ create policy "routes_state_update_all"
     if (!p) return;
 
     const meta = [];
-    meta.push(`<strong>${p.license_plate}</strong>`);
-    if (p.vehicle_type_description) meta.push(`<span class="text-muted">(${p.vehicle_type_description})</span>`);
-    if (p.carrier_name) meta.push(`<span class="text-muted">• ${p.carrier_name}</span>`);
+    const esc = (x) => this.escHtml(x);
+    meta.push(`<strong>${esc(p.license_plate)}</strong>`);
+    if (p.vehicle_type_description) meta.push(`<span class="text-muted">(${esc(p.vehicle_type_description)})</span>`);
+    if (p.carrier_name) meta.push(`<span class="text-muted">• ${esc(p.carrier_name)}</span>`);
     $cur.html(meta.join(' '));
 
     const routesArr = Array.from(p.routes);
     routesArr.sort((a, b) => String(a).localeCompare(String(b)));
 
     $list.html(
-      routesArr.map(rk => `<li class="list-group-item">${rk}</li>`).join('') ||
+      routesArr.map(rk => `<li class="list-group-item">${this.escHtml(rk)}</li>`).join('') ||
       '<li class="list-group-item text-muted">sem rotas nessa placa</li>'
     );
 
@@ -2128,12 +2230,12 @@ create policy "routes_state_update_all"
     };
 
     $missing.html(
-      missing.map(routeId => `<li class="list-group-item">${fmtExpected(routeId)}</li>`).join('') ||
+      missing.map(routeId => `<li class="list-group-item">${this.escHtml(fmtExpected(routeId))}</li>`).join('') ||
       '<li class="list-group-item text-muted">nada faltando 🎉</li>'
     );
 
     $extra.html(
-      extra.map(rk => `<li class="list-group-item">${fmtExtra(rk)}</li>`).join('') ||
+      extra.map(rk => `<li class="list-group-item">${this.escHtml(fmtExtra(rk))}</li>`).join('') ||
       '<li class="list-group-item text-muted">—</li>'
     );
   },
@@ -2230,7 +2332,7 @@ create policy "routes_state_update_all"
     }
 
     if (r.conferidos.has(codigo) || r.foraDeRota.has(codigo)) {
-      const count = r.duplicados.get(codigo) || 1;
+      const count = this.dupCount(r.duplicados.get(codigo)) || 1;
       r.duplicados.set(codigo, count + 1);
       r.timestamps.set(codigo, now);
 
@@ -2348,7 +2450,6 @@ create policy "routes_state_update_all"
 
     if (imported) this.currentRouteId = String(this.routes.keys().next().value);
     this.refreshUIFromCurrent();
-    $('#route-not-found-alert').hide();
     this.atualizarListas();
 
     return imported;
@@ -2708,16 +2809,22 @@ $(document).ready(async () => {
     $('#initial-interface').removeClass('d-none');
   });
 
-  $(document).on('click', '#db-search-btn', async () => {
+  // Status da busca: no index vai para o painel lateral, no search.html para #db-search-status
+  const searchStatus = (txt, kind) => {
+    ConferenciaApp.setStatus(txt, kind);
+    $('#db-search-status').text(txt);
+  };
+
+  const runDbSearch = async () => {
     try {
       const rawIds = ($('#db-ids').val() || '').trim();
       if (!rawIds) { alert('Informe pelo menos um ID.'); return; }
 
       const dayFrom = ($('#db-day-from').val() || '').trim() || undefined;
       const dayTo = ($('#db-day-to').val() || '').trim() || undefined;
-      const op = ($('#db-op-filter').val() || '').trim() || undefined;
+      const op = ($('#db-op-filter').val() || $('#db-op-code').val() || '').trim() || undefined;
 
-      ConferenciaApp.setStatus('Buscando histórico no banco...', 'info');
+      searchStatus('Buscando histórico no banco...', 'info');
 
       const res = await ConferenciaApp.searchIdsFull(rawIds, {
         operation_code: op,
@@ -2725,14 +2832,35 @@ $(document).ready(async () => {
         day_to: dayTo
       });
 
+      if (!res.ids.length) {
+        searchStatus('Nenhum ID válido informado.', 'warning');
+        return;
+      }
+
       ConferenciaApp.renderDbSearchSummary(res.summary);
-      ConferenciaApp.setStatus(`Busca concluída • ${res.summary.length} ID(s)`, 'success');
+      searchStatus(`Busca concluída • ${res.summary.length} ID(s)`, 'success');
     } catch (e) {
       console.error(e);
-      ConferenciaApp.setStatus('Erro ao buscar histórico.', 'danger');
+      searchStatus('Erro ao buscar histórico.', 'danger');
       alert('Erro na busca: ' + (e?.message || e));
     }
+  };
+
+  $(document).on('click', '#db-search-btn', runDbSearch);
+
+  $(document).on('keydown', '#db-ids', (e) => {
+    if (e.ctrlKey && e.key === 'Enter') runDbSearch();
   });
+
+  $(document).on('click', '#db-clear-btn', () => {
+    $('#db-ids').val('');
+    $('#db-search-results').empty();
+    $('#db-search-results-wrap').addClass('d-none');
+    $('#db-search-status').text('—');
+  });
+
+  // search.html: página só de busca, não carrega rotas/realtime
+  if ($('#db-search-page').length) return;
 
   const today = ConferenciaApp.todayLocalISO();
   $('#work-day').val(today);
@@ -2748,6 +2876,7 @@ $(document).ready(async () => {
 $(document).on('click', '#btn-op-confirm', async () => {
   const code = String($('#op-select').val() || '').trim().toUpperCase();
   if (!code) return;
+  await ConferenciaApp.flushPendingNow();
   ConferenciaApp.setOperationCode(code);
   ConferenciaApp.resetForOperationChange();
   $('#modal-operation').modal('hide');
@@ -2892,9 +3021,13 @@ $('#submit-manual').click(() => {
     if (!routeId) return alert('Informe o RouteId.');
 
     const cluster = ($('#manual-cluster').val() || '').trim();
-    const manualIds = $('#manual-input').val().split(/[\s,;]+/).map(x => x.trim()).filter(Boolean);
+    const brutos = ($('#manual-input').val() || '').split(/[\s,;]+/).map(x => x.trim()).filter(Boolean);
+    // Mesmo formato da bipagem (11 dígitos), senão o ID nunca bateria na conferência
+    const manualIds = Array.from(new Set(brutos.map(x => ConferenciaApp.normalizarCodigo(x)).filter(Boolean)));
+    const ignorados = brutos.filter(x => !ConferenciaApp.normalizarCodigo(x)).length;
 
-    if (!manualIds.length) return alert('Nenhum ID válido inserido.');
+    if (!manualIds.length) return alert('Nenhum ID válido inserido (esperado: 11 dígitos começando com 4).');
+    if (ignorados && !confirm(`${ignorados} valor(es) não parecem IDs válidos e serão ignorados. Continuar?`)) return;
 
     const route = ConferenciaApp.routes.get(String(routeId)) || ConferenciaApp.makeEmptyRoute(routeId);
     route.cluster = cluster || route.cluster;
@@ -3092,14 +3225,6 @@ $(document).on('click', '#carreta-clear-bipagem-plate', () => {
   ConferenciaApp.clearBipagemForPlate(pk);
 });
 
-$(document).on('keypress', '#carreta-input', (e) => {
-  if (e.which === 13) {
-    const raw = $('#carreta-input').val();
-    $('#carreta-input').val('');
-    processCarretaScan(raw);
-  }
-});
-
 $(document).on('paste', '#carreta-input', (e) => {
   const pasted = (e.originalEvent && e.originalEvent.clipboardData)
     ? e.originalEvent.clipboardData.getData('text')
@@ -3127,6 +3252,18 @@ $(document).on('click', '#export-csv-mapa-carretas', () => {
 // Admin UI
 $(document).on('click', '#btn-admin-open', async () => {
   $('#modal-admin').modal('show');
+  await refreshAdminOps();
+});
+
+// Atalho para o Admin a partir do modal de operação (útil quando ainda não há operações)
+$(document).on('click', '#btn-op-admin', () => {
+  $('#modal-operation').one('hidden.bs.modal', () => $('#btn-admin-open').trigger('click'));
+  $('#modal-operation').modal('hide');
+});
+
+// Ao fechar o Admin, recarrega a lista de operações (reabre a seleção se ainda não houver operação válida)
+$(document).on('hidden.bs.modal', '#modal-admin', () => {
+  ConferenciaApp.ensureOperationSelected();
 });
 
 async function refreshAdminOps() {
@@ -3138,36 +3275,12 @@ async function refreshAdminOps() {
     ops.forEach(o => {
       const act = o.active ? 'SIM' : 'NÃO';
       const name = o.name || '';
-      $tbody.append(`<tr><td>${o.code}</td><td>${name}</td><td>${act}</td></tr>`);
+      $tbody.append(`<tr><td>${ConferenciaApp.escHtml(o.code)}</td><td>${ConferenciaApp.escHtml(name)}</td><td>${act}</td></tr>`);
     });
   } catch (e) {
     console.warn(e);
   }
 }
-
-$(document).on('click', '#btn-admin-login', async () => {
-  const email = $('#admin-email').val();
-  const pass = $('#admin-pass').val();
-  try {
-    await ConferenciaApp.adminSignIn(email, pass);
-    $('#admin-status').text('Logado.');
-    $('#admin-panel').removeClass('d-none');
-    await refreshAdminOps();
-  } catch (e) {
-    console.error(e);
-    alert('Falha no login do admin: ' + (e.message || e));
-  }
-});
-
-$(document).on('click', '#btn-admin-logout', async () => {
-  try {
-    await ConferenciaApp.adminSignOut();
-    $('#admin-status').text('Deslogado.');
-    $('#admin-panel').addClass('d-none');
-  } catch (e) {
-    console.error(e);
-  }
-});
 
 $(document).on('click', '#btn-admin-save-op', async () => {
   const code = $('#admin-op-code').val();
@@ -3188,9 +3301,7 @@ $(document).on('click', '#btn-global-acomp', async () => {
   try {
     const day = $('#work-day').val() || ConferenciaApp.todayLocalISO();
 
-    $('#initial-interface').addClass('d-none');
-    $('#carreta-interface').addClass('d-none');
-    $('#manual-interface').addClass('d-none');
+    $('#initial-interface, #carreta-interface, #manual-interface, #conference-interface, #db-search-interface').addClass('d-none');
     $('#global-interface').removeClass('d-none');
 
     ConferenciaApp.setStatus(`Carregando acompanhamento geral • ${day}`, 'info');

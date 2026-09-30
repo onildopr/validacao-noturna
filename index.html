@@ -65,7 +65,7 @@
       inset: 0;
       background-image: url("./logorodacoop.png");
       background-repeat: no-repeat;
-      background-position: top-right;
+      background-position: top right;
       background-size: 360px auto;
       z-index: 0;
       pointer-events: none;
@@ -259,6 +259,9 @@
 
       
 <div class="mt-2">
+  <button id="btn-global-acomp" class="btn btn-sm btn-outline-primary btn-block">
+    Acompanhamento geral (todas as operações)
+  </button>
   <button id="finish-night-btn" class="btn btn-sm btn-danger btn-block">
     Finalizar conferência noturna
   </button>
@@ -679,10 +682,11 @@
         <select id="op-select" class="form-control"></select>
 
         <div class="alert alert-warning mt-3 mb-0">
-          Se a lista estiver vazia, peça ao admin cadastrar as operações.
+          Se a lista estiver vazia, cadastre uma operação em "Admin".
         </div>
       </div>
       <div class="modal-footer">
+        <button id="btn-op-admin" class="btn btn-outline-warning">Admin</button>
         <button id="btn-op-confirm" class="btn btn-success">Entrar</button>
       </div>
     </div>
@@ -702,22 +706,7 @@
       <div class="modal-body">
         <div class="row">
           <div class="col-md-6">
-            <h6>Login do Admin</h6>
-            <div class="form-group">
-              <label>Email</label>
-              <input id="admin-email" type="email" class="form-control" placeholder="admin@empresa.com">
-            </div>
-            <div class="form-group">
-              <label>Senha</label>
-              <input id="admin-pass" type="password" class="form-control" placeholder="••••••••">
-            </div>
-            <div class="d-flex" style="gap:8px; flex-wrap:wrap;">
-              <button id="btn-admin-login" class="btn btn-primary">Entrar</button>
-              <button id="btn-admin-logout" class="btn btn-outline-secondary">Sair</button>
-              <span id="admin-status" class="small text-muted align-self-center">Deslogado.</span>
-            </div>
-            <hr>
-            <div id="admin-panel" class="d-none">
+            <div id="admin-panel">
               <h6>Cadastrar / Atualizar operação</h6>
               <div class="form-row">
                 <div class="form-group col-md-4">
@@ -748,10 +737,6 @@
                 <tbody id="admin-ops-tbody"></tbody>
               </table>
             </div>
-            <div class="alert alert-info mt-2">
-              Para o app sincronizar, crie também a tabela <code>routes_state</code> no Supabase (se ainda não criou).
-              O SQL aparece no console quando faltar.
-            </div>
           </div>
         </div>
       </div>
@@ -767,15 +752,14 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
 <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
 <!-- Supabase (uma vez só) -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
-  const supabaseUrl = "https://joxqazqnbrwakavnwrmg.supabase.co";
-  const supabaseAnonKey = "sb_publishable_qZ9fkBvjdAOXLcspibRqrA_SDSS1tvr";
+  const supabaseUrl = "https://aonnurqsycusufrbikrx.supabase.co";
+  const supabaseAnonKey = "sb_publishable_TpKLpLwPUlsc5LuDcS6c4w_xIBv604D";
   window.SB_URL = supabaseUrl;
   window.SB_ANON = supabaseAnonKey;
   if (!window.supabase) {
