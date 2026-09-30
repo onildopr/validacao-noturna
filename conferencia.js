@@ -1,10 +1,12 @@
-// Pull periódico do banco (rede de segurança caso o realtime caia)
-const SYNC_INTERVAL_MS = 15000;
-// Espera após a última bipagem antes de enviar ao banco
-const CLOUD_SAVE_DEBOUNCE_MS = 1200;
+// Checagem periódica do banco (rede de segurança caso o realtime caia). Consultas baratas.
+const SYNC_INTERVAL_MS = 30000;
+// Espera após a última mudança nas rotas (importar/placa/excluir) antes de enviar ao banco
+const DEFS_SAVE_DEBOUNCE_MS = 1500;
+// Espera após a última bipagem antes de enviar o lote de bipagens
+const EVENT_FLUSH_DEBOUNCE_MS = 800;
 
 // Prefixo de chaves no localStorage (separa por operação e por dia)
-const STORAGE_KEY_PREFIX = 'conferencia.routes.v3';
+const STORAGE_KEY_PREFIX = 'conferencia.v4';
 
 const ConferenciaApp = {
   routes: new Map(),     // routeId -> routeObject (somente do dia selecionado)
@@ -13,25 +15,36 @@ const ConferenciaApp = {
   operationCode: null, // ex: ERD1
   deviceId: null,
   cloudEnabled: true,
-  cloudDirty: false,
-  cloudSaving: false,
-  cloudLastSaveAt: 0,
-  cloudSaveTimer: null,
-  cloudMutationSeq: 0,         // incrementa a cada mudança local (detecta bipagens durante o save)
   syncTimer: null,
-  lastLocalMutationAt: 0,
-  cloudPullGraceMs: 2000,
+  periodicBusy: false,
   workDay: null,               // YYYY-MM-DD
   lastEvents: [],              // log simples de bipagens (últimos eventos)
   deletedRoutes: new Map(),    // routeId -> ts (epoch ms)
   revivedRoutes: new Map(),    // routeId -> ts (epoch ms) (desfaz exclusão)
 
-  // ===== Realtime sync (Supabase) =====
+  // ===== Definições das rotas (routes_state) =====
+  defsDirty: false,
+  defsSaving: false,
+  defsSaveTimer: null,
+  defsMutationSeq: 0,          // incrementa a cada mudança (detecta mudança durante o save)
+  defsRemoteUpdatedAt: null,   // updated_at da última versão do banco que já incorporamos
+  lastPushedDefsHash: '',
+  lastSavedLocalDefsHash: '',
+
+  // ===== Bipagens (scan_events) =====
+  events: new Map(),           // client_id -> {cid, pkg, route, ts, dev, sv(1 = já está no banco), res}
+  eventQueue: new Set(),       // client_ids ainda não enviados ao banco
+  eventsSending: false,
+  eventFlushTimer: null,
+  eventsPersistTimer: null,
+  maxServerId: 0,              // maior scan_events.id já recebido
+  lastAppliedEv: null,
+  lastOwnTs: 0,
+  _foraOrDupIds: new Set(),    // IDs que já apareceram em fora de rota/duplicados (atalho de desempenho)
+
+  // ===== Realtime =====
   rtChannel: null,
   rtBound: { op: null, day: null },
-  lastRemoteUpdatedAt: null,
-  lastPushedSnapshotHash: '',
-  lastSavedLocalSnapshotHash: '',
 
   // =======================
   // Carretas (Placa -> Rotas QR)
@@ -244,8 +257,16 @@ const ConferenciaApp = {
   },
 
   // =======================
-  // Realtime
+  // Sincronização com o Supabase
+  // -----------------------
+  // Dois tipos de dado, para gastar o mínimo de banco:
+  //  - routes_state: DEFINIÇÕES das rotas (IDs importados, cluster, placas, exclusões).
+  //    Muda poucas vezes por noite (importação, placa, exclusão).
+  //  - scan_events: uma linha pequena por BIPAGEM. Conferidos / faltantes / fora de rota /
+  //    duplicados são recalculados localmente a partir dos eventos, em ordem de horário.
   // =======================
+
+  // ----- Realtime -----
   async stopRealtimeSync() {
     try {
       const sb = this.getSb();
@@ -260,6 +281,10 @@ const ConferenciaApp = {
     }
   },
 
+  isCurrentDayOp(op, dayISO) {
+    return op === this.getOperationCode() && dayISO === this.workDay;
+  },
+
   async startRealtimeSync(dayISO) {
     const sb = this.getSb();
     const op = this.getOperationCode();
@@ -270,34 +295,40 @@ const ConferenciaApp = {
     await this.stopRealtimeSync();
 
     this.rtChannel = sb
-      .channel('routes_state_live')
+      .channel(`conferencia_${op}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'scan_events', filter: `operation_code=eq.${op}` },
+        (payload) => {
+          try {
+            const row = payload && payload.new;
+            if (!row || row.operation_code !== op || String(row.day) !== dayISO) return;
+            if (!this.isCurrentDayOp(op, dayISO)) return;
+            this.ingestServerEvents([row]);
+          } catch (e) {
+            console.warn('Falha ao aplicar bipagem do realtime:', e);
+          }
+        }
+      )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'routes_state', filter: `operation_code=eq.${op}` },
-        async (payload) => {
+        (payload) => {
           try {
             const row = payload && payload.new;
-            if (!row || !row.data) return;
-
-            if (row.operation_code !== op) return;
-            if (row.day !== dayISO) return;
+            if (!row || row.operation_code !== op || String(row.day) !== dayISO) return;
+            if (!this.isCurrentDayOp(op, dayISO)) return;
             if (row.device_id && row.device_id === this.getDeviceId()) return;
 
-            // A mesclagem é por união, então é seguro aplicar mesmo com mudanças locais pendentes
-            this.lastRemoteUpdatedAt = row.updated_at || this.lastRemoteUpdatedAt;
-            this.mergeSnapshotIntoLocal(row.data);
-            this.saveToStorage(dayISO, { syncCloud: false });
-
-            // Se o local tem algo a mais que o remoto, reenvia a união
-            const remoteHash = this.computeSnapshotHash(row.data);
-            const localHash = this.computeSnapshotHash(this.buildDaySnapshotObject());
-            if (localHash !== remoteHash) this.markCloudDirty(dayISO, op);
-            else if (!this.cloudDirty) this.lastPushedSnapshotHash = remoteHash;
-
-            this.refreshAfterRemoteMerge();
-            this.setStatus(`Realtime • atualizado • ${op} • ${dayISO}`, "info");
+            // Linhas grandes chegam sem o conteúdo pelo realtime: nesse caso busca no banco
+            if (!row.data) {
+              this.pullDefs(dayISO, { force: true }).catch(e => console.warn('Falha ao buscar rotas:', e));
+              return;
+            }
+            this.defsRemoteUpdatedAt = row.updated_at || this.defsRemoteUpdatedAt;
+            this.applyRemoteDefs(row.data, dayISO);
           } catch (e) {
-            console.warn('Falha ao aplicar realtime payload:', e);
+            console.warn('Falha ao aplicar rotas do realtime:', e);
           }
         }
       )
@@ -307,7 +338,7 @@ const ConferenciaApp = {
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
           this.setStatus(`Realtime instável • ${op} • ${dayISO}`, 'warning');
         } else if (status === 'CLOSED') {
-          // O pull periódico (startPeriodicSync) cobre o período sem realtime
+          // A checagem periódica (startPeriodicSync) cobre o período sem realtime
           this.setStatus(`Realtime CLOSED • ${op} • ${dayISO}`, 'warning');
         }
         try { console.log('[Realtime]', status, { op, dayISO }); } catch {}
@@ -316,21 +347,8 @@ const ConferenciaApp = {
     this.rtBound = { op, day: dayISO };
   },
 
-  buildDaySnapshotObject() {
-    const obj = {};
-    for (const [routeId, r] of this.routes.entries()) {
-      obj[routeId] = this.serializeRoute(r);
-    }
-    obj.__meta = {
-      deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map()),
-      revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map()),
-      carretas: this.serializeCarretas()
-    };
-    return obj;
-  },
-
   // =======================
-  // Carretas: persistência (vai junto no snapshot do dia)
+  // Carretas: persistência (vai junto nas definições do dia)
   // =======================
   resetCarretas() {
     this.carretas = {
@@ -422,6 +440,110 @@ const ConferenciaApp = {
     }
   },
 
+  // =======================
+  // Definições das rotas (routes_state)
+  // =======================
+  buildDefsSnapshot() {
+    const routes = {};
+    for (const [routeId, r] of this.routes.entries()) {
+      routes[routeId] = this.serializeRouteDef(r);
+    }
+    return {
+      v: 2,
+      routes,
+      meta: {
+        deletedRoutes: Object.fromEntries(this.deletedRoutes || new Map()),
+        revivedRoutes: Object.fromEntries(this.revivedRoutes || new Map()),
+        carretas: this.serializeCarretas()
+      }
+    };
+  },
+
+  // Aceita o formato novo {v:2, routes, meta} e o antigo (rotas na raiz + __meta)
+  splitDefsSnapshot(data) {
+    if (!data || typeof data !== 'object') return { routes: {}, meta: {} };
+    if (data.v === 2) return { routes: data.routes || {}, meta: data.meta || {} };
+    const routes = {};
+    for (const [k, v] of Object.entries(data)) if (k !== '__meta') routes[k] = v;
+    return { routes, meta: data.__meta || {} };
+  },
+
+  // Junta definições remotas com as locais (união, com regras determinísticas de desempate)
+  mergeDefsIntoLocal(data) {
+    this.invalidateIdIndex();
+    const { routes, meta } = this.splitDefsSnapshot(data);
+    if (!this.deletedRoutes) this.deletedRoutes = new Map();
+    if (!this.revivedRoutes) this.revivedRoutes = new Map();
+
+    for (const [rid, ts] of Object.entries(meta.deletedRoutes || {})) {
+      const id = String(rid);
+      const t = Number(ts || 0);
+      if (t > Number(this.deletedRoutes.get(id) || 0)) this.deletedRoutes.set(id, t);
+    }
+    for (const [rid, ts] of Object.entries(meta.revivedRoutes || {})) {
+      const id = String(rid);
+      const t = Number(ts || 0);
+      if (t > Number(this.revivedRoutes.get(id) || 0)) this.revivedRoutes.set(id, t);
+    }
+
+    // Exclusão vs. reimportação: vence o mais recente
+    for (const [id, delTs] of Array.from(this.deletedRoutes.entries())) {
+      if (Number(this.revivedRoutes.get(id) || 0) > Number(delTs)) this.deletedRoutes.delete(id);
+    }
+    for (const rid of this.deletedRoutes.keys()) {
+      this.routes.delete(String(rid));
+    }
+
+    this.mergeCarretas(meta.carretas);
+
+    for (const [routeId, ser] of Object.entries(routes)) {
+      const id = String(routeId);
+      if (this.deletedRoutes.has(id)) continue;
+
+      const tmp = this.deserializeRouteDef(id, ser);
+      const existing = this.routes.get(id);
+      if (!existing) {
+        this.routes.set(id, tmp);
+        continue;
+      }
+
+      tmp.ids.forEach(v => existing.ids.add(v));
+
+      // Campos de texto: pega o preenchido; se ambos preenchidos e diferentes, escolha determinística
+      for (const f of ['cluster', 'destinationFacilityId', 'destinationFacilityName']) {
+        const a = String(existing[f] || '');
+        const b = String(tmp[f] || '');
+        if (!a || (b && b > a)) existing[f] = b || a;
+      }
+
+      // Vínculo placa/rota: vence o mais recente
+      if (Number(tmp.plateUpdatedAt || 0) > Number(existing.plateUpdatedAt || 0)) {
+        for (const f of ['plateKey', 'plateRaw', 'plateLicense', 'routeQrKey', 'routeQrRaw', 'plateScanTs', 'routeQrScanTs', 'plateUpdatedAt']) {
+          existing[f] = tmp[f];
+        }
+      }
+
+      existing.resetAt = Math.max(Number(existing.resetAt || 0), Number(tmp.resetAt || 0));
+      existing.totalInicial = Math.max(Number(existing.totalInicial || 0), Number(tmp.totalInicial || 0), existing.ids.size);
+    }
+  },
+
+  // Aplica definições recebidas de outro aparelho
+  applyRemoteDefs(data, dayISO) {
+    this.mergeDefsIntoLocal(data);
+    this.rebuildScanState();
+    this.saveLocalDefs();
+
+    // Se o local tem algo que o banco não tem, reenvia a união
+    const localHash = this.computeSnapshotHash(this.buildDefsSnapshot());
+    const remoteHash = this.computeSnapshotHash(data);
+    if (localHash !== remoteHash) this.markDefsDirty();
+    else if (!this.defsDirty) this.lastPushedDefsHash = remoteHash;
+
+    this.refreshAfterRemoteMerge();
+    this.setStatus(`Rotas atualizadas • ${this.getOperationCode()} • ${dayISO}`, 'info');
+  },
+
   async supaLoadDaySnapshot(operationCode, dayISO) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
@@ -432,8 +554,21 @@ const ConferenciaApp = {
       .eq('day', dayISO)
       .maybeSingle();
     if (error) throw error;
-    if (!data) return null;
-    return data;
+    return data || null;
+  },
+
+  // Consulta barata (~100 bytes): só a data da última gravação das definições
+  async fetchDefsUpdatedAt(operationCode, dayISO) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
+    const { data, error } = await sb
+      .from('routes_state')
+      .select('updated_at')
+      .eq('operation_code', operationCode)
+      .eq('day', dayISO)
+      .maybeSingle();
+    if (error) throw error;
+    return data ? data.updated_at : null;
   },
 
   async supaSaveDaySnapshot(operationCode, dayISO, snapshotObj) {
@@ -446,91 +581,379 @@ const ConferenciaApp = {
       updated_at: new Date().toISOString(),
       device_id: this.getDeviceId()
     };
-    const { error } = await sb
+    const { data, error } = await sb
       .from('routes_state')
-      .upsert(payload, { onConflict: 'operation_code,day' });
+      .upsert(payload, { onConflict: 'operation_code,day' })
+      .select('updated_at')
+      .single();
     if (error) throw error;
+    return data ? data.updated_at : null;
   },
 
-  markCloudDirty(targetDay = this.workDay || this.todayLocalISO(), targetOp = this.getOperationCode()) {
-    this.cloudDirty = true;
-    this.cloudMutationSeq++;
-    this.lastLocalMutationAt = Date.now();
-
-    this.pendingCloudSave = {
-      day: targetDay,
-      op: targetOp
-    };
-
-    this.scheduleCloudSave(CLOUD_SAVE_DEBOUNCE_MS);
+  markDefsDirty() {
+    this.defsDirty = true;
+    this.defsMutationSeq++;
+    this.scheduleDefsSave(DEFS_SAVE_DEBOUNCE_MS);
+    this.updatePendingFlag();
   },
 
-  scheduleCloudSave(delayMs) {
-    if (this.cloudSaveTimer) clearTimeout(this.cloudSaveTimer);
-    this.cloudSaveTimer = setTimeout(() => {
-      this.cloudSaveTimer = null;
-      const pending = this.pendingCloudSave || {};
-      this.flushCloudSave(pending.op, pending.day).catch(e => {
-        console.warn('Falha ao salvar no Supabase (vai tentar de novo):', e);
-        this.setStatus('Falha ao salvar no banco (Supabase). Mantido no cache local, tentando de novo...', 'warning');
-        this.scheduleCloudSave(5000);
+  scheduleDefsSave(delayMs) {
+    if (this.defsSaveTimer) clearTimeout(this.defsSaveTimer);
+    this.defsSaveTimer = setTimeout(() => {
+      this.defsSaveTimer = null;
+      this.flushDefsSave().catch(e => {
+        console.warn('Falha ao salvar rotas no Supabase (vai tentar de novo):', e);
+        this.setStatus('Falha ao salvar rotas no banco. Mantido no cache local, tentando de novo...', 'warning');
+        this.scheduleDefsSave(5000);
       });
     }, delayMs);
   },
 
-  async flushCloudSave(forceOp, forceDay) {
-    if (!this.cloudEnabled) return;
-    if (!this.cloudDirty) return;
-    if (this.cloudSaving) {
-      // Já tem um save em andamento: tenta de novo quando ele terminar
-      this.scheduleCloudSave(500);
+  async flushDefsSave() {
+    if (!this.cloudEnabled || !this.defsDirty) return;
+    if (this.defsSaving) {
+      this.scheduleDefsSave(500);
       return;
     }
 
-    const op = forceOp || this.getOperationCode();
-    const day = forceDay || this.workDay || this.todayLocalISO();
+    const op = this.getOperationCode();
+    const day = this.workDay;
     if (!op || !day) return;
 
-    // Só envia se o estado em memória ainda for desse dia/operação
-    if (op !== this.getOperationCode() || day !== (this.workDay || this.todayLocalISO())) return;
-
-    this.cloudSaving = true;
-    const seqAtStart = this.cloudMutationSeq;
+    this.defsSaving = true;
+    const seqAtStart = this.defsMutationSeq;
     try {
-      // Ler → mesclar → gravar: incorpora o que outros aparelhos salvaram antes de sobrescrever
-      const remote = await this.supaLoadDaySnapshot(op, day);
-      if (remote && remote.data) {
-        this.mergeSnapshotIntoLocal(remote.data);
-        this.saveToStorage(day, { syncCloud: false });
+      // Só baixa as definições remotas se outro aparelho gravou depois da última vez que vimos
+      const remoteTs = await this.fetchDefsUpdatedAt(op, day);
+      if (!this.isCurrentDayOp(op, day)) return;
+
+      let remoteHash = null;
+      if (remoteTs && remoteTs !== this.defsRemoteUpdatedAt) {
+        const row = await this.supaLoadDaySnapshot(op, day);
+        if (!this.isCurrentDayOp(op, day)) return;
+        if (row && row.data) {
+          this.mergeDefsIntoLocal(row.data);
+          this.rebuildScanState();
+          this.saveLocalDefs();
+          this.refreshAfterRemoteMerge();
+          remoteHash = this.computeSnapshotHash(row.data);
+        }
+        this.defsRemoteUpdatedAt = remoteTs;
       }
 
-      const snapshot = this.buildDaySnapshotObject();
-      const snapshotHash = this.computeSnapshotHash(snapshot);
-      const remoteHash = remote && remote.data ? this.computeSnapshotHash(remote.data) : '';
+      const snapshot = this.buildDefsSnapshot();
+      const hash = this.computeSnapshotHash(snapshot);
+      const remoteUnchanged = remoteTs && remoteTs === this.defsRemoteUpdatedAt;
 
-      if (snapshotHash !== remoteHash) {
-        await this.supaSaveDaySnapshot(op, day, snapshot);
-        this.lastRemoteUpdatedAt = new Date().toISOString();
-      }
-
-      this.cloudLastSaveAt = Date.now();
-      this.lastPushedSnapshotHash = snapshotHash;
-
-      // Se alguém bipou durante o save, continua sujo e agenda outro envio
-      if (this.cloudMutationSeq !== seqAtStart) {
-        this.scheduleCloudSave(300);
+      if (hash === remoteHash || (remoteUnchanged && hash === this.lastPushedDefsHash)) {
+        this.lastPushedDefsHash = hash;
       } else {
-        this.cloudDirty = false;
-        this.pendingCloudSave = null;
-        this.dirty = false;
-        $('#dirty-flag').addClass('d-none');
-        this.setStatus(`Salvo no banco • ${op} • ${day}`, 'success');
+        const savedAt = await this.supaSaveDaySnapshot(op, day, snapshot);
+        this.defsRemoteUpdatedAt = savedAt || this.defsRemoteUpdatedAt;
+        this.lastPushedDefsHash = hash;
       }
 
-      if (remote && remote.data) this.refreshAfterRemoteMerge();
+      // Se mudou algo durante o save, continua pendente e agenda outro envio
+      if (this.defsMutationSeq !== seqAtStart) {
+        this.scheduleDefsSave(300);
+      } else {
+        this.defsDirty = false;
+        this.setStatus(`Rotas salvas no banco • ${op} • ${day}`, 'success');
+      }
     } finally {
-      this.cloudSaving = false;
+      this.defsSaving = false;
+      this.updatePendingFlag();
     }
+  },
+
+  // Busca as definições no banco (só baixa o conteúdo se mudou)
+  async pullDefs(dayISO, { force = false } = {}) {
+    const op = this.getOperationCode();
+    if (!op || !dayISO) return;
+
+    const remoteTs = await this.fetchDefsUpdatedAt(op, dayISO);
+    if (!this.isCurrentDayOp(op, dayISO)) return;
+
+    if (!remoteTs) {
+      // Banco ainda sem esse dia, mas há rotas locais: envia
+      if (this.routes.size) this.markDefsDirty();
+      return;
+    }
+    if (!force && remoteTs === this.defsRemoteUpdatedAt) return;
+
+    const row = await this.supaLoadDaySnapshot(op, dayISO);
+    if (!row || !row.data || !this.isCurrentDayOp(op, dayISO)) return;
+
+    this.defsRemoteUpdatedAt = row.updated_at || remoteTs;
+    this.applyRemoteDefs(row.data, dayISO);
+  },
+
+  // =======================
+  // Bipagens (scan_events)
+  // =======================
+  newId() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+  },
+
+  compareEvents(a, b) {
+    return (a.ts - b.ts) || (a.cid < b.cid ? -1 : a.cid > b.cid ? 1 : 0);
+  },
+
+  // Aplica UMA bipagem sobre o estado das rotas (mesma regra da conferência manual)
+  applyScanEvent(ev) {
+    const r = this.routes.get(String(ev.route));
+    if (!r) { ev.res = null; return null; }
+    // Bipagens anteriores a uma reimportação da rota não contam
+    if (ev.ts < Number(r.resetAt || 0)) { ev.res = null; return null; }
+
+    const codigo = ev.pkg;
+    const now = ev.ts;
+    const correctRouteId = this.findCorrectRouteForId(codigo);
+    const isCorrectHere = correctRouteId && String(correctRouteId) === String(r.routeId);
+
+    if (isCorrectHere) {
+      if (!r.conferidos.has(codigo)) {
+        r.faltantes.delete(codigo);
+        r.foraDeRota.delete(codigo);
+        r.conferidos.add(codigo);
+        r.timestamps.set(codigo, now);
+        this.cleanupIdFromOtherRoutes(codigo, r.routeId);
+        ev.res = 'ok';
+        return ev.res;
+      }
+      this.cleanupIdFromOtherRoutes(codigo, r.routeId);
+    }
+
+    if (r.conferidos.has(codigo) || r.foraDeRota.has(codigo)) {
+      r.duplicados.set(codigo, this.dupCount(r.duplicados.get(codigo) || 1) + 1);
+      this._foraOrDupIds.add(codigo);
+      r.timestamps.set(codigo, now);
+      ev.res = 'dup';
+      return ev.res;
+    }
+
+    if (r.faltantes.has(codigo)) {
+      r.faltantes.delete(codigo);
+      r.conferidos.add(codigo);
+      r.timestamps.set(codigo, now);
+      this.cleanupIdFromOtherRoutes(codigo, r.routeId);
+      ev.res = 'ok';
+      return ev.res;
+    }
+
+    r.foraDeRota.add(codigo);
+    this._foraOrDupIds.add(codigo);
+    r.timestamps.set(codigo, now);
+    ev.res = 'fora';
+    return ev.res;
+  },
+
+  // Recalcula conferidos/faltantes/fora/duplicados do zero a partir de todos os eventos
+  rebuildScanState() {
+    this.invalidateIdIndex();
+    this._foraOrDupIds = new Set();
+    for (const r of this.routes.values()) {
+      r.conferidos = new Set();
+      r.foraDeRota = new Set();
+      r.duplicados = new Map();
+      r.timestamps = new Map();
+      r.faltantes = new Set(r.ids);
+    }
+    const list = Array.from(this.events.values()).sort((a, b) => this.compareEvents(a, b));
+    for (const ev of list) this.applyScanEvent(ev);
+    this.lastAppliedEv = list.length ? list[list.length - 1] : null;
+  },
+
+  // Adiciona eventos; aplica em sequência ou recalcula tudo se chegou algum "no passado"
+  addEvents(evs) {
+    const novos = [];
+    for (const ev of evs) {
+      const cur = this.events.get(ev.cid);
+      if (cur) {
+        if (ev.sv) cur.sv = 1;
+        continue;
+      }
+      this.events.set(ev.cid, ev);
+      novos.push(ev);
+    }
+    if (!novos.length) return novos;
+
+    novos.sort((a, b) => this.compareEvents(a, b));
+    const last = this.lastAppliedEv;
+    if (last && this.compareEvents(novos[0], last) < 0) {
+      this.rebuildScanState();
+    } else {
+      for (const ev of novos) this.applyScanEvent(ev);
+      this.lastAppliedEv = novos[novos.length - 1];
+    }
+    return novos;
+  },
+
+  serverRowToEvent(row) {
+    return {
+      cid: row.client_id ? String(row.client_id) : `srv-${row.id}`,
+      pkg: String(row.package_id),
+      route: String(row.route_id ?? ''),
+      ts: Date.parse(row.scanned_at) || 0,
+      dev: row.device_id || '',
+      sv: 1
+    };
+  },
+
+  // Eventos vindos do banco (carga inicial, checagem periódica ou realtime)
+  ingestServerEvents(rows) {
+    if (!rows || !rows.length) return;
+    for (const row of rows) {
+      if (Number(row.id) > this.maxServerId) this.maxServerId = Number(row.id);
+    }
+    const novos = this.addEvents(rows.map(r => this.serverRowToEvent(r)));
+    this.persistEventsSoon();
+    if (novos.length) this.refreshAfterRemoteMerge();
+  },
+
+  eventToRow(ev, op, day) {
+    const meta = this.getRouteMeta(ev.route);
+    return {
+      client_id: ev.cid,
+      device_id: ev.dev || this.getDeviceId(),
+      operation_code: op,
+      day,
+      package_id: ev.pkg,
+      route_id: ev.route || null,
+      cluster: meta.cluster || null,
+      xpt: meta.xpt || null,
+      result: ev.res || null,
+      scanned_at: new Date(ev.ts).toISOString()
+    };
+  },
+
+  scheduleEventFlush(delayMs = EVENT_FLUSH_DEBOUNCE_MS) {
+    if (this.eventFlushTimer) clearTimeout(this.eventFlushTimer);
+    this.eventFlushTimer = setTimeout(() => {
+      this.eventFlushTimer = null;
+      this.flushEventQueue();
+    }, delayMs);
+  },
+
+  // Envia as bipagens pendentes em lotes. client_id único => reenvio nunca duplica.
+  async flushEventQueue() {
+    if (!this.cloudEnabled || !this.eventQueue.size) return;
+    if (this.eventsSending) {
+      this.scheduleEventFlush(500);
+      return;
+    }
+    const sb = this.getSb();
+    const op = this.getOperationCode();
+    const day = this.workDay;
+    if (!sb || !op || !day) return;
+
+    this.eventsSending = true;
+    try {
+      while (this.eventQueue.size && this.isCurrentDayOp(op, day)) {
+        const cids = Array.from(this.eventQueue).slice(0, 500);
+        const rows = cids.map(cid => this.events.get(cid)).filter(Boolean).map(ev => this.eventToRow(ev, op, day));
+
+        if (rows.length) {
+          const { error } = await sb
+            .from('scan_events')
+            .upsert(rows, { onConflict: 'client_id', ignoreDuplicates: true });
+          if (error) throw error;
+        }
+
+        for (const cid of cids) {
+          this.eventQueue.delete(cid);
+          const ev = this.events.get(cid);
+          if (ev) ev.sv = 1;
+        }
+        this.persistEventsSoon();
+      }
+      if (!this.eventQueue.size) this.setStatus(`Bipagens salvas no banco • ${op} • ${day}`, 'success');
+    } catch (e) {
+      console.warn('Falha ao enviar bipagens (vai tentar de novo):', e);
+      this.setStatus(`Sem conexão com o banco • ${this.eventQueue.size} bipagem(ns) guardada(s) no aparelho`, 'warning');
+      this.scheduleEventFlush(5000);
+    } finally {
+      this.eventsSending = false;
+      this.updatePendingFlag();
+    }
+  },
+
+  // Baixa bipagens do dia. Incremental (id > último visto) por padrão; paginado de 1000 em 1000.
+  async pullEvents(dayISO, { full = false } = {}) {
+    const sb = this.getSb();
+    const op = this.getOperationCode();
+    if (!sb || !op || !dayISO) return;
+
+    let after = full ? 0 : this.maxServerId;
+    let rows = [];
+    for (;;) {
+      const { data, error } = await sb
+        .from('scan_events')
+        .select('id,client_id,device_id,package_id,route_id,scanned_at')
+        .eq('operation_code', op)
+        .eq('day', dayISO)
+        .gt('id', after)
+        .order('id', { ascending: true })
+        .limit(1000);
+      if (error) throw error;
+      if (!this.isCurrentDayOp(op, dayISO)) return;
+      if (!data || !data.length) break;
+      rows = rows.concat(data);
+      after = data[data.length - 1].id;
+      if (data.length < 1000) break;
+    }
+    if (rows.length) this.ingestServerEvents(rows);
+  },
+
+  // Consulta barata: só a contagem de bipagens do dia no banco (sem baixar linhas)
+  async countServerEvents(op, dayISO) {
+    const sb = this.getSb();
+    const { count, error } = await sb
+      .from('scan_events')
+      .select('id', { count: 'exact', head: true })
+      .eq('operation_code', op)
+      .eq('day', dayISO);
+    if (error) throw error;
+    return count || 0;
+  },
+
+  knownServerEventsCount() {
+    let n = 0;
+    for (const ev of this.events.values()) if (ev.sv) n++;
+    return n;
+  },
+
+  // Checagem periódica: só baixa algo se o banco tiver mudado
+  async periodicSyncTick() {
+    const op = this.getOperationCode();
+    const day = this.workDay;
+    if (!op || !day || this.periodicBusy) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
+
+    this.periodicBusy = true;
+    try {
+      if (this.eventQueue.size && !this.eventsSending && !this.eventFlushTimer) this.scheduleEventFlush(0);
+      if (this.defsDirty && !this.defsSaving && !this.defsSaveTimer) this.scheduleDefsSave(0);
+
+      if (!this.defsDirty) await this.pullDefs(day);
+
+      const count = await this.countServerEvents(op, day);
+      if (count > this.knownServerEventsCount()) {
+        await this.pullEvents(day);
+        // Ainda faltando (ex.: inserção concorrente com id menor): recarrega o dia inteiro
+        if (count > this.knownServerEventsCount()) await this.pullEvents(day, { full: true });
+      }
+    } catch (e) {
+      console.warn('Falha na checagem periódica:', e);
+    } finally {
+      this.periodicBusy = false;
+    }
+  },
+
+  startPeriodicSync() {
+    if (this.syncTimer) clearInterval(this.syncTimer);
+    this.syncTimer = setInterval(() => this.periodicSyncTick(), SYNC_INTERVAL_MS);
   },
 
   // Re-renderiza a tela depois de mesclar dados vindos do banco
@@ -553,176 +976,15 @@ const ConferenciaApp = {
     }, 250);
   },
 
-  // Converte duplicados antigos (que viraram array por bug de merge) em número
   dupCount(v) {
     if (Array.isArray(v)) return v.reduce((m, x) => Math.max(m, Number(x) || 0), 0);
     return Number(v) || 0;
   },
 
-  mergeSnapshotIntoLocal(snapshotObj) {
-    if (!snapshotObj || typeof snapshotObj !== 'object') return;
-    if (!this.deletedRoutes) this.deletedRoutes = new Map();
-    if (!this.revivedRoutes) this.revivedRoutes = new Map();
-
-    const remoteDel = snapshotObj.__meta?.deletedRoutes || {};
-    for (const [rid, ts] of Object.entries(remoteDel)) {
-      const id = String(rid);
-      const t = Number(ts || 0);
-      if (t > Number(this.deletedRoutes.get(id) || 0)) this.deletedRoutes.set(id, t);
-    }
-
-    const remoteRev = snapshotObj.__meta?.revivedRoutes || {};
-    for (const [rid, ts] of Object.entries(remoteRev)) {
-      const id = String(rid);
-      const t = Number(ts || 0);
-      if (t > Number(this.revivedRoutes.get(id) || 0)) this.revivedRoutes.set(id, t);
-    }
-
-    // Exclusão vs. reimportação: vence o mais recente
-    for (const [id, delTs] of Array.from(this.deletedRoutes.entries())) {
-      if (Number(this.revivedRoutes.get(id) || 0) > Number(delTs)) this.deletedRoutes.delete(id);
-    }
-
-    for (const rid of this.deletedRoutes.keys()) {
-      this.routes.delete(String(rid));
-    }
-
-    this.mergeCarretas(snapshotObj.__meta?.carretas);
-
-    for (const [routeId, ser] of Object.entries(snapshotObj)) {
-      const id = String(routeId);
-      if (id === '__meta') continue;
-      if (this.deletedRoutes.has(id)) continue;
-
-      const existing = this.routes.get(id);
-
-      if (!existing) {
-        this.routes.set(id, this.deserializeRoute(id, ser));
-        continue;
-      }
-
-      const tmp = this.deserializeRoute(id, ser);
-
-      tmp.ids.forEach(v => existing.ids.add(v));
-      tmp.conferidos.forEach(v => existing.conferidos.add(v));
-      tmp.foraDeRota.forEach(v => existing.foraDeRota.add(v));
-
-      // Campos de texto: pega o preenchido; se ambos preenchidos e diferentes, escolha determinística
-      for (const f of ['cluster', 'destinationFacilityId', 'destinationFacilityName']) {
-        const a = String(existing[f] || '');
-        const b = String(tmp[f] || '');
-        if (!a || (b && b > a)) existing[f] = b || a;
-      }
-
-      // Vínculo placa/rota: vence o mais recente
-      if (Number(tmp.plateUpdatedAt || 0) > Number(existing.plateUpdatedAt || 0)) {
-        for (const f of ['plateKey', 'plateRaw', 'plateLicense', 'routeQrKey', 'routeQrRaw', 'plateScanTs', 'routeQrScanTs', 'plateUpdatedAt']) {
-          existing[f] = tmp[f];
-        }
-      }
-
-      for (const [k, v] of tmp.timestamps.entries()) {
-        const cur = existing.timestamps.get(k);
-        if (!cur || Number(v) > Number(cur)) existing.timestamps.set(k, v);
-      }
-      for (const [k, v] of tmp.duplicados.entries()) {
-        existing.duplicados.set(k, Math.max(this.dupCount(existing.duplicados.get(k)), this.dupCount(v)));
-      }
-
-      // Um ID conferido não pode continuar em "fora de rota" na mesma rota
-      for (const c of existing.conferidos) existing.foraDeRota.delete(c);
-
-      existing.totalInicial = Math.max(Number(existing.totalInicial || 0), Number(tmp.totalInicial || 0), existing.ids.size);
-      existing.faltantes = new Set(existing.ids);
-      for (const c of existing.conferidos) existing.faltantes.delete(c);
-    }
-
-    // A união traria de volta "fora de rota" já resolvidos em outro aparelho; limpa aqui
-    this.globalCleanupForaDeRotaForConferidos();
-  },
-
-  async syncFromSupabaseForDay(dayISO) {
-    const op = this.getOperationCode();
-    if (!op) return;
-    if (this.cloudSaving) return;
-
-    try {
-      const row = await this.supaLoadDaySnapshot(op, dayISO);
-      if (!row || !row.data) {
-        // Banco ainda sem esse dia, mas há dados locais (ex.: bipado offline): envia
-        if (this.routes.size && op === this.getOperationCode() && dayISO === this.workDay) {
-          this.markCloudDirty(dayISO, op);
-        }
-        return;
-      }
-
-      // O dia/operação pode ter mudado enquanto a consulta estava em andamento
-      if (op !== this.getOperationCode() || dayISO !== this.workDay) return;
-
-      const remoteHash = this.computeSnapshotHash(row.data);
-      if (remoteHash === this.lastPushedSnapshotHash) return;
-
-      this.lastRemoteUpdatedAt = row.updated_at || this.lastRemoteUpdatedAt;
-      this.mergeSnapshotIntoLocal(row.data);
-      this.saveToStorage(dayISO, { syncCloud: false });
-
-      // Se o local tem algo que o banco não tem (ex.: bipado offline), envia
-      const localHash = this.computeSnapshotHash(this.buildDaySnapshotObject());
-      if (localHash !== remoteHash) {
-        this.markCloudDirty(dayISO, op);
-      } else {
-        this.lastPushedSnapshotHash = remoteHash;
-      }
-
-      this.refreshAfterRemoteMerge();
-      this.setStatus(`Sincronizado do banco • ${op} • ${dayISO}`, 'info');
-    } catch (e) {
-      if (e && (e.code === '42P01' || /routes_state/i.test(String(e.message || '')))) {
-        this.setStatus('Tabela routes_state não existe no Supabase. Crie a tabela para sincronizar.', 'danger');
-        console.warn('Crie no Supabase:', this.getRoutesStateCreateSQL());
-        return;
-      }
-      console.warn('Falha ao sincronizar do Supabase:', e);
-    }
-  },
-
-  startPeriodicSync() {
-    if (this.syncTimer) clearInterval(this.syncTimer);
-    this.syncTimer = setInterval(() => {
-      if (!this.workDay || !this.getOperationCode()) return;
-      if (this.cloudDirty) {
-        // Save travado (ex.: falha de rede sem retry agendado)? força nova tentativa
-        if (!this.cloudSaveTimer && !this.cloudSaving) this.scheduleCloudSave(0);
-        return;
-      }
-      this.syncFromSupabaseForDay(this.workDay);
-    }, SYNC_INTERVAL_MS);
-  },
-
-  getRoutesStateCreateSQL() {
-    return `create table if not exists public.routes_state (
-  operation_code text not null references public.operations(code) on delete restrict,
-  day date not null,
-  data jsonb not null,
-  updated_at timestamptz not null default now(),
-  device_id text,
-  primary key (operation_code, day)
-);
-
-alter table public.routes_state enable row level security;
-
-create policy "routes_state_select_all"
-  on public.routes_state for select
-  using (true);
-
-create policy "routes_state_upsert_all"
-  on public.routes_state for insert
-  with check (true);
-
-create policy "routes_state_update_all"
-  on public.routes_state for update
-  using (true)
-  with check (true);`;
+  updatePendingFlag() {
+    this.dirty = !!(this.defsDirty || (this.eventQueue && this.eventQueue.size));
+    if (this.dirty) $('#dirty-flag').removeClass('d-none');
+    else $('#dirty-flag').addClass('d-none');
   },
 
   async ensureOperationSelected() {
@@ -765,18 +1027,11 @@ create policy "routes_state_update_all"
     $s.text(txt);
   },
 
+  // Definições das rotas mudaram (importação, exclusão, placa...): agenda envio ao banco
   markDirty(reason = '') {
-    this.dirty = true;
-    this.markCloudDirty();
+    this.markDefsDirty();
     const msg = reason ? `pendente salvar (${reason})` : 'pendente salvar';
     this.setStatus(msg, 'warning');
-    $('#dirty-flag').removeClass('d-none');
-  },
-
-  markClean() {
-    this.dirty = false;
-    $('#dirty-flag').addClass('d-none');
-    this.setStatus('sincronizado', 'success');
   },
 
   // =======================
@@ -871,45 +1126,6 @@ create policy "routes_state_update_all"
     };
   },
 
-  enrichEventForCloud(evt) {
-    const e = Object.assign({}, evt || {});
-    const meta = this.getRouteMeta(e.currentRouteId);
-    e._meta = meta;
-    return e;
-  },
-
-  async logScanEventToCloud(evt) {
-    try {
-      const sb = this.getSb();
-      if (!sb) return;
-
-      const op = this.getOperationCode();
-      const dayISO = this.workDay || this.todayLocalISO();
-      if (!op || !dayISO) return;
-
-      const e = this.enrichEventForCloud(evt);
-      const code = this.normalizarCodigo(e.code);
-      if (!code) return;
-      if (!/^\d+$/.test(String(code))) return;
-
-      const payload = {
-        operation_code: String(op),
-        day: String(dayISO),
-        package_id: String(code),
-        scanned_at: new Date(Number(e.ts || Date.now())).toISOString(),
-        result: String(e.type || '').toLowerCase() || null,
-        route_id: e._meta?.routeId || null,
-        cluster: e._meta?.cluster || null,
-        xpt: e._meta?.xpt || null
-      };
-
-      const { error } = await sb.from('scan_events').insert(payload);
-      if (error) console.warn('Falha ao gravar scan_events:', error);
-    } catch (err) {
-      console.warn('Falha ao gravar scan_events (catch):', err);
-    }
-  },
-
   parseIdsList(raw) {
     const txt = String(raw || '');
     // Aceita qualquer ID numérico (não só o padrão de 11 dígitos da bipagem)
@@ -993,17 +1209,15 @@ create policy "routes_state_update_all"
     if ($wrap.length) $wrap.removeClass('d-none');
   },
 
+  // Log local das últimas bipagens (painel "Acompanhamento")
   pushEvent(evt) {
-    const e = this.enrichEventForCloud(evt);
-    this.lastEvents.unshift(e);
+    this.lastEvents.unshift(Object.assign({}, evt));
     if (this.lastEvents.length > 80) this.lastEvents.length = 80;
     this.renderAcompanhamento();
-    this.logScanEventToCloud(e);
   },
 
   renderAcompanhamento() {
-    if (this.dirty) $('#dirty-flag').removeClass('d-none');
-    else $('#dirty-flag').addClass('d-none');
+    this.updatePendingFlag();
 
     const mapa = new Map();
 
@@ -1252,7 +1466,9 @@ create policy "routes_state_update_all"
 
       plateScanTs: 0,
       routeQrScanTs: 0,
-      plateUpdatedAt: 0
+      plateUpdatedAt: 0,
+
+      resetAt: 0 // bipagens anteriores a este horário não contam (rota reimportada após exclusão)
     };
   },
 
@@ -1262,185 +1478,160 @@ create policy "routes_state_update_all"
   },
 
   // =======================
-  // Persistência local
+  // Persistência local (funciona offline; o banco é sincronizado depois)
   // =======================
-  loadFromStorage(dayISO) {
+  loadLocal(dayISO) {
+    const key = this.storageKeyForDay(dayISO);
     try {
-      const key = this.storageKeyForDay(dayISO);
       const raw = localStorage.getItem(key);
-      if (!raw) return;
-
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') return;
-
-      this.deletedRoutes = new Map(Object.entries(parsed.__meta?.deletedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
-      this.revivedRoutes = new Map(Object.entries(parsed.__meta?.revivedRoutes || {}).map(([k, v]) => [String(k), Number(v || 0)]));
-
-      for (const [rid, rts] of this.revivedRoutes.entries()) {
-        const delTs = Number(this.deletedRoutes.get(rid) || 0);
-        if (Number(rts || 0) > delTs) this.deletedRoutes.delete(rid);
-      }
-
-      this.routes.clear();
-      this.currentRouteId = null;
-
-      for (const [routeId, r] of Object.entries(parsed)) {
-        if (routeId === '__meta') continue;
-        if (this.deletedRoutes.has(String(routeId))) continue;
-        this.routes.set(String(routeId), this.deserializeRoute(routeId, r));
-      }
-
-      this.mergeCarretas(parsed.__meta?.carretas);
-      this.lastSavedLocalSnapshotHash = this.computeSnapshotHash(this.buildDaySnapshotObject());
+      if (raw) this.mergeDefsIntoLocal(JSON.parse(raw));
     } catch (e) {
-      console.warn('Falha ao carregar storage:', e);
+      console.warn('Falha ao carregar rotas do cache local:', e);
     }
-  },
-
-  saveToStorage(dayISO, opts = {}) {
-    const { syncCloud = true } = opts;
 
     try {
-      const key = this.storageKeyForDay(dayISO);
-      const obj = this.buildDaySnapshotObject();
-
-      const hash = this.computeSnapshotHash(obj);
-      if (hash !== this.lastSavedLocalSnapshotHash) {
-        localStorage.setItem(key, JSON.stringify(obj));
-        this.lastSavedLocalSnapshotHash = hash;
-      }
-
-      if (syncCloud && hash !== this.lastPushedSnapshotHash) {
-        this.markCloudDirty(dayISO, this.getOperationCode());
+      const raw = localStorage.getItem(`${key}.events`);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        for (const [cid, pkg, route, ts, dev, sv] of (saved.events || [])) {
+          this.events.set(cid, { cid, pkg, route, ts: Number(ts), dev, sv: sv ? 1 : 0 });
+        }
+        (saved.queue || []).forEach(cid => { if (this.events.has(cid)) this.eventQueue.add(cid); });
+        this.maxServerId = Number(saved.maxServerId || 0);
       }
     } catch (e) {
-      console.warn('Falha ao salvar storage:', e);
+      console.warn('Falha ao carregar bipagens do cache local:', e);
+    }
+
+    this.rebuildScanState();
+    this.lastSavedLocalDefsHash = this.computeSnapshotHash(this.buildDefsSnapshot());
+  },
+
+  saveLocalDefs() {
+    if (!this.workDay) return '';
+    try {
+      const obj = this.buildDefsSnapshot();
+      const hash = this.computeSnapshotHash(obj);
+      if (hash !== this.lastSavedLocalDefsHash) {
+        localStorage.setItem(this.storageKeyForDay(this.workDay), JSON.stringify(obj));
+        this.lastSavedLocalDefsHash = hash;
+      }
+      return hash;
+    } catch (e) {
+      console.warn('Falha ao salvar rotas no cache local:', e);
+      return '';
     }
   },
 
-  serializeRoute(r) {
+  // Chamado após mudar definições (importar, excluir, placa...): salva local e agenda envio
+  saveToStorage(dayISO, opts = {}) {
+    // Definições mudaram: reavalia as bipagens (ex.: um "fora de rota" pode virar conferido)
+    this.rebuildScanState();
+    const { syncCloud = true } = opts;
+    const hash = this.saveLocalDefs();
+    if (syncCloud && hash !== this.lastPushedDefsHash) this.markDefsDirty();
+  },
+
+  persistEventsNow() {
+    if (this.eventsPersistTimer) {
+      clearTimeout(this.eventsPersistTimer);
+      this.eventsPersistTimer = null;
+    }
+    if (!this.workDay || !this.getOperationCode()) return;
+    try {
+      const events = Array.from(this.events.values()).map(ev => [ev.cid, ev.pkg, ev.route, ev.ts, ev.dev, ev.sv ? 1 : 0]);
+      localStorage.setItem(`${this.storageKeyForDay(this.workDay)}.events`, JSON.stringify({
+        events,
+        queue: Array.from(this.eventQueue),
+        maxServerId: this.maxServerId
+      }));
+    } catch (e) {
+      console.warn('Falha ao salvar bipagens no cache local:', e);
+    }
+  },
+
+  persistEventsSoon() {
+    if (this.eventsPersistTimer) return;
+    this.eventsPersistTimer = setTimeout(() => this.persistEventsNow(), 300);
+  },
+
+  serializeRouteDef(r) {
     return {
       routeId: r.routeId,
       cluster: r.cluster,
       destinationFacilityId: r.destinationFacilityId,
       destinationFacilityName: r.destinationFacilityName,
       totalInicial: r.totalInicial,
+      ids: Array.from(r.ids),
+      resetAt: Number(r.resetAt || 0),
 
       plateKey: r.plateKey || '',
       plateRaw: r.plateRaw || '',
       plateLicense: r.plateLicense || '',
       routeQrKey: r.routeQrKey || '',
       routeQrRaw: r.routeQrRaw || '',
-
       plateScanTs: Number(r.plateScanTs || 0),
       routeQrScanTs: Number(r.routeQrScanTs || 0),
       plateUpdatedAt: Number(r.plateUpdatedAt || 0),
-
-      ids: Array.from(r.ids),
-      faltantes: Array.from(r.faltantes),
-      conferidos: Array.from(r.conferidos),
-      foraDeRota: Array.from(r.foraDeRota),
-
-      timestamps: Object.fromEntries(r.timestamps),
-      duplicados: Object.fromEntries(r.duplicados),
     };
   },
 
-  deserializeRoute(routeId, r) {
+  deserializeRouteDef(routeId, r) {
     const route = this.makeEmptyRoute(routeId);
     r = r || {};
 
     route.cluster = r.cluster || '';
     route.destinationFacilityId = r.destinationFacilityId || '';
     route.destinationFacilityName = r.destinationFacilityName || '';
-    route.totalInicial = Number(r.totalInicial || 0);
+    (r.ids || []).forEach(id => route.ids.add(String(id)));
+    route.totalInicial = Math.max(Number(r.totalInicial || 0), route.ids.size);
+    route.resetAt = Number(r.resetAt || 0);
 
     route.plateKey = r.plateKey || '';
     route.plateRaw = r.plateRaw || '';
     route.plateLicense = r.plateLicense || '';
     route.routeQrKey = r.routeQrKey || '';
     route.routeQrRaw = r.routeQrRaw || '';
-
     route.plateScanTs = Number(r.plateScanTs || 0);
     route.routeQrScanTs = Number(r.routeQrScanTs || 0);
     route.plateUpdatedAt = Number(r.plateUpdatedAt || r.routeQrScanTs || 0);
 
-    (r.ids || []).forEach(id => route.ids.add(id));
-    (r.conferidos || []).forEach(id => route.conferidos.add(id));
-    (r.foraDeRota || []).forEach(id => route.foraDeRota.add(id));
-
-    route.timestamps = new Map(Object.entries(r.timestamps || {}));
-    route.duplicados = new Map(Object.entries(r.duplicados || {}).map(([k, v]) => [k, this.dupCount(v)]));
-
-    // Faltantes sempre derivados de ids - conferidos (evita lista desatualizada)
-    if (route.ids.size) {
-      route.faltantes = new Set(route.ids);
-      for (const c of route.conferidos) route.faltantes.delete(c);
-    } else {
-      route.faltantes = new Set(r.faltantes || []);
-    }
-
+    route.faltantes = new Set(route.ids);
     return route;
   },
 
-  // Remove "fora de rota" de IDs que depois foram conferidos na rota certa.
-  // Mantém o alerta quando o "fora" aconteceu DEPOIS da conferência (pacote foi parar na gaiola errada).
-  globalCleanupForaDeRotaForConferidos() {
-    const conferidoTs = new Map(); // id -> ts da conferência
-    for (const r of this.routes.values()) {
-      for (const id of r.conferidos) {
-        const ts = Number(r.timestamps.get(id) || 0);
-        conferidoTs.set(id, Math.max(conferidoTs.get(id) || 0, ts));
-      }
-    }
-    if (!conferidoTs.size) return;
-
-    for (const r of this.routes.values()) {
-      for (const id of Array.from(r.foraDeRota)) {
-        if (!conferidoTs.has(id)) continue;
-        if (r.conferidos.has(id)) {
-          r.foraDeRota.delete(id);
-          continue;
-        }
-        const foraTs = Number(r.timestamps.get(id) || 0);
-        if (foraTs <= conferidoTs.get(id)) {
-          r.foraDeRota.delete(id);
-          r.duplicados.delete(id);
-        }
-      }
-    }
-  },
-
   // =======================
-  // Troca de dia
+  // Troca de dia / operação
   // =======================
   // Envia ao banco o que estiver pendente (usado antes de trocar dia/operação)
   async flushPendingNow() {
-    if (this.cloudSaveTimer) {
-      clearTimeout(this.cloudSaveTimer);
-      this.cloudSaveTimer = null;
+    for (const t of ['defsSaveTimer', 'eventFlushTimer']) {
+      if (this[t]) {
+        clearTimeout(this[t]);
+        this[t] = null;
+      }
     }
-    for (let i = 0; i < 50 && this.cloudSaving; i++) {
+    for (let i = 0; i < 50 && (this.defsSaving || this.eventsSending); i++) {
       await new Promise(res => setTimeout(res, 100));
     }
-    if (!this.cloudDirty) return;
     try {
-      const pending = this.pendingCloudSave || {};
-      await this.flushCloudSave(pending.op, pending.day);
+      if (this.defsDirty) await this.flushDefsSave();
     } catch (e) {
-      console.warn("Falha ao enviar pendências antes da troca (ficam no cache local):", e);
+      console.warn('Falha ao enviar rotas antes da troca (ficam no cache local):', e);
     }
-    if (this.cloudSaveTimer) {
-      clearTimeout(this.cloudSaveTimer);
-      this.cloudSaveTimer = null;
+    await this.flushEventQueue();
+    for (const t of ['defsSaveTimer', 'eventFlushTimer']) {
+      if (this[t]) {
+        clearTimeout(this[t]);
+        this[t] = null;
+      }
     }
+    this.persistEventsNow();
+    this.saveLocalDefs();
   },
 
-  async applyWorkDay(dayISO) {
-    await this.flushPendingNow();
-    this.cloudDirty = false;
-    this.pendingCloudSave = null;
-
+  resetDayState() {
+    this.invalidateIdIndex();
     this.routes.clear();
     this.resetCarretas();
     this.currentRouteId = null;
@@ -1449,9 +1640,21 @@ create policy "routes_state_update_all"
     this.deletedRoutes = new Map();
     this.revivedRoutes = new Map();
     this.lastEvents = [];
-    this.lastRemoteUpdatedAt = null;
-    this.lastPushedSnapshotHash = '';
-    this.lastSavedLocalSnapshotHash = '';
+
+    this.events = new Map();
+    this.eventQueue = new Set();
+    this.maxServerId = 0;
+    this.lastAppliedEv = null;
+
+    this.defsDirty = false;
+    this.defsRemoteUpdatedAt = null;
+    this.lastPushedDefsHash = '';
+    this.lastSavedLocalDefsHash = '';
+  },
+
+  async applyWorkDay(dayISO) {
+    await this.flushPendingNow();
+    this.resetDayState();
 
     this.workDay = dayISO;
     $('#work-day').val(dayISO);
@@ -1459,17 +1662,29 @@ create policy "routes_state_update_all"
     const op = this.getOperationCode();
     if (op) $('#op-badge').text(op);
 
-    this.loadFromStorage(dayISO);
+    this.loadLocal(dayISO);
+    this.renderRoutesSelects();
+    this.refreshUIFromCurrent();
+    this.renderAcompanhamento();
 
     if (op) {
-      await this.syncFromSupabaseForDay(dayISO);
+      // Realtime primeiro, para não perder nada que chegue durante a carga
       await this.startRealtimeSync(dayISO);
+      try {
+        await this.pullDefs(dayISO, { force: true });
+        await this.pullEvents(dayISO);
+      } catch (e) {
+        console.warn('Falha ao carregar o dia do banco (seguindo com o cache local):', e);
+        this.setStatus('Sem conexão com o banco • usando dados do aparelho', 'warning');
+      }
       this.startPeriodicSync();
+      if (this.eventQueue.size) this.scheduleEventFlush(0);
     }
 
     this.renderRoutesSelects();
     this.refreshUIFromCurrent();
     this.renderAcompanhamento();
+    this.updatePendingFlag();
 
     if (op) this.setStatus(`dia carregado • ${op} • ${dayISO}`, 'success');
     else this.setStatus('dia carregado (sem operação)', 'warning');
@@ -1477,11 +1692,8 @@ create policy "routes_state_update_all"
 
   resetForOperationChange() {
     this.stopRealtimeSync();
-    this.routes.clear();
-    this.resetCarretas();
-    this.currentRouteId = null;
+    this.resetDayState();
     this.viaCsv = false;
-    this.lastRoutesSignature = '';
 
     try {
       $('#saved-routes').html('<option value="">(Nenhuma selecionada)</option>');
@@ -1502,50 +1714,30 @@ create policy "routes_state_update_all"
     $('#initial-interface').removeClass('d-none');
   },
 
-  computeSnapshotStats(snapshotObj) {
-    const routes = snapshotObj && typeof snapshotObj === 'object' ? Object.values(snapshotObj) : [];
-    let routesCount = 0, totalIds = 0, conferidos = 0, faltantes = 0, fora = 0;
-
-    for (const r of routes) {
-      if (!r || typeof r !== 'object') continue;
-      routesCount += 1;
-      const idsArr = Array.isArray(r.ids) ? r.ids : [];
-      const confArr = Array.isArray(r.conferidos) ? r.conferidos : [];
-      const faltArr = Array.isArray(r.faltantes) ? r.faltantes : [];
-      const foraArr = Array.isArray(r.foraDeRota) ? r.foraDeRota : [];
-      totalIds += idsArr.length;
-      conferidos += confArr.length;
-      faltantes += faltArr.length;
-      fora += foraArr.length;
-    }
-    return { routesCount, totalIds, conferidos, faltantes, fora };
-  },
-
+  // Acompanhamento geral: calculado no próprio banco (função day_progress), sem baixar os dados
   async loadGlobalProgress(dayISO) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado (window.sbClient).');
 
-    const { data: ops, error: e1 } = await sb
-      .from('operations')
-      .select('code,name,active')
-      .eq('active', true)
-      .order('code', { ascending: true });
-    if (e1) throw e1;
+    const { data, error } = await sb.rpc('day_progress', { p_day: dayISO });
+    if (error) throw error;
 
-    const tasks = (ops || []).map(async (o) => {
-      const code = String(o.code || '').toUpperCase();
-      const row = await this.supaLoadDaySnapshot(code, dayISO).catch(() => null);
-      const stats = this.computeSnapshotStats(row && row.data ? row.data : {});
+    return (data || []).map(o => {
+      const totalIds = Number(o.total_ids || 0);
+      const conferidos = Number(o.conferidos || 0);
       return {
-        code,
+        code: String(o.operation_code || '').toUpperCase(),
         name: o.name || '',
-        stats,
-        updated_at: row ? row.updated_at : null,
-        device_id: row ? row.device_id : null
+        stats: {
+          routesCount: Number(o.routes || 0),
+          totalIds,
+          conferidos,
+          faltantes: Math.max(0, totalIds - conferidos),
+          fora: Number(o.fora || 0)
+        },
+        updated_at: o.updated_at || null
       };
     });
-
-    return Promise.all(tasks);
   },
 
   renderGlobalProgress(items, dayISO) {
@@ -2254,24 +2446,31 @@ create policy "routes_state_update_all"
   // =======================
   // Fora de rota inteligente
   // =======================
+  // Rota "dona" do ID (primeira rota que tem o ID na lista importada).
+  // Usa um índice ID -> rota, invalidado sempre que as definições mudam.
   findCorrectRouteForId(id) {
-    for (const [rid, r] of this.routes.entries()) {
-      if (r.ids && r.ids.has(id)) return String(rid);
+    if (!this._idIndex) {
+      this._idIndex = new Map();
+      for (const [rid, r] of this.routes.entries()) {
+        for (const x of r.ids) if (!this._idIndex.has(x)) this._idIndex.set(x, String(rid));
+      }
     }
-    for (const [rid, r] of this.routes.entries()) {
-      if (r.faltantes && r.faltantes.has(id)) return String(rid);
-    }
-    for (const [rid, r] of this.routes.entries()) {
-      if (r.conferidos && r.conferidos.has(id)) return String(rid);
-    }
-    return null;
+    return this._idIndex.get(id) || null;
+  },
+
+  invalidateIdIndex() {
+    this._idIndex = null;
   },
 
   cleanupIdFromOtherRoutes(id, targetRouteId) {
+    // Caminho rápido: ID nunca esteve em fora de rota/duplicados => nada para limpar
+    if (this._foraOrDupIds && !this._foraOrDupIds.has(id)) return;
     const target = String(targetRouteId);
 
     for (const [rid, r] of this.routes.entries()) {
-      if (String(rid) === target) continue;
+      // Caminho rápido: na grande maioria das rotas o ID não está em fora/duplicados
+      if (!r.foraDeRota.has(id) && !r.duplicados.has(id)) continue;
+      if (rid === target) continue;
 
       let changed = false;
 
@@ -2305,73 +2504,37 @@ create policy "routes_state_update_all"
     const r = this.current;
     if (!r || !codigo) return;
 
-    const now = Date.now();
+    // Horário estritamente crescente por aparelho (desempate estável na ordenação)
+    let ts = Date.now();
+    if (ts <= this.lastOwnTs) ts = this.lastOwnTs + 1;
+    this.lastOwnTs = ts;
 
-    const correctRouteId = this.findCorrectRouteForId(codigo);
-    const isCorrectHere = correctRouteId && String(correctRouteId) === String(this.currentRouteId);
+    const ev = {
+      cid: this.newId(),
+      pkg: String(codigo),
+      route: String(r.routeId),
+      ts,
+      dev: this.getDeviceId(),
+      sv: 0
+    };
 
-    if (isCorrectHere) {
-      if (!r.conferidos.has(codigo)) {
-        if (r.faltantes && r.faltantes.has(codigo)) r.faltantes.delete(codigo);
-        if (r.foraDeRota && r.foraDeRota.has(codigo)) r.foraDeRota.delete(codigo);
-        r.conferidos.add(codigo);
-        r.timestamps.set(codigo, now);
+    this.addEvents([ev]);
+    this.eventQueue.add(ev.cid);
+    this.persistEventsSoon();
+    this.scheduleEventFlush();
+    this.updatePendingFlag();
 
-        this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
-
-        $('#barcode-input').val('').focus();
-        this.pushEvent({ ts: now, type: 'ok', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
-        this.markDirty('bipagem');
-
-        this.saveToStorage(this.workDay);
-        this.atualizarListas();
-        return;
-      }
-
-      this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
-    }
-
-    if (r.conferidos.has(codigo) || r.foraDeRota.has(codigo)) {
-      const count = this.dupCount(r.duplicados.get(codigo)) || 1;
-      r.duplicados.set(codigo, count + 1);
-      r.timestamps.set(codigo, now);
-
-      if (!this.viaCsv) this.playAlertSound();
-      $('#barcode-input').val('').focus();
-
-      this.pushEvent({ ts: now, type: 'dup', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
-      this.markDirty('bipagem');
-
-      this.saveToStorage(this.workDay);
-      this.atualizarListas();
-      return;
-    }
-
-    if (r.faltantes.has(codigo)) {
-      r.faltantes.delete(codigo);
-      r.conferidos.add(codigo);
-      r.timestamps.set(codigo, now);
-
-      this.cleanupIdFromOtherRoutes(codigo, this.currentRouteId);
-
-      $('#barcode-input').val('').focus();
-      this.pushEvent({ ts: now, type: 'ok', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
-      this.markDirty('bipagem');
-
-      this.saveToStorage(this.workDay);
-      this.atualizarListas();
-      return;
-    }
-
-    r.foraDeRota.add(codigo);
-    r.timestamps.set(codigo, now);
-    if (!this.viaCsv) this.playAlertSound();
+    const tipo = ev.res || 'ok';
+    if (tipo !== 'ok' && !this.viaCsv) this.playAlertSound();
 
     $('#barcode-input').val('').focus();
-    this.pushEvent({ ts: now, type: 'fora', code: codigo, currentRouteId: this.currentRouteId, correctRouteId });
-    this.markDirty('bipagem');
-
-    this.saveToStorage(this.workDay);
+    this.pushEvent({
+      ts,
+      type: tipo,
+      code: codigo,
+      currentRouteId: this.currentRouteId,
+      correctRouteId: this.findCorrectRouteForId(codigo)
+    });
     this.atualizarListas();
   },
 
@@ -2404,13 +2567,17 @@ create policy "routes_state_update_all"
 
       const routeId = String(routeMatch[1]);
 
+      let revivedAt = 0;
       if (this.deletedRoutes?.has(routeId)) {
         this.deletedRoutes.delete(routeId);
         if (!this.revivedRoutes) this.revivedRoutes = new Map();
-        this.revivedRoutes.set(routeId, Date.now());
+        revivedAt = Date.now();
+        this.revivedRoutes.set(routeId, revivedAt);
       }
 
       const route = this.routes.get(routeId) || this.makeEmptyRoute(routeId);
+      // Rota excluída e importada de novo começa zerada (bipagens antigas não contam)
+      if (revivedAt) route.resetAt = revivedAt;
 
       const clusterMatch = /"cluster":"([^"]+)"/.exec(block);
       if (clusterMatch) route.cluster = this.normalizeCluster(clusterMatch[1]);
@@ -3332,5 +3499,11 @@ $(document).on('click', '#global-back', () => {
 
 // encerra realtime ao sair
 window.addEventListener('beforeunload', () => {
+  try { ConferenciaApp.persistEventsNow(); } catch {}
   try { ConferenciaApp.stopRealtimeSync(); } catch {}
+});
+
+// Ao voltar para a aba, sincroniza na hora (a checagem periódica pausa com a aba oculta)
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) ConferenciaApp.periodicSyncTick();
 });
