@@ -39,6 +39,9 @@ insert into public.operations (code, name, active)
 values ('ERD1', 'Expedição ERD1', true)
 on conflict (code) do nothing;
 
+-- 3b) PIN por operação (guarda só o hash; protege exclusões contra acidentes)
+alter table public.operations add column if not exists pin_hash text;
+
 -- 4) scan_events passa a ser a fonte das bipagens
 --    client_id: ID gerado no aparelho; o índice único impede duplicar quando o app reenvia
 --    uma bipagem (ex.: depois de ficar sem internet).
