@@ -57,20 +57,20 @@ create or replace function public.pin_enabled()
 returns boolean
 language sql stable security definer
 set search_path = public
-as $
+as $$
   select exists (select 1 from public.app_config where key = 'pin_hash');
-$;
+$$;
 
 create or replace function public.check_pin(p_pin text)
 returns boolean
 language sql stable security definer
 set search_path = public, extensions
-as $
+as $$
   select coalesce(
     (select value = encode(extensions.digest('conferencia:' || coalesce(trim(p_pin), ''), 'sha256'), 'hex')
        from public.app_config where key = 'pin_hash'),
     true);  -- sem PIN cadastrado = liberado
-$;
+$$;
 
 revoke all on function public.pin_enabled()     from public;
 revoke all on function public.check_pin(text)   from public;
