@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+const crypto = require('crypto');
 
 const MODULES = ['core', 'regras', 'sync', 'banco', 'importacao', 'exportacao', 'ui', 'eventos'];
 const SRC = MODULES
@@ -35,6 +36,7 @@ function createServer() {
     offline: new Set(),   // nomes de aparelhos sem conexão
     bytesOut: 0,          // bytes "baixados" pelos aparelhos (para medir economia)
     calls: [],            // log de consultas: {dev, table, op, cols}
+    pinHash: null,        // app_config.pin_hash (null = sem PIN)
   };
 }
 
@@ -119,7 +121,17 @@ function makeSb(server, dev) {
     from,
     channel: () => ({ on() { return this; }, subscribe() { return this; } }),
     removeChannel: async () => {},
-    rpc: async () => ({ data: [], error: null }),
+    // Funções do banco: pin_enabled / check_pin (mesma regra do supabase_setup.sql)
+    rpc: async (name, args) => {
+      if (server.offline.has(dev)) return { data: null, error: { message: 'offline (teste)' } };
+      if (name === 'pin_enabled') return { data: !!server.pinHash, error: null };
+      if (name === 'check_pin') {
+        if (!server.pinHash) return { data: true, error: null };
+        const h = crypto.createHash('sha256').update('conferencia:' + String(args.p_pin || '').trim()).digest('hex');
+        return { data: h === server.pinHash, error: null };
+      }
+      return { data: [], error: null };
+    },
   };
 }
 

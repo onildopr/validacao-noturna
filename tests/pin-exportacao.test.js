@@ -1,8 +1,8 @@
-// PIN por operação e formato das exportações.
+// PIN (único, conferido no banco) e formato das exportações.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { createDevice, addRoute, bipar, DAY } = require('./helpers');
+const { createServer, createDevice, addRoute, bipar, DAY } = require('./helpers');
 
 // Parser de uma linha CSV com campos entre aspas ("" = aspas dentro do campo)
 function parseCsvLine(line) {
@@ -22,38 +22,56 @@ function parseCsvLine(line) {
   return out;
 }
 
-test('SHA-256 próprio bate com o do Node', () => {
-  const a = createDevice('T', null);
-  for (const msg of ['', 'abc', 'conferencia:ERD1:1234', 'x'.repeat(55), 'x'.repeat(64), 'ção 🚚']) {
-    assert.equal(a.sha256Hex(msg), crypto.createHash('sha256').update(msg).digest('hex'));
-  }
+// PIN único, conferido no banco (funções pin_enabled / check_pin simuladas em helpers.js)
+const PIN_HASH_225487 = crypto.createHash('sha256').update('conferencia:225487').digest('hex');
+
+test('hash do PIN usado no SQL confere com o PIN 225487', () => {
+  assert.equal(PIN_HASH_225487, 'a88ccd081e59aa21d14dc62edf90e7c6ac41d2d78c7b18a31f31183dbaab30a6');
 });
 
-test('PIN: operação sem PIN libera; com PIN só o certo passa', () => {
-  const a = createDevice('T', null);
-  assert.equal(a.checkPin('ERD1', ''), true);
-
-  a.opPins.set('ERD1', a.pinHash('ERD1', '4321'));
-  assert.equal(a.checkPin('ERD1', '4321'), true);
-  assert.equal(a.checkPin('ERD1', '1234'), false);
-  assert.equal(a.checkPin('ERD1', ''), false);
-  // o mesmo PIN em outra operação gera outro hash
-  assert.notEqual(a.pinHash('ERD1', '4321'), a.pinHash('ERD2', '4321'));
+test('sem PIN cadastrado: ações liberadas sem perguntar', async () => {
+  const server = createServer();
+  const a = createDevice('T', server);
+  assert.equal(await a.pinEnabled(), false);
+  assert.equal(await a.requirePin('teste'), true);
 });
 
-test('requirePin libera direto quando a operação não tem PIN', async () => {
-  const a = createDevice('T', null);
-  assert.equal(await a.requirePin('teste', 'ERD1'), true);
+test('com PIN: o banco aceita só o PIN certo (o mesmo para qualquer operação)', async () => {
+  const server = createServer();
+  server.pinHash = PIN_HASH_225487;
+  const erd1 = createDevice('A', server, { op: 'ERD1' });
+  const erd2 = createDevice('B', server, { op: 'ERD2' });
+  assert.equal(await erd1.pinEnabled(), true);
+  assert.equal(await erd1.verifyPin('225487'), true);
+  assert.equal(await erd1.verifyPin(' 225487 '), true);
+  assert.equal(await erd1.verifyPin('000000'), false);
+  assert.equal(await erd1.verifyPin(''), false);
+  assert.equal(await erd2.verifyPin('225487'), true);
 });
 
-test('adminUpsertOperation valida o PIN', async () => {
+test('sem conexão com PIN cadastrado: ação destrutiva fica bloqueada', async () => {
+  const server = createServer();
+  server.pinHash = PIN_HASH_225487;
+  const a = createDevice('T', server);
+  server.offline.add('T');
+  assert.equal(await a.requirePin('teste'), false);
+});
+
+test('PIN digitado certo vale por 10 minutos', async () => {
+  const server = createServer();
+  server.pinHash = PIN_HASH_225487;
+  const a = createDevice('T', server);
+  a.pinOkUntil = Date.now() + 60 * 1000;
+  assert.equal(await a.requirePin('teste'), true);
+});
+
+test('cadastro de operação não envia PIN e valida o código', async () => {
   const a = createDevice('T', null);
-  a.getSb = () => ({ from: () => ({ upsert: async () => ({ error: null }) }) });
-  await assert.rejects(() => a.adminUpsertOperation('ERD1', '', true, 'definir', '12'), /4 a 8 números/);
-  await a.adminUpsertOperation('ERD1', '', true, 'definir', '2468');
-  assert.equal(a.checkPin('ERD1', '2468'), true);
-  await a.adminUpsertOperation('ERD1', '', true, 'remover');
-  assert.equal(a.checkPin('ERD1', 'qualquer'), true);
+  let enviado = null;
+  a.getSb = () => ({ from: () => ({ upsert: async (op) => { enviado = op; return { error: null }; } }) });
+  await assert.rejects(() => a.adminUpsertOperation('XX', '', true), /Código inválido/);
+  await a.adminUpsertOperation('erd2', 'Expedição 2', true);
+  assert.deepEqual(JSON.parse(JSON.stringify(enviado)), { code: 'ERD2', name: 'Expedição 2', active: true });
 });
 
 test('linha do CSV no formato do app de leitura', () => {

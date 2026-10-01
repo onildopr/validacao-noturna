@@ -5,7 +5,7 @@
 -- ==========================================================
 
 -- 1) Permissões básicas para a chave pública (anon)
-grant select, insert, update on public.operations   to anon, authenticated;
+grant select                 on public.operations   to anon, authenticated;  -- insert/update: ver 3b
 grant select, insert, update on public.routes_state to anon, authenticated;
 grant select, insert         on public.scan_events  to anon, authenticated;
 grant usage, select on all sequences in schema public to anon, authenticated;
@@ -39,8 +39,48 @@ insert into public.operations (code, name, active)
 values ('ERD1', 'Expedição ERD1', true)
 on conflict (code) do nothing;
 
--- 3b) PIN por operação (guarda só o hash; protege exclusões contra acidentes)
-alter table public.operations add column if not exists pin_hash text;
+-- 3b) PIN único para todas as operações (pedido em excluir rota, limpar o dia,
+--     excluir bipagem de placa e salvar operação no Admin).
+--     O hash fica em app_config, que a chave pública NÃO consegue ler nem alterar.
+--     O app só pergunta ao banco "tem PIN?" e "este PIN está certo?".
+--     Definir / trocar / remover o PIN: só por SQL (comandos no final deste arquivo).
+create extension if not exists pgcrypto with schema extensions;
+
+create table if not exists public.app_config (
+  key   text primary key,
+  value text not null
+);
+alter table public.app_config enable row level security;
+revoke all on public.app_config from anon, authenticated;
+
+create or replace function public.pin_enabled()
+returns boolean
+language sql stable security definer
+set search_path = public
+as $
+  select exists (select 1 from public.app_config where key = 'pin_hash');
+$;
+
+create or replace function public.check_pin(p_pin text)
+returns boolean
+language sql stable security definer
+set search_path = public, extensions
+as $
+  select coalesce(
+    (select value = encode(extensions.digest('conferencia:' || coalesce(trim(p_pin), ''), 'sha256'), 'hex')
+       from public.app_config where key = 'pin_hash'),
+    true);  -- sem PIN cadastrado = liberado
+$;
+
+revoke all on function public.pin_enabled()     from public;
+revoke all on function public.check_pin(text)   from public;
+grant execute on function public.pin_enabled()   to anon, authenticated;
+grant execute on function public.check_pin(text) to anon, authenticated;
+
+-- Operações: a chave pública só cadastra/altera código, nome e ativa
+alter table public.operations drop column if exists pin_hash;
+revoke insert, update on public.operations from anon, authenticated;
+grant insert (code, name, active), update (code, name, active) on public.operations to anon, authenticated;
 
 -- 4) scan_events passa a ser a fonte das bipagens
 --    client_id: ID gerado no aparelho; o índice único impede duplicar quando o app reenvia
@@ -117,3 +157,13 @@ select cron.schedule(
 
 -- 8) Recarrega o cache do schema da API
 notify pgrst, 'reload schema';
+
+-- ==========================================================
+-- PIN: comandos para rodar À PARTE quando precisar (não rodam junto com o resto)
+-- ==========================================================
+-- Definir / trocar o PIN: gere o hash de  conferencia:SEU_PIN  em SHA-256 (hex) e use:
+--   insert into public.app_config (key, value) values ('pin_hash', '<hash>')
+--   on conflict (key) do update set value = excluded.value;
+--
+-- Remover o PIN (exclusões voltam a não pedir PIN):
+--   delete from public.app_config where key = 'pin_hash';

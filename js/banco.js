@@ -1,8 +1,7 @@
 // Consultas ao banco: admin de operações, acompanhamento geral e busca de IDs.
 
 Object.assign(ConferenciaApp, {
-  // pinAction: 'manter' | 'definir' (usa newPin) | 'remover'
-  async adminUpsertOperation(code, name, active = true, pinAction = 'manter', newPin = '') {
+  async adminUpsertOperation(code, name, active = true) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado.');
 
@@ -16,52 +15,47 @@ Object.assign(ConferenciaApp, {
       throw new Error('Código inválido. Use 3 letras e 1 número (ex.: ERD1).');
     }
 
-    if (pinAction === 'definir') {
-      const pin = String(newPin || '').trim();
-      if (!/^\d{4,8}$/.test(pin)) throw new Error('O PIN precisa ter de 4 a 8 números.');
-      op.pin_hash = this.pinHash(op.code, pin);
-    } else if (pinAction === 'remover') {
-      op.pin_hash = null;
-    }
-
     const { error } = await sb.from('operations').upsert(op, { onConflict: 'code' });
-    if (error) {
-      if (error.code === '42703' || /pin_hash/.test(String(error.message))) {
-        throw new Error('A coluna pin_hash não existe. Rode o supabase_setup.sql atualizado no Supabase.');
-      }
-      throw error;
-    }
-    if ('pin_hash' in op) {
-      if (op.pin_hash) this.opPins.set(op.code, op.pin_hash);
-      else this.opPins.delete(op.code);
-    }
+    if (error) throw error;
   },
 
-  // Lê operações; se a coluna pin_hash ainda não existir no banco, funciona sem PIN
   async loadOperationsRows(includeInactive) {
     const sb = this.getSb();
     if (!sb) throw new Error('Supabase client não encontrado.');
-    const run = async (cols) => {
-      let q = sb.from('operations').select(cols).order('code', { ascending: true });
-      if (!includeInactive) q = q.eq('active', true);
-      return q;
-    };
-    let { data, error } = await run('code,name,active,created_at,pin_hash');
-    if (error && (error.code === '42703' || /pin_hash/.test(String(error.message)))) {
-      ({ data, error } = await run('code,name,active,created_at'));
-    }
+    let q = sb.from('operations').select('code,name,active,created_at').order('code', { ascending: true });
+    if (!includeInactive) q = q.eq('active', true);
+    const { data, error } = await q;
     if (error) throw error;
-
-    for (const o of data || []) {
-      const code = String(o.code || '').toUpperCase();
-      if (o.pin_hash) this.opPins.set(code, o.pin_hash);
-      else this.opPins.delete(code);
-    }
     return data || [];
   },
 
   async adminLoadOperations(includeInactive = true) {
     return this.loadOperationsRows(includeInactive);
+  },
+
+  // ===== PIN (único para todas as operações) =====
+  // O hash do PIN fica numa tabela que a chave pública não lê; a conferência é feita
+  // no banco pelas funções pin_enabled() e check_pin(). Definir/trocar o PIN: só por SQL.
+
+  // true = existe PIN cadastrado; false = sem PIN (ou SQL do PIN ainda não aplicado)
+  async pinEnabled() {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado.');
+    const { data, error } = await sb.rpc('pin_enabled');
+    if (error) {
+      // Função não existe (SQL do PIN não aplicado): segue sem PIN
+      if (error.code === 'PGRST202' || error.code === '42883') return false;
+      throw error;
+    }
+    return !!data;
+  },
+
+  async verifyPin(pin) {
+    const sb = this.getSb();
+    if (!sb) throw new Error('Supabase client não encontrado.');
+    const { data, error } = await sb.rpc('check_pin', { p_pin: String(pin || '').trim() });
+    if (error) throw error;
+    return data === true;
   },
 
   async searchIdsFull(idsRaw, opts = {}) {

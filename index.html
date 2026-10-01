@@ -724,23 +724,9 @@
                   <input id="admin-op-active" type="checkbox" checked>
                 </div>
               </div>
-              <div class="form-row">
-                <div class="form-group col-md-6">
-                  <label>PIN da operação</label>
-                  <select id="admin-op-pin-action" class="form-control">
-                    <option value="manter">Manter como está</option>
-                    <option value="definir">Definir / trocar PIN</option>
-                    <option value="remover">Remover PIN</option>
-                  </select>
-                </div>
-                <div class="form-group col-md-6">
-                  <label>Novo PIN</label>
-                  <input id="admin-op-pin" type="password" inputmode="numeric" autocomplete="new-password" class="form-control" placeholder="4 a 8 números" disabled>
-                </div>
-              </div>
               <small class="text-muted d-block mb-2">
-                Com PIN, excluir rota, limpar o dia e excluir bipagem de placa pedem o PIN.
-                Para alterar uma operação que já tem PIN, é preciso digitar o PIN atual.
+                Excluir rota, limpar o dia, excluir bipagem de placa e salvar operação pedem o PIN
+                (único para todas as operações, definido direto no banco).
               </small>
               <button id="btn-admin-save-op" class="btn btn-success">Salvar operação</button>
             </div>
@@ -751,7 +737,7 @@
             <div class="table-responsive" style="max-height:340px; overflow:auto;">
               <table class="table table-sm table-striped">
                 <thead>
-                  <tr><th>Código</th><th>Nome</th><th>Ativa</th><th>PIN</th></tr>
+                  <tr><th>Código</th><th>Nome</th><th>Ativa</th></tr>
                 </thead>
                 <tbody id="admin-ops-tbody"></tbody>
               </table>
@@ -766,7 +752,7 @@
   </div>
 </div>
 
-<!-- Modal: PIN da operação (ações destrutivas) -->
+<!-- Modal: PIN (ações destrutivas; conferido no banco) -->
 <div class="modal fade" id="modal-pin" tabindex="-1" role="dialog" aria-labelledby="modalPinTitle" aria-hidden="true">
   <div class="modal-dialog modal-sm modal-dialog-centered" role="document">
     <div class="modal-content">
@@ -824,13 +810,13 @@
 
 <!-- Seu JS (cache-bust recomendado) -->
 <!-- App (ordem importa: core primeiro, eventos por último) -->
-<script src="js/core.js?v=2026-10-01"></script>
-<script src="js/regras.js?v=2026-10-01"></script>
-<script src="js/sync.js?v=2026-10-01"></script>
-<script src="js/banco.js?v=2026-10-01"></script>
-<script src="js/importacao.js?v=2026-10-01"></script>
-<script src="js/exportacao.js?v=2026-10-01"></script>
-<script src="js/ui.js?v=2026-10-01"></script>
-<script src="js/eventos.js?v=2026-10-01"></script>
+<script src="js/core.js?v=2026-10-01b"></script>
+<script src="js/regras.js?v=2026-10-01b"></script>
+<script src="js/sync.js?v=2026-10-01b"></script>
+<script src="js/banco.js?v=2026-10-01b"></script>
+<script src="js/importacao.js?v=2026-10-01b"></script>
+<script src="js/exportacao.js?v=2026-10-01b"></script>
+<script src="js/ui.js?v=2026-10-01b"></script>
+<script src="js/eventos.js?v=2026-10-01b"></script>
 </body>
 </html>

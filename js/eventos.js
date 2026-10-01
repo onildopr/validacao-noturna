@@ -484,13 +484,6 @@ $(document).on('hidden.bs.modal', '#modal-admin', () => {
   ConferenciaApp.ensureOperationSelected();
 });
 
-// Campo "Novo PIN" só fica ativo quando a ação é definir/trocar
-$(document).on('change', '#admin-op-pin-action', (e) => {
-  const definir = e.target.value === 'definir';
-  $('#admin-op-pin').prop('disabled', !definir);
-  if (!definir) $('#admin-op-pin').val('');
-});
-
 // Com dois modais abertos (Admin + PIN), fechar o do PIN não pode destravar a rolagem do Admin
 $(document).on('hidden.bs.modal', '#modal-pin', () => {
   if ($('.modal.show').length) $('body').addClass('modal-open');
@@ -505,8 +498,7 @@ async function refreshAdminOps() {
     ops.forEach(o => {
       const act = o.active ? 'SIM' : 'NÃO';
       const name = o.name || '';
-      const pin = o.pin_hash ? 'SIM' : '—';
-      $tbody.append(`<tr><td>${ConferenciaApp.escHtml(o.code)}</td><td>${ConferenciaApp.escHtml(name)}</td><td>${act}</td><td>${pin}</td></tr>`);
+      $tbody.append(`<tr><td>${ConferenciaApp.escHtml(o.code)}</td><td>${ConferenciaApp.escHtml(name)}</td><td>${act}</td></tr>`);
     });
   } catch (e) {
     console.warn(e);
@@ -517,17 +509,11 @@ $(document).on('click', '#btn-admin-save-op', async () => {
   const code = $('#admin-op-code').val();
   const name = $('#admin-op-name').val();
   const active = $('#admin-op-active').is(':checked');
-  const pinAction = $('#admin-op-pin-action').val() || 'manter';
-  const newPin = $('#admin-op-pin').val();
   try {
-    // Alterar uma operação que já tem PIN exige o PIN atual dela
-    const opCode = String(code || '').trim().toUpperCase();
-    if (!(await ConferenciaApp.requirePin('Alterar operação no Admin', opCode))) return;
+    if (!(await ConferenciaApp.requirePin('Cadastrar / alterar operação no Admin'))) return;
 
-    await ConferenciaApp.adminUpsertOperation(code, name, active, pinAction, newPin);
+    await ConferenciaApp.adminUpsertOperation(code, name, active);
     await refreshAdminOps();
-    $('#admin-op-pin').val('');
-    $('#admin-op-pin-action').val('manter').trigger('change');
     alert('Operação salva.');
   } catch (e) {
     console.error(e);

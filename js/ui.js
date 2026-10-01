@@ -47,18 +47,28 @@ Object.assign(ConferenciaApp, {
     }
   },
 
-  // Pede o PIN da operação antes de uma ação destrutiva. Resolve true se liberado.
-  // Operação sem PIN => liberado direto. PIN certo vale por 10 minutos neste aparelho.
-  requirePin(acao, opCode = this.getOperationCode()) {
-    const code = String(opCode || '').toUpperCase();
-    if (!this.opPins.get(code)) return Promise.resolve(true);
-    if (this.pinOkFor === code && Date.now() < this.pinOkUntil) return Promise.resolve(true);
+  // Pede o PIN (único, conferido no banco) antes de uma ação destrutiva. Resolve true se liberado.
+  // Sem PIN cadastrado => liberado direto. PIN certo vale por 10 minutos neste aparelho.
+  // Sem conexão não dá para conferir o PIN => a ação é bloqueada.
+  async requirePin(acao) {
+    if (Date.now() < this.pinOkUntil) return true;
+
+    let temPin;
+    try {
+      temPin = await this.pinEnabled();
+    } catch (e) {
+      console.warn('Falha ao consultar o PIN:', e);
+      alert('Sem conexão com o banco: não foi possível conferir o PIN. Tente de novo quando a conexão voltar.');
+      return false;
+    }
+    if (!temPin) return true;
 
     return new Promise((resolve) => {
       const $m = $('#modal-pin');
       const $in = $('#pin-input');
       const $err = $('#pin-error');
-      $('#pin-acao').text(`${acao} • operação ${code}`);
+      const $btn = $('#pin-confirm');
+      $('#pin-acao').text(acao);
       $in.val('');
       $err.addClass('d-none');
 
@@ -66,24 +76,31 @@ Object.assign(ConferenciaApp, {
       const finish = (ok) => {
         if (done) return;
         done = true;
-        $('#pin-confirm').off('click.pin');
+        $btn.off('click.pin').prop('disabled', false);
         $in.off('keydown.pin');
         $m.off('hidden.bs.modal.pin');
         $m.modal('hide');
         resolve(ok);
       };
-      const tentar = () => {
-        if (this.checkPin(code, $in.val())) {
-          this.pinOkFor = code;
-          this.pinOkUntil = Date.now() + 10 * 60 * 1000;
-          finish(true);
-        } else {
-          $err.removeClass('d-none');
-          $in.val('').focus();
+      const tentar = async () => {
+        if ($btn.prop('disabled')) return;
+        $btn.prop('disabled', true);
+        try {
+          if (await this.verifyPin($in.val())) {
+            this.pinOkUntil = Date.now() + 10 * 60 * 1000;
+            finish(true);
+            return;
+          }
+          $err.text('PIN incorreto.').removeClass('d-none');
+        } catch (e) {
+          console.warn('Falha ao conferir o PIN:', e);
+          $err.text('Sem conexão com o banco. Tente de novo.').removeClass('d-none');
         }
+        $btn.prop('disabled', false);
+        $in.val('').focus();
       };
 
-      $('#pin-confirm').on('click.pin', tentar);
+      $btn.on('click.pin', tentar);
       $in.on('keydown.pin', (e) => { if (e.key === 'Enter') tentar(); });
       $m.on('hidden.bs.modal.pin', () => finish(false));
       $m.one('shown.bs.modal', () => $in.trigger('focus'));
