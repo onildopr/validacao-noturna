@@ -75,6 +75,38 @@ const ConferenciaApp = {
       .replace(/'/g, '&#39;');
   },
 
+  // ===== Senha do dia (primeiro acesso do dia em cada aparelho) =====
+  // Senha = dia − mês + ano (data de Porto Velho). Ex.: 30/09/2026 => 30 − 9 + 2026 = 2047.
+  dailyPassword(dayISO = this.todayLocalISO()) {
+    const [y, m, d] = String(dayISO).split('-').map(Number);
+    return String(d - m + y);
+  },
+
+  // Aceita o resultado (2047) ou a conta escrita (30-9+2026 / 30-09+2026)
+  checkDailyPassword(input, dayISO = this.todayLocalISO()) {
+    const txt = String(input || '').trim();
+    if (txt === this.dailyPassword(dayISO)) return true;
+
+    const m = txt.match(/^(\d{1,2})\s*-\s*(\d{1,2})\s*\+\s*(\d{4})$/);
+    if (!m) return false;
+    const [y, mo, d] = String(dayISO).split('-').map(Number);
+    return Number(m[1]) === d && Number(m[2]) === mo && Number(m[3]) === y;
+  },
+
+  isUnlockedToday() {
+    try {
+      return localStorage.getItem('conf_unlock_day.v1') === this.todayLocalISO();
+    } catch {
+      return false;
+    }
+  },
+
+  markUnlockedToday() {
+    try {
+      localStorage.setItem('conf_unlock_day.v1', this.todayLocalISO());
+    } catch {}
+  },
+
   lockRouteUi(ms = 2500) {
     this.routeUiLockUntil = Date.now() + ms;
   },

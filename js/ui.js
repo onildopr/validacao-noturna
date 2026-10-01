@@ -108,6 +108,48 @@ Object.assign(ConferenciaApp, {
     });
   },
 
+  // Tela de bloqueio do primeiro acesso do dia neste aparelho. Resolve quando a senha do dia é aceita.
+  ensureDailyUnlock() {
+    if (this.isUnlockedToday()) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      const lock = document.createElement('div');
+      lock.id = 'daily-lock';
+      lock.setAttribute('role', 'dialog');
+      lock.setAttribute('aria-modal', 'true');
+      lock.style.cssText =
+        'position:fixed;inset:0;z-index:3000;background:#000;display:flex;align-items:center;justify-content:center;padding:16px;';
+      lock.innerHTML = `
+        <div style="background:#fff;color:#212529;border-left:4px solid #ff8c00;border-radius:6px;padding:24px;width:100%;max-width:360px;text-align:center;">
+          <img src="logorodacoop.png" alt="" style="max-width:160px;margin-bottom:12px;" onerror="this.remove()">
+          <h5 style="color:#ff8c00;margin-bottom:4px;">Senha do dia</h5>
+          <div class="small text-muted mb-3">Primeiro acesso de hoje neste aparelho</div>
+          <input id="daily-lock-input" type="password" inputmode="numeric" autocomplete="off"
+                 class="form-control text-center mb-2" placeholder="Senha" aria-label="Senha do dia">
+          <div id="daily-lock-error" class="text-danger small mb-2" style="display:none;">Senha incorreta.</div>
+          <button id="daily-lock-btn" type="button" class="btn btn-primary btn-block">Entrar</button>
+        </div>`;
+      document.body.appendChild(lock);
+
+      const input = lock.querySelector('#daily-lock-input');
+      const err = lock.querySelector('#daily-lock-error');
+      const tentar = () => {
+        if (this.checkDailyPassword(input.value)) {
+          this.markUnlockedToday();
+          lock.remove();
+          resolve();
+        } else {
+          err.style.display = 'block';
+          input.value = '';
+          input.focus();
+        }
+      };
+      lock.querySelector('#daily-lock-btn').addEventListener('click', tentar);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') tentar(); });
+      setTimeout(() => input.focus(), 0);
+    });
+  },
+
   async ensureOperationSelected() {
     if (!this.getSb()) return;
 

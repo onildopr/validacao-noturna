@@ -35,6 +35,14 @@ Dados com mais de 90 dias são apagados automaticamente (pg_cron).
 1. No painel do Supabase, abra o **SQL Editor**, cole o conteúdo de `supabase_setup.sql` e clique em **Run** (pode rodar de novo sempre que o arquivo mudar).
 2. A URL e a chave pública do projeto ficam no final de `index.html` e em `search.html`.
 
+## Senha do dia
+
+No primeiro acesso de cada dia, em cada aparelho, o app pede a **senha do dia**: **dia − mês + ano** (data de Porto Velho).
+
+Exemplo: 30/09/2026 → 30 − 9 + 2026 = **2047**. Também aceita a conta escrita (`30-9+2026`).
+
+Depois de acertar, o aparelho fica liberado até o fim do dia. A conferência é feita no próprio app (funciona sem internet), então é uma barreira simples contra uso por quem não é da equipe, não uma proteção forte.
+
 ## PIN
 
 Um PIN único para todas as operações. Com PIN cadastrado, **excluir rota**, **limpar o dia**, **excluir bipagem de placa** e **salvar operação no Admin** pedem o PIN, que vale por 10 minutos no aparelho.

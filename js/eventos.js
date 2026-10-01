@@ -66,6 +66,9 @@ $(document).ready(async () => {
     $('#db-search-status').text('—');
   });
 
+  // Senha do dia: primeiro acesso de hoje neste aparelho (vale também para a busca)
+  await ConferenciaApp.ensureDailyUnlock();
+
   // search.html: página só de busca, não carrega rotas/realtime
   if ($('#db-search-page').length) return;
 
